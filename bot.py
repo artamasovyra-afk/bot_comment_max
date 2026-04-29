@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import mimetypes
+import re
 import sqlite3
 import threading
 import time
@@ -43,10 +44,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger("max-comments-bot")
 
-WEBAPP_DIR = Path(__file__).resolve().parent / "webapp"
+APP_ROOT_DIR = Path(__file__).resolve().parent
+VERSION_FILE = APP_ROOT_DIR / "VERSION"
+WEBAPP_DIR = APP_ROOT_DIR / "webapp"
 COMMENT_MEDIA_DIR = Path(DATABASE_PATH).resolve().parent / "comment_media"
 COMMENT_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 COMMENT_IMAGE_DATA_URL_MAX_LENGTH = 16 * 1024 * 1024
+COMMENT_LINK_RE = re.compile(
+    r"(?i)(?:\b(?:https?://|ftp://|www\.)\S+|(?<!@)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d{2,5})?(?:/[^\s]*)?)"
+)
+BIND_CHANNEL_CODE_TTL_SECONDS = 30 * 60
+BIND_CHANNEL_CLEANUP_INTERVAL_SECONDS = 10 * 60
+
+
+def read_app_version() -> str:
+    try:
+        version = VERSION_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "0.0.0-dev"
+    return version or "0.0.0-dev"
+
+
+APP_VERSION = read_app_version()
 
 
 def is_configured_for_publishing() -> bool:
@@ -82,6 +101,54 @@ def snippet(text: str, limit: int = 120) -> str:
     return f"{text[: limit - 1]}…"
 
 
+def format_duration_compact(total_seconds: int) -> str:
+    seconds = max(int(total_seconds), 0)
+    if seconds < 60:
+        return "< 1 мин"
+    total_minutes = (seconds + 59) // 60
+    hours, minutes = divmod(total_minutes, 60)
+    if hours <= 0:
+        return f"{total_minutes} мин"
+    if minutes <= 0:
+        return f"{hours} ч"
+    return f"{hours} ч {minutes} мин"
+
+
+def format_utc_timestamp(iso_value: str) -> str:
+    try:
+        dt = datetime.fromisoformat(iso_value)
+    except ValueError:
+        return iso_value
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def contains_link_like_text(text: str) -> bool:
+    return bool(COMMENT_LINK_RE.search(safe_text(text)))
+
+
+def ensure_comment_text_has_no_links(text: str) -> None:
+    if contains_link_like_text(text):
+        raise MaxApiError("Links are not allowed in comments")
+
+
+def humanize_comment_error_message(message: str) -> str:
+    normalized = safe_text(message)
+    if not normalized:
+        return "Не удалось обработать комментарий."
+    return {
+        "Post not found": "Пост для комментария больше не найден. Попробуйте открыть обсуждение заново.",
+        "Parent comment not found": "Комментарий, на который вы отвечаете, больше не найден.",
+        "Comment not found": "Комментарий не найден.",
+        "Comment is empty": "Комментарий пустой. Напишите текст или прикрепите фото.",
+        "Comment is too long": "Комментарий слишком длинный. Максимум 4000 символов.",
+        "Links are not allowed in comments": "Ссылки запрещены правилами сервиса.",
+        "Channel is not connected": "Этот канал не подключён к боту. Добавьте его через `/channel_add CHANNEL_ID COMMENTS_CHAT_ID`.",
+        "Comments chat is not configured for this post": "Для этого поста не найден чат комментариев.",
+        "You can edit only your own comments": "Можно редактировать только свои комментарии.",
+        "You can delete only your own comments": "Можно удалять только свои комментарии.",
+    }.get(normalized, normalized)
+
+
 def comment_reply_preview_text(comment: sqlite3.Row | dict[str, Any]) -> str:
     text = safe_text(comment["text"] if isinstance(comment, sqlite3.Row) else comment.get("text"))
     if text:
@@ -110,6 +177,17 @@ def message_id_from_post_token(post_token: str) -> str | None:
         return None
 
 
+def extract_message_id(message_payload: dict[str, Any] | None) -> str | None:
+    if not isinstance(message_payload, dict):
+        return None
+    message = message_payload.get("message")
+    if isinstance(message, dict):
+        body = message.get("body") or {}
+        return safe_text(body.get("mid") or message.get("mid")) or None
+    body = message_payload.get("body") or {}
+    return safe_text(body.get("mid") or message_payload.get("mid")) or None
+
+
 def post_ref_for_message_id(post_message_id: str) -> str:
     return f"post_{post_token_for_message_id(post_message_id)}"
 
@@ -121,6 +199,10 @@ def comment_code_for_post(post_message_id: str) -> str:
 
 def comment_button_text(comment_count: int) -> str:
     return f"💬 {max(comment_count, 0)}"
+
+
+def max_share_url(text: str) -> str:
+    return f"https://max.ru/:share?text={parse.quote(safe_text(text))}"
 
 
 CHANNEL_POST_FOOTER = "Комментарии к этому посту открываются в мини-приложении по кнопке ниже."
@@ -308,6 +390,15 @@ class PendingComment:
 
 
 @dataclass
+class PendingChannelBinding:
+    bind_code: str
+    requested_by_user_id: int
+    channel_chat_id: int
+    channel_title: str | None
+    created_at: str
+
+
+@dataclass
 class AuthenticatedWebAppUser:
     user_id: int
     display_name: str
@@ -484,6 +575,9 @@ class MaxApiClient:
     def get_message(self, message_id: str) -> dict[str, Any]:
         return self._request("GET", f"/messages/{message_id}")
 
+    def delete_message(self, message_id: str) -> dict[str, Any]:
+        return self._request("DELETE", "/messages", query={"message_id": message_id})
+
     def get_chat_messages(
         self,
         chat_id: int,
@@ -513,9 +607,18 @@ class CommentStore:
         with self.lock:
             self.conn.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS channel_bindings (
+                    channel_chat_id INTEGER PRIMARY KEY,
+                    comments_chat_id INTEGER NOT NULL,
+                    comments_chat_url TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS posts (
                     post_message_id TEXT PRIMARY KEY,
                     channel_chat_id INTEGER NOT NULL,
+                    comments_chat_id INTEGER,
                     post_url TEXT,
                     post_text TEXT,
                     post_attachments_json TEXT NOT NULL DEFAULT '[]',
@@ -535,6 +638,7 @@ class CommentStore:
                     text TEXT NOT NULL,
                     media_json TEXT NOT NULL DEFAULT '[]',
                     source_message_id TEXT,
+                    discussion_copy_message_id TEXT,
                     source_kind TEXT NOT NULL DEFAULT 'bot',
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(post_message_id) REFERENCES posts(post_message_id)
@@ -545,6 +649,14 @@ class CommentStore:
                     post_message_id TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(post_message_id) REFERENCES posts(post_message_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS pending_channel_bindings (
+                    bind_code TEXT PRIMARY KEY,
+                    requested_by_user_id INTEGER NOT NULL,
+                    channel_chat_id INTEGER NOT NULL,
+                    channel_title TEXT,
+                    created_at TEXT NOT NULL
                 );
                 """
             )
@@ -568,20 +680,99 @@ class CommentStore:
             self.conn.execute(
                 "ALTER TABLE comments ADD COLUMN media_json TEXT NOT NULL DEFAULT '[]'"
             )
+        if "discussion_copy_message_id" not in comment_columns:
+            self.conn.execute(
+                "ALTER TABLE comments ADD COLUMN discussion_copy_message_id TEXT"
+            )
         post_columns = {
             row["name"]
             for row in self.conn.execute("PRAGMA table_info(posts)").fetchall()
         }
+        if "comments_chat_id" not in post_columns:
+            self.conn.execute(
+                "ALTER TABLE posts ADD COLUMN comments_chat_id INTEGER"
+            )
+            if COMMENTS_CHAT_ID is not None:
+                self.conn.execute(
+                    "UPDATE posts SET comments_chat_id = ? WHERE comments_chat_id IS NULL",
+                    (COMMENTS_CHAT_ID,),
+                )
         if "post_attachments_json" not in post_columns:
             self.conn.execute(
                 "ALTER TABLE posts ADD COLUMN post_attachments_json TEXT NOT NULL DEFAULT '[]'"
             )
+
+    def upsert_channel_binding(
+        self,
+        *,
+        channel_chat_id: int,
+        comments_chat_id: int,
+        comments_chat_url: str | None = None,
+    ) -> None:
+        now = utc_now()
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO channel_bindings (
+                    channel_chat_id,
+                    comments_chat_id,
+                    comments_chat_url,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(channel_chat_id) DO UPDATE SET
+                    comments_chat_id = excluded.comments_chat_id,
+                    comments_chat_url = COALESCE(excluded.comments_chat_url, channel_bindings.comments_chat_url),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    int(channel_chat_id),
+                    int(comments_chat_id),
+                    safe_text(comments_chat_url) or None,
+                    now,
+                    now,
+                ),
+            )
+            self.conn.commit()
+
+    def get_channel_binding(self, channel_chat_id: int) -> sqlite3.Row | None:
+        with self.lock:
+            return self.conn.execute(
+                """
+                SELECT *
+                FROM channel_bindings
+                WHERE channel_chat_id = ?
+                """,
+                (int(channel_chat_id),),
+            ).fetchone()
+
+    def list_channel_bindings(self) -> list[sqlite3.Row]:
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT *
+                FROM channel_bindings
+                ORDER BY channel_chat_id ASC
+                """
+            ).fetchall()
+        return list(rows)
+
+    def delete_channel_binding(self, channel_chat_id: int) -> bool:
+        with self.lock:
+            cursor = self.conn.execute(
+                "DELETE FROM channel_bindings WHERE channel_chat_id = ?",
+                (int(channel_chat_id),),
+            )
+            self.conn.commit()
+        return cursor.rowcount > 0
 
     def upsert_post(
         self,
         *,
         post_message_id: str,
         channel_chat_id: int,
+        comments_chat_id: int | None,
         post_url: str | None,
         post_text: str,
         post_attachments: list[dict[str, Any]] | None = None,
@@ -595,6 +786,7 @@ class CommentStore:
                 INSERT INTO posts (
                     post_message_id,
                     channel_chat_id,
+                    comments_chat_id,
                     post_url,
                     post_text,
                     post_attachments_json,
@@ -602,9 +794,10 @@ class CommentStore:
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(post_message_id) DO UPDATE SET
                     channel_chat_id = excluded.channel_chat_id,
+                    comments_chat_id = COALESCE(posts.comments_chat_id, excluded.comments_chat_id),
                     post_url = excluded.post_url,
                     post_text = excluded.post_text,
                     post_attachments_json = excluded.post_attachments_json,
@@ -614,6 +807,7 @@ class CommentStore:
                 (
                     post_message_id,
                     channel_chat_id,
+                    comments_chat_id,
                     post_url,
                     post_text,
                     post_attachments_json,
@@ -694,6 +888,105 @@ class CommentStore:
             self.conn.commit()
         return PendingComment(user_id=row["user_id"], post_message_id=row["post_message_id"])
 
+    def set_pending_channel_binding(
+        self,
+        *,
+        bind_code: str,
+        requested_by_user_id: int,
+        channel_chat_id: int,
+        channel_title: str | None,
+    ) -> None:
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO pending_channel_bindings (
+                    bind_code,
+                    requested_by_user_id,
+                    channel_chat_id,
+                    channel_title,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(bind_code) DO UPDATE SET
+                    requested_by_user_id = excluded.requested_by_user_id,
+                    channel_chat_id = excluded.channel_chat_id,
+                    channel_title = excluded.channel_title,
+                    created_at = excluded.created_at
+                """,
+                (
+                    safe_text(bind_code).upper(),
+                    int(requested_by_user_id),
+                    int(channel_chat_id),
+                    safe_text(channel_title) or None,
+                    utc_now(),
+                ),
+            )
+            self.conn.commit()
+
+    def get_pending_channel_binding(self, bind_code: str) -> PendingChannelBinding | None:
+        with self.lock:
+            row = self.conn.execute(
+                """
+                SELECT bind_code, requested_by_user_id, channel_chat_id, channel_title, created_at
+                FROM pending_channel_bindings
+                WHERE bind_code = ?
+                """,
+                (safe_text(bind_code).upper(),),
+            ).fetchone()
+        if row is None:
+            return None
+        return PendingChannelBinding(
+            bind_code=safe_text(row["bind_code"]).upper(),
+            requested_by_user_id=int(row["requested_by_user_id"]),
+            channel_chat_id=int(row["channel_chat_id"]),
+            channel_title=safe_text(row["channel_title"]) or None,
+            created_at=safe_text(row["created_at"]),
+        )
+
+    def list_pending_channel_bindings(
+        self,
+        *,
+        requested_by_user_id: int | None = None,
+    ) -> list[PendingChannelBinding]:
+        query = """
+            SELECT bind_code, requested_by_user_id, channel_chat_id, channel_title, created_at
+            FROM pending_channel_bindings
+        """
+        params: list[Any] = []
+        if requested_by_user_id is not None:
+            query += " WHERE requested_by_user_id = ?"
+            params.append(int(requested_by_user_id))
+        query += " ORDER BY created_at DESC"
+        with self.lock:
+            rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [
+            PendingChannelBinding(
+                bind_code=safe_text(row["bind_code"]).upper(),
+                requested_by_user_id=int(row["requested_by_user_id"]),
+                channel_chat_id=int(row["channel_chat_id"]),
+                channel_title=safe_text(row["channel_title"]) or None,
+                created_at=safe_text(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def delete_pending_channel_binding(self, bind_code: str) -> None:
+        with self.lock:
+            self.conn.execute(
+                "DELETE FROM pending_channel_bindings WHERE bind_code = ?",
+                (safe_text(bind_code).upper(),),
+            )
+            self.conn.commit()
+
+    def clear_expired_pending_channel_bindings(self, *, older_than_iso: str) -> int:
+        with self.lock:
+            cursor = self.conn.execute(
+                "DELETE FROM pending_channel_bindings WHERE created_at < ?",
+                (older_than_iso,),
+            )
+            self.conn.commit()
+        return int(cursor.rowcount)
+
     def add_comment(
         self,
         *,
@@ -705,6 +998,7 @@ class CommentStore:
         text: str,
         media: list[dict[str, Any]] | None,
         source_message_id: str | None,
+        discussion_copy_message_id: str | None,
         source_kind: str,
     ) -> int:
         now = utc_now()
@@ -721,10 +1015,11 @@ class CommentStore:
                     text,
                     media_json,
                     source_message_id,
+                    discussion_copy_message_id,
                     source_kind,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     post_message_id,
@@ -735,6 +1030,7 @@ class CommentStore:
                     text,
                     media_json,
                     source_message_id,
+                    discussion_copy_message_id,
                     source_kind,
                     now,
                 ),
@@ -809,6 +1105,24 @@ class CommentStore:
                 "SELECT * FROM comments WHERE id = ?",
                 (comment_id,),
             ).fetchone()
+
+    def set_comment_discussion_copy_message_id(
+        self,
+        *,
+        comment_id: int,
+        post_message_id: str,
+        discussion_copy_message_id: str,
+    ) -> None:
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE comments
+                SET discussion_copy_message_id = ?
+                WHERE id = ? AND post_message_id = ?
+                """,
+                (discussion_copy_message_id, comment_id, post_message_id),
+            )
+            self.conn.commit()
 
     def list_comments_by_ids(self, comment_ids: list[int]) -> dict[int, sqlite3.Row]:
         normalized_ids = [int(comment_id) for comment_id in comment_ids if comment_id is not None]
@@ -981,20 +1295,25 @@ class MaxCommentsBot:
     def __init__(self) -> None:
         self.api = MaxApiClient(BOT_TOKEN, MAX_API_BASE_URL)
         self.store = CommentStore(DATABASE_PATH)
+        self.bootstrap_legacy_channel_binding()
         self.marker: int | None = None
         self.bot_info: dict[str, Any] | None = None
         self.web_server: CommentWebServer | None = None
         self.channel_sync_thread: threading.Thread | None = None
+        self.bind_cleanup_thread: threading.Thread | None = None
 
     def run(self) -> None:
+        logger.info("Starting MAX Comments bot version %s", APP_VERSION)
         self.bot_info = self.api.get_me()
         logger.info(
             "Connected as %s (@%s)",
             self.bot_info.get("first_name") or self.bot_info.get("name"),
             self.bot_info.get("username"),
         )
+        self.purge_expired_bind_codes()
         self.start_web_server()
         self.start_channel_sync()
+        self.start_bind_cleanup()
         while True:
             try:
                 payload = self.api.get_updates(self.marker)
@@ -1018,9 +1337,121 @@ class MaxCommentsBot:
         if WEB_APP_PUBLIC_URL:
             logger.info("Expected public WebApp URL: %s", WEB_APP_PUBLIC_URL)
 
-    def start_channel_sync(self) -> None:
+    def bootstrap_legacy_channel_binding(self) -> None:
+        if self.store.list_channel_bindings():
+            return
         if TARGET_CHANNEL_CHAT_ID is None or COMMENTS_CHAT_ID is None:
-            logger.info("Channel auto-attach sync is disabled until channel ids are configured")
+            return
+        self.store.upsert_channel_binding(
+            channel_chat_id=int(TARGET_CHANNEL_CHAT_ID),
+            comments_chat_id=int(COMMENTS_CHAT_ID),
+            comments_chat_url=COMMENTS_CHAT_URL or None,
+        )
+        logger.info(
+            "Bootstrapped channel binding from legacy env: %s -> %s",
+            TARGET_CHANNEL_CHAT_ID,
+            COMMENTS_CHAT_ID,
+        )
+
+    def has_channel_bindings(self) -> bool:
+        return bool(self.store.list_channel_bindings())
+
+    def get_channel_binding(self, channel_chat_id: int | None) -> sqlite3.Row | None:
+        if channel_chat_id is None:
+            return None
+        try:
+            return self.store.get_channel_binding(int(channel_chat_id))
+        except (TypeError, ValueError):
+            return None
+
+    def list_channel_bindings(self) -> list[sqlite3.Row]:
+        return self.store.list_channel_bindings()
+
+    def current_chat_context(self, message: dict[str, Any]) -> tuple[int | None, str, str, str | None]:
+        recipient = message.get("recipient") or {}
+        chat_id = recipient.get("chat_id")
+        title = safe_text(recipient.get("title") or recipient.get("name"))
+        chat_type = safe_text(recipient.get("chat_type") or recipient.get("type"))
+        chat_link = safe_text(recipient.get("link")) or None
+        try:
+            normalized_chat_id = int(chat_id) if chat_id is not None else None
+        except (TypeError, ValueError):
+            normalized_chat_id = None
+        return (
+            normalized_chat_id,
+            title,
+            chat_type,
+            chat_link,
+        )
+
+    def issue_bind_code(self) -> str:
+        while True:
+            code = uuid.uuid4().hex[:6].upper()
+            if self.store.get_pending_channel_binding(code) is None:
+                return code
+
+    def purge_expired_bind_codes(self) -> None:
+        threshold = datetime.fromtimestamp(
+            time.time() - BIND_CHANNEL_CODE_TTL_SECONDS,
+            tz=timezone.utc,
+        ).isoformat()
+        deleted_count = self.store.clear_expired_pending_channel_bindings(older_than_iso=threshold)
+        if deleted_count:
+            logger.info("Purged %s expired pending channel binding code(s)", deleted_count)
+
+    def start_bind_cleanup(self) -> None:
+        if self.bind_cleanup_thread is not None:
+            return
+        self.bind_cleanup_thread = threading.Thread(
+            target=self.bind_cleanup_loop,
+            name="bind-cleanup",
+            daemon=True,
+        )
+        self.bind_cleanup_thread.start()
+        logger.info(
+            "Pending bind-code cleanup started every %s seconds",
+            BIND_CHANNEL_CLEANUP_INTERVAL_SECONDS,
+        )
+
+    def bind_cleanup_loop(self) -> None:
+        while True:
+            try:
+                self.purge_expired_bind_codes()
+            except Exception:
+                logger.exception("Pending bind-code cleanup failed")
+            time.sleep(max(BIND_CHANNEL_CLEANUP_INTERVAL_SECONDS, 60))
+
+    def get_valid_pending_channel_binding(self, bind_code: str) -> PendingChannelBinding | None:
+        self.purge_expired_bind_codes()
+        pending = self.store.get_pending_channel_binding(bind_code)
+        if pending is None:
+            return None
+        try:
+            created_at = datetime.fromisoformat(pending.created_at)
+        except ValueError:
+            self.store.delete_pending_channel_binding(bind_code)
+            return None
+        if (datetime.now(timezone.utc) - created_at).total_seconds() > BIND_CHANNEL_CODE_TTL_SECONDS:
+            self.store.delete_pending_channel_binding(bind_code)
+            return None
+        return pending
+
+    def resolve_post_comments_chat_id(self, post: sqlite3.Row) -> int:
+        raw_comments_chat_id = post["comments_chat_id"] if "comments_chat_id" in post.keys() else None
+        if raw_comments_chat_id is not None:
+            return int(raw_comments_chat_id)
+
+        channel_chat_id = int(post["channel_chat_id"])
+        binding = self.get_channel_binding(channel_chat_id)
+        if binding is not None:
+            return int(binding["comments_chat_id"])
+        if COMMENTS_CHAT_ID is not None:
+            return int(COMMENTS_CHAT_ID)
+        raise MaxApiError("Comments chat is not configured for this post")
+
+    def start_channel_sync(self) -> None:
+        if not self.has_channel_bindings():
+            logger.info("Channel auto-attach sync is disabled until at least one channel binding is configured")
             return
         if self.channel_sync_thread is not None:
             return
@@ -1031,8 +1462,8 @@ class MaxCommentsBot:
         )
         self.channel_sync_thread.start()
         logger.info(
-            "Channel auto-attach sync started for chat %s every %s seconds",
-            TARGET_CHANNEL_CHAT_ID,
+            "Channel auto-attach sync started for %s channel(s) every %s seconds",
+            len(self.list_channel_bindings()),
             CHANNEL_SYNC_INTERVAL_SECONDS,
         )
 
@@ -1109,10 +1540,19 @@ class MaxCommentsBot:
                 user_id=user_id,
                 text=(
                     "Команды администратора:\n"
-                    "`/publish текст поста` - опубликовать пост в канал через бота и открыть комментарии в мини-приложении\n"
+                    "`/publish текст поста` - опубликовать пост в единственный подключённый канал или в текущий канал\n"
+                    "`/publish CHANNEL_ID текст поста` - опубликовать пост в выбранный подключённый канал\n"
                     "`/attach MESSAGE_ID` - подключить мини-приложение к уже существующему посту\n"
+                    "`/channels` - показать подключённые каналы\n"
+                    "`/channel_add CHANNEL_ID COMMENTS_CHAT_ID` - подключить канал к чату комментариев\n"
+                    "`/channel_remove CHANNEL_ID` - отключить канал\n"
                     "`/posts` - показать последние зарегистрированные посты\n"
+                    "`/bind_status` - показать активные коды незавершённых привязок\n"
                     "`/chatinfo` - показать данные текущего чата\n\n"
+                    "Быстрая привязка без ручного ввода ID:\n"
+                    "`/bind_channel` - отправить прямо в канале\n"
+                    "`/bind_comments CODE` - отправить в чате комментариев\n"
+                    "`/bind_channel same` - если комментарии должны жить в этом же чате\n\n"
                     "Если администратор публикует пост вручную прямо в канале, кнопка комментариев тоже добавится автоматически.\n\n"
                     "Диагностика:\n"
                     "`/me` - показать мой user id"
@@ -1164,6 +1604,18 @@ class MaxCommentsBot:
             )
             return
 
+        if command == "/bind_channel":
+            self.begin_channel_binding(user_id=user_id, message=message, args=args)
+            return
+
+        if command == "/bind_comments":
+            self.complete_channel_binding(user_id=user_id, message=message, args=args)
+            return
+
+        if command == "/bind_status":
+            self.send_pending_channel_bindings_status(user_id)
+            return
+
         if user_id not in ADMIN_USER_IDS:
             self.api.send_message(
                 user_id=user_id,
@@ -1177,10 +1629,18 @@ class MaxCommentsBot:
         if command == "/publish":
             if not self.ensure_publish_ready(user_id):
                 return
-            if not args:
-                self.api.send_message(user_id=user_id, text="Формат: `/publish текст поста`")
+            binding, publish_text, error_text = self.resolve_publish_command_target(message, args)
+            if error_text:
+                self.api.send_message(user_id=user_id, text=error_text)
                 return
-            self.publish_post(args, admin_user_id=user_id)
+            try:
+                self.publish_post(
+                    publish_text,
+                    admin_user_id=user_id,
+                    channel_chat_id=int(binding["channel_chat_id"]),
+                )
+            except MaxApiError as exc:
+                self.api.send_message(user_id=user_id, text=humanize_comment_error_message(str(exc)))
             return
 
         if command == "/attach":
@@ -1189,13 +1649,40 @@ class MaxCommentsBot:
             if not args:
                 self.api.send_message(user_id=user_id, text="Формат: `/attach MESSAGE_ID`")
                 return
-            self.attach_existing_post(args, admin_user_id=user_id)
+            try:
+                self.attach_existing_post(args, admin_user_id=user_id)
+            except MaxApiError as exc:
+                self.api.send_message(user_id=user_id, text=humanize_comment_error_message(str(exc)))
+            return
+
+        if command == "/channels":
+            self.send_channel_bindings_overview(user_id)
+            return
+
+        if command == "/channel_add":
+            if not args:
+                self.api.send_message(
+                    user_id=user_id,
+                    text="Формат: `/channel_add CHANNEL_ID COMMENTS_CHAT_ID`",
+                )
+                return
+            self.add_channel_binding(user_id=user_id, args=args)
+            return
+
+        if command == "/channel_remove":
+            if not args:
+                self.api.send_message(
+                    user_id=user_id,
+                    text="Формат: `/channel_remove CHANNEL_ID`",
+                )
+                return
+            self.remove_channel_binding(user_id=user_id, args=args)
             return
 
         self.api.send_message(user_id=user_id, text="Неизвестная команда. Используйте `/help`.")
 
     def ensure_publish_ready(self, user_id: int) -> bool:
-        if is_configured_for_publishing():
+        if self.has_channel_bindings() and ADMIN_USER_IDS:
             return True
         self.api.send_message(
             user_id=user_id,
@@ -1207,36 +1694,38 @@ class MaxCommentsBot:
         return False
 
     def setup_status_text(self) -> str:
+        bindings = self.list_channel_bindings()
         missing: list[str] = []
-        if TARGET_CHANNEL_CHAT_ID is None:
-            missing.append("`MAX_CHANNEL_CHAT_ID`")
-        if COMMENTS_CHAT_ID is None:
-            missing.append("`MAX_COMMENTS_CHAT_ID`")
+        if not bindings:
+            missing.append("хотя бы одну привязку канала через `/channel_add CHANNEL_ID COMMENTS_CHAT_ID`")
         if not ADMIN_USER_IDS:
             missing.append("`MAX_ADMIN_USER_IDS`")
 
-        if not missing:
-            status = "Режим публикации настроен."
-            if uses_same_chat_for_posts_and_comments():
-                status += (
-                    "\n\n"
-                    "Внимание: канал и чат обсуждения совпадают. "
-                    "Для нормальной работы лучше использовать отдельный чат комментариев."
-                )
-            if not WEB_APP_PUBLIC_URL:
-                status += (
-                    "\n\n"
-                    "Не забудьте настроить публичный HTTPS-URL мини-приложения в кабинете MAX. "
-                    "Локальный сервер из этого проекта нужен для разработки и бэкенда комментариев."
-                )
-            return status
+        if missing:
+            return (
+                "Сейчас доступен диагностический режим.\n"
+                "Нужно настроить: "
+                f"{', '.join(missing)}\n"
+                "Используйте `/me`, чтобы получить свой `user_id`, и `/chatinfo`, чтобы получить `chat_id`."
+            )
 
-        return (
-            "Сейчас доступен диагностический режим.\n"
-            "Заполните: "
-            f"{', '.join(missing)}\n"
-            "Используйте `/me`, чтобы получить свой `user_id`, и `/chatinfo`, чтобы получить `chat_id`."
-        )
+        same_chat_bindings = [
+            row for row in bindings if int(row["channel_chat_id"]) == int(row["comments_chat_id"])
+        ]
+        status = f"Режим публикации настроен. Подключено каналов: {len(bindings)}."
+        if same_chat_bindings:
+            status += (
+                "\n\n"
+                "Внимание: для некоторых привязок канал и чат обсуждения совпадают. "
+                "Посты и техническая лента обсуждения будут смешиваться."
+            )
+        if not WEB_APP_PUBLIC_URL:
+            status += (
+                "\n\n"
+                "Не забудьте настроить публичный HTTPS-URL мини-приложения в кабинете MAX. "
+                "Локальный сервер из этого проекта нужен для разработки и бэкенда комментариев."
+            )
+        return status
 
     def send_chat_info(self, user_id: int, message: dict[str, Any]) -> None:
         recipient = message.get("recipient") or {}
@@ -1261,9 +1750,328 @@ class MaxCommentsBot:
         for post in posts:
             ref = post_ref_for_message_id(post["post_message_id"])
             lines.append(
-                f"- `{post['post_message_id']}` | `{ref}` | {post['comment_count']} комм. | {snippet(post['post_text'], 60)}"
+                f"- канал `{post['channel_chat_id']}` | пост `{post['post_message_id']}` | `{ref}` | {post['comment_count']} комм. | {snippet(post['post_text'], 60)}"
             )
         self.api.send_message(user_id=user_id, text="\n".join(lines))
+
+    def send_channel_bindings_overview(self, user_id: int) -> None:
+        bindings = self.list_channel_bindings()
+        if not bindings:
+            self.api.send_message(
+                user_id=user_id,
+                text=(
+                    "Пока нет подключённых каналов.\n"
+                    "Добавьте первый через `/channel_add CHANNEL_ID COMMENTS_CHAT_ID`."
+                ),
+            )
+            return
+
+        lines = ["Подключённые каналы:"]
+        for binding in bindings:
+            extra = ""
+            comments_chat_url = safe_text(binding["comments_chat_url"])
+            if comments_chat_url:
+                extra = f" | {comments_chat_url}"
+            lines.append(
+                f"- канал `{binding['channel_chat_id']}` -> чат комментариев `{binding['comments_chat_id']}`{extra}"
+            )
+        self.api.send_message(user_id=user_id, text="\n".join(lines))
+
+    def send_pending_channel_bindings_status(self, user_id: int) -> None:
+        self.purge_expired_bind_codes()
+        show_all = user_id in ADMIN_USER_IDS
+        pendings = self.store.list_pending_channel_bindings(
+            requested_by_user_id=None if show_all else user_id
+        )
+        if not pendings:
+            message = (
+                "Сейчас нет активных незавершённых привязок."
+                if show_all
+                else "У вас нет активных незавершённых привязок."
+            )
+            self.api.send_message(user_id=user_id, text=message)
+            return
+
+        now = datetime.now(timezone.utc)
+        lines = [
+            "Активные незавершённые привязки:"
+            if show_all
+            else "Ваши активные незавершённые привязки:"
+        ]
+        for pending in pendings:
+            try:
+                created_at = datetime.fromisoformat(pending.created_at)
+            except ValueError:
+                created_at = now
+            expires_at = created_at.timestamp() + BIND_CHANNEL_CODE_TTL_SECONDS
+            remaining_seconds = max(int(expires_at - now.timestamp()), 0)
+            channel_label = pending.channel_title or "-"
+            line = (
+                f"- код `{pending.bind_code}` | канал `{channel_label} ({pending.channel_chat_id})` | "
+                f"создан `{format_utc_timestamp(pending.created_at)}` | осталось `{format_duration_compact(remaining_seconds)}`"
+            )
+            if show_all:
+                line += f" | админ `{pending.requested_by_user_id}`"
+            lines.append(line)
+        self.api.send_message(user_id=user_id, text="\n".join(lines))
+
+    def build_link_keyboard(self, buttons: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "inline_keyboard",
+                "payload": {
+                    "buttons": [
+                        buttons
+                    ]
+                },
+            }
+        ]
+
+    def begin_channel_binding(self, *, user_id: int, message: dict[str, Any], args: str) -> None:
+        channel_chat_id, title, chat_type, chat_link = self.current_chat_context(message)
+        if channel_chat_id is None:
+            self.api.send_message(
+                user_id=user_id,
+                text="Эту команду нужно отправить прямо в канале, который хотите подключить.",
+            )
+            return
+
+        same_chat_mode = safe_text(args).lower() in {"same", "self", "here", "same_chat"}
+        if same_chat_mode:
+            self.store.upsert_channel_binding(
+                channel_chat_id=channel_chat_id,
+                comments_chat_id=channel_chat_id,
+                comments_chat_url=chat_link,
+            )
+            self.start_channel_sync()
+            attached_count = self.sync_recent_channel_posts_for_binding(
+                channel_chat_id=channel_chat_id,
+                comments_chat_id=channel_chat_id,
+            )
+            self.api.send_message(
+                user_id=user_id,
+                text=(
+                    "Канал подключён в режиме одного чата.\n"
+                    f"Канал: `{channel_chat_id}`\n"
+                    f"Чат комментариев: `{channel_chat_id}`\n"
+                    f"Подцеплено постов при первичной синхронизации: `{attached_count}`"
+                ),
+            )
+            return
+
+        bind_code = self.issue_bind_code()
+        self.store.set_pending_channel_binding(
+            bind_code=bind_code,
+            requested_by_user_id=user_id,
+            channel_chat_id=channel_chat_id,
+            channel_title=title or None,
+        )
+        lines = [
+            "Канал подготовлен к подключению комментариев.",
+            f"Канал: `{title or '-'} ({channel_chat_id})`",
+            f"Код привязки: `{bind_code}`",
+            "",
+            "Теперь откройте нужный чат комментариев и отправьте туда:",
+            f"`/bind_comments {bind_code}`",
+            "",
+            f"Код действует {BIND_CHANNEL_CODE_TTL_SECONDS // 60} минут.",
+        ]
+        share_url = max_share_url(f"/bind_comments {bind_code}")
+        self.api.send_message(user_id=user_id, text="\n".join(lines))
+        self.api.send_message(
+            user_id=user_id,
+            text=(
+                "Готовые кнопки для завершения привязки.\n"
+                "Можно выбрать отдельный чат комментариев или сразу подключить комментарии в этом же чате."
+            ),
+            attachments=self.build_link_keyboard(
+                [
+                    {
+                        "type": "link",
+                        "text": "Выбрать чат комментариев",
+                        "url": share_url,
+                    },
+                    {
+                        "type": "message",
+                        "text": "Комментарии в этом чате",
+                        "payload": "/bind_channel same",
+                    },
+                ]
+            ),
+        )
+
+    def complete_channel_binding(self, *, user_id: int, message: dict[str, Any], args: str) -> None:
+        bind_code = safe_text(args).upper()
+        if not bind_code:
+            self.api.send_message(
+                user_id=user_id,
+                text="Формат: `/bind_comments CODE`",
+            )
+            return
+
+        pending = self.get_valid_pending_channel_binding(bind_code)
+        if pending is None:
+            self.api.send_message(
+                user_id=user_id,
+                text="Код привязки не найден или уже истёк. Запустите `/bind_channel` заново в канале.",
+            )
+            return
+        if int(pending.requested_by_user_id) != int(user_id):
+            self.api.send_message(
+                user_id=user_id,
+                text="Этот код привязки создан другим пользователем. Завершить привязку должен тот же администратор.",
+            )
+            return
+
+        comments_chat_id, comments_title, _chat_type, comments_chat_link = self.current_chat_context(message)
+        if comments_chat_id is None:
+            self.api.send_message(
+                user_id=user_id,
+                text="Эту команду нужно отправить прямо в чате комментариев.",
+            )
+            return
+
+        self.store.upsert_channel_binding(
+            channel_chat_id=pending.channel_chat_id,
+            comments_chat_id=comments_chat_id,
+            comments_chat_url=comments_chat_link,
+        )
+        self.store.delete_pending_channel_binding(bind_code)
+        self.start_channel_sync()
+
+        attached_count = self.sync_recent_channel_posts_for_binding(
+            channel_chat_id=pending.channel_chat_id,
+            comments_chat_id=comments_chat_id,
+        )
+        warning = ""
+        if int(pending.channel_chat_id) == int(comments_chat_id):
+            warning = (
+                "\n\nВнимание: канал и чат комментариев совпадают. "
+                "Посты и техническая лента обсуждения будут смешиваться."
+            )
+        self.api.send_message(
+            user_id=user_id,
+            text=(
+                "Привязка завершена.\n"
+                f"Канал: `{pending.channel_title or '-'} ({pending.channel_chat_id})`\n"
+                f"Чат комментариев: `{comments_title or '-'} ({comments_chat_id})`\n"
+                f"Подцеплено постов при первичной синхронизации: `{attached_count}`"
+                f"{warning}"
+            ),
+        )
+
+    def add_channel_binding(self, *, user_id: int, args: str) -> None:
+        parts = args.split(maxsplit=2)
+        if len(parts) < 2:
+            self.api.send_message(
+                user_id=user_id,
+                text="Формат: `/channel_add CHANNEL_ID COMMENTS_CHAT_ID`",
+            )
+            return
+
+        try:
+            channel_chat_id = int(parts[0])
+            comments_chat_id = int(parts[1])
+        except ValueError:
+            self.api.send_message(
+                user_id=user_id,
+                text="CHANNEL_ID и COMMENTS_CHAT_ID должны быть числами.",
+            )
+            return
+
+        comments_chat_url = parts[2].strip() if len(parts) > 2 else None
+        self.store.upsert_channel_binding(
+            channel_chat_id=channel_chat_id,
+            comments_chat_id=comments_chat_id,
+            comments_chat_url=comments_chat_url or None,
+        )
+        self.start_channel_sync()
+
+        warning = ""
+        if channel_chat_id == comments_chat_id:
+            warning = (
+                "\n\nВнимание: канал и чат комментариев совпадают. "
+                "Посты и техническая лента обсуждения будут смешиваться."
+            )
+        self.api.send_message(
+            user_id=user_id,
+            text=(
+                "Канал подключён.\n"
+                f"Канал: `{channel_chat_id}`\n"
+                f"Чат комментариев: `{comments_chat_id}`{warning}"
+            ),
+        )
+
+    def remove_channel_binding(self, *, user_id: int, args: str) -> None:
+        try:
+            channel_chat_id = int(args.strip())
+        except ValueError:
+            self.api.send_message(
+                user_id=user_id,
+                text="CHANNEL_ID должен быть числом.",
+            )
+            return
+
+        deleted = self.store.delete_channel_binding(channel_chat_id)
+        if not deleted:
+            self.api.send_message(
+                user_id=user_id,
+                text=f"Канал `{channel_chat_id}` не найден в списке подключённых.",
+            )
+            return
+        self.api.send_message(
+            user_id=user_id,
+            text=(
+                f"Канал `{channel_chat_id}` отключён.\n"
+                "Старые посты и их комментарии останутся доступны, но новые посты бот больше не будет подцеплять автоматически."
+            ),
+        )
+
+    def resolve_publish_command_target(
+        self,
+        message: dict[str, Any],
+        args: str,
+    ) -> tuple[sqlite3.Row | None, str, str | None]:
+        clean_args = args.strip()
+        bindings = self.list_channel_bindings()
+        if not bindings:
+            return None, "", "Сначала подключите хотя бы один канал через `/channel_add CHANNEL_ID COMMENTS_CHAT_ID`."
+
+        recipient = message.get("recipient") or {}
+        current_binding = self.get_channel_binding(recipient.get("chat_id"))
+        if current_binding is not None:
+            if not clean_args:
+                return None, "", "Формат: `/publish текст поста`"
+            return current_binding, clean_args, None
+
+        if len(bindings) == 1:
+            if not clean_args:
+                return None, "", "Формат: `/publish текст поста`"
+            return bindings[0], clean_args, None
+
+        if not clean_args:
+            return (
+                None,
+                "",
+                "Подключено несколько каналов. Используйте формат `/publish CHANNEL_ID текст поста` или отправьте команду прямо в нужном канале.",
+            )
+
+        raw_channel_id, _, publish_text = clean_args.partition(" ")
+        try:
+            channel_chat_id = int(raw_channel_id)
+        except ValueError:
+            return (
+                None,
+                "",
+                "Подключено несколько каналов. Используйте формат `/publish CHANNEL_ID текст поста` или отправьте команду прямо в нужном канале.",
+            )
+
+        binding = self.get_channel_binding(channel_chat_id)
+        if binding is None:
+            return None, "", f"Канал `{channel_chat_id}` не подключён. Посмотреть список можно через `/channels`."
+        if not publish_text.strip():
+            return None, "", "После CHANNEL_ID укажите текст поста."
+        return binding, publish_text.strip(), None
 
     def resolve_post_reference(self, reference: str) -> sqlite3.Row | None:
         direct = self.store.get_post(reference)
@@ -1293,12 +2101,13 @@ class MaxCommentsBot:
         return int(sender_user_id) == int(bot_user_id)
 
     def maybe_auto_attach_channel_post(self, message: dict[str, Any]) -> bool:
-        if not is_configured_for_publishing() or TARGET_CHANNEL_CHAT_ID is None:
+        if not self.has_channel_bindings():
             return False
 
         recipient = message.get("recipient") or {}
         chat_id = recipient.get("chat_id")
-        if chat_id is None or int(chat_id) != int(TARGET_CHANNEL_CHAT_ID):
+        binding = self.get_channel_binding(chat_id)
+        if binding is None:
             return False
 
         sender = message.get("sender") or {}
@@ -1315,7 +2124,8 @@ class MaxCommentsBot:
         try:
             self.register_channel_post_for_comments(
                 post_message_id=post_message_id,
-                channel_chat_id=int(TARGET_CHANNEL_CHAT_ID),
+                channel_chat_id=int(binding["channel_chat_id"]),
+                comments_chat_id=int(binding["comments_chat_id"]),
                 post_url=message.get("url"),
                 post_text=safe_text(body.get("text")),
                 source_attachments=self.extract_post_attachments_from_message(message),
@@ -1333,10 +2143,28 @@ class MaxCommentsBot:
         return True
 
     def sync_recent_channel_posts(self, *, count: int = 50) -> int:
-        if TARGET_CHANNEL_CHAT_ID is None:
-            return 0
         attached_count = 0
-        messages = self.api.get_chat_messages(TARGET_CHANNEL_CHAT_ID, count=count)
+        for binding in self.list_channel_bindings():
+            channel_chat_id = int(binding["channel_chat_id"])
+            try:
+                attached_count += self.sync_recent_channel_posts_for_binding(
+                    channel_chat_id=channel_chat_id,
+                    comments_chat_id=int(binding["comments_chat_id"]),
+                    count=count,
+                )
+            except Exception:
+                logger.exception("Failed to sync channel %s", channel_chat_id)
+        return attached_count
+
+    def sync_recent_channel_posts_for_binding(
+        self,
+        *,
+        channel_chat_id: int,
+        comments_chat_id: int,
+        count: int = 50,
+    ) -> int:
+        attached_count = 0
+        messages = self.api.get_chat_messages(channel_chat_id, count=count)
         for message in reversed(messages):
             if not self.should_auto_attach_channel_message(message):
                 continue
@@ -1346,7 +2174,8 @@ class MaxCommentsBot:
                 continue
             self.register_channel_post_for_comments(
                 post_message_id=post_message_id,
-                channel_chat_id=int(TARGET_CHANNEL_CHAT_ID),
+                channel_chat_id=channel_chat_id,
+                comments_chat_id=comments_chat_id,
                 post_url=message.get("url"),
                 post_text=safe_text(body.get("text")),
                 source_attachments=self.extract_post_attachments_from_message(message),
@@ -1357,9 +2186,7 @@ class MaxCommentsBot:
     def should_auto_attach_channel_message(self, message: dict[str, Any]) -> bool:
         recipient = message.get("recipient") or {}
         chat_id = recipient.get("chat_id")
-        if TARGET_CHANNEL_CHAT_ID is None or chat_id is None:
-            return False
-        if int(chat_id) != int(TARGET_CHANNEL_CHAT_ID):
+        if self.get_channel_binding(chat_id) is None:
             return False
 
         body = message.get("body") or {}
@@ -1433,6 +2260,7 @@ class MaxCommentsBot:
         *,
         post_message_id: str,
         channel_chat_id: int,
+        comments_chat_id: int,
         post_url: str | None,
         post_text: str,
         source_attachments: list[dict[str, Any]] | None,
@@ -1440,10 +2268,16 @@ class MaxCommentsBot:
         clean_post_text = strip_managed_channel_footer(post_text)
         clean_attachments = list(source_attachments or [])
         existing_post = self.store.get_post(post_message_id)
+        stored_comments_chat_id = (
+            int(existing_post["comments_chat_id"])
+            if existing_post is not None and existing_post["comments_chat_id"] is not None
+            else int(comments_chat_id)
+        )
 
         self.store.upsert_post(
             post_message_id=post_message_id,
             channel_chat_id=channel_chat_id,
+            comments_chat_id=stored_comments_chat_id,
             post_url=post_url,
             post_text=clean_post_text,
             post_attachments=clean_attachments,
@@ -1458,12 +2292,10 @@ class MaxCommentsBot:
         if not discussion_message_id:
             discussion_text = self.build_discussion_post_text(post_message_id, clean_post_text, post_url)
             discussion_message = self.api.send_message(
-                chat_id=COMMENTS_CHAT_ID,
+                chat_id=stored_comments_chat_id,
                 text=discussion_text,
-            ).get("message", {})
-            discussion_message_id = safe_text(
-                discussion_message.get("body", {}).get("mid") or discussion_message.get("mid")
             )
+            discussion_message_id = extract_message_id(discussion_message)
             if discussion_message_id:
                 self.store.set_discussion_message_id(post_message_id, discussion_message_id)
 
@@ -1481,9 +2313,12 @@ class MaxCommentsBot:
             raise MaxApiError("Post was registered but could not be reloaded")
         return stored_post
 
-    def publish_post(self, text: str, *, admin_user_id: int) -> None:
+    def publish_post(self, text: str, *, admin_user_id: int, channel_chat_id: int) -> None:
+        binding = self.get_channel_binding(channel_chat_id)
+        if binding is None:
+            raise MaxApiError("Channel is not connected")
         channel_message = self.api.send_message(
-            chat_id=TARGET_CHANNEL_CHAT_ID,
+            chat_id=channel_chat_id,
             text=text,
         ).get("message", {})
 
@@ -1494,7 +2329,8 @@ class MaxCommentsBot:
         post_url = channel_message.get("url")
         self.register_channel_post_for_comments(
             post_message_id=post_message_id,
-            channel_chat_id=int(TARGET_CHANNEL_CHAT_ID),
+            channel_chat_id=int(binding["channel_chat_id"]),
+            comments_chat_id=int(binding["comments_chat_id"]),
             post_url=post_url,
             post_text=safe_text(channel_message.get("body", {}).get("text")) or text,
             source_attachments=self.extract_post_attachments_from_message(channel_message),
@@ -1514,12 +2350,16 @@ class MaxCommentsBot:
         message = self.api.get_message(post_message_id)
         post_text = safe_text(((message.get("body") or {}).get("text")))
         recipient = message.get("recipient") or {}
-        chat_id = recipient.get("chat_id") or TARGET_CHANNEL_CHAT_ID
+        chat_id = recipient.get("chat_id")
+        binding = self.get_channel_binding(chat_id)
+        if binding is None:
+            raise MaxApiError("Channel is not connected")
         post_url = message.get("url")
 
         self.register_channel_post_for_comments(
             post_message_id=post_message_id,
-            channel_chat_id=int(chat_id),
+            channel_chat_id=int(binding["channel_chat_id"]),
+            comments_chat_id=int(binding["comments_chat_id"]),
             post_url=post_url,
             post_text=post_text,
             source_attachments=self.extract_post_attachments_from_message(message),
@@ -1801,6 +2641,7 @@ class MaxCommentsBot:
         self,
         *,
         post_message_id: str,
+        comments_chat_id: int,
         display_name: str,
         username: str | None,
         text: str,
@@ -1823,7 +2664,7 @@ class MaxCommentsBot:
             link_payload = {"type": "reply", "mid": discussion_message_id}
 
         self.api.send_message(
-            chat_id=COMMENTS_CHAT_ID,
+            chat_id=comments_chat_id,
             text="\n".join(lines),
             link=link_payload,
             notify=False,
@@ -1967,6 +2808,7 @@ class MaxCommentsBot:
         clean_text = safe_text(text)
         if not clean_text and not media_items:
             raise MaxApiError("Comment is empty")
+        ensure_comment_text_has_no_links(clean_text)
         parent_comment = None
         if parent_comment_id is not None:
             parent_comment = self.store.get_comment(int(parent_comment_id))
@@ -1982,9 +2824,11 @@ class MaxCommentsBot:
             text=clean_text,
             media=media_items,
             source_message_id=source_message_id,
+            discussion_copy_message_id=None,
             source_kind=source_kind,
         )
         comment_count = self.store.get_comment_count(post_message_id)
+        comments_chat_id = self.resolve_post_comments_chat_id(post)
         discussion_text = self.build_discussion_comment_text(
             post_message_id=post_message_id,
             comment_count=comment_count,
@@ -2000,12 +2844,19 @@ class MaxCommentsBot:
         if post["discussion_message_id"]:
             link_payload = {"type": "reply", "mid": post["discussion_message_id"]}
 
-        self.send_message_with_attachment_retry(
-            chat_id=COMMENTS_CHAT_ID,
+        discussion_comment_message = self.send_message_with_attachment_retry(
+            chat_id=comments_chat_id,
             text=discussion_text,
             attachments=discussion_attachments or None,
             link=link_payload,
         )
+        discussion_copy_message_id = extract_message_id(discussion_comment_message)
+        if discussion_copy_message_id:
+            self.store.set_comment_discussion_copy_message_id(
+                comment_id=comment_id,
+                post_message_id=post_message_id,
+                discussion_copy_message_id=discussion_copy_message_id,
+            )
 
         for admin_id in ADMIN_USER_IDS:
             self.api.send_message(
@@ -2063,10 +2914,17 @@ class MaxCommentsBot:
                 source_kind="bot",
                 source_message_id=source_message_id,
             )
-        except MaxApiError:
+        except MaxApiError as exc:
+            recoverable_errors = {
+                "Comment is empty",
+                "Comment is too long",
+                "Links are not allowed in comments",
+            }
+            if safe_text(str(exc)) in recoverable_errors:
+                self.store.set_pending_comment(user_id, pending.post_message_id)
             self.api.send_message(
                 user_id=user_id,
-                text="Пост для комментария больше не найден. Попробуйте открыть обсуждение заново.",
+                text=humanize_comment_error_message(str(exc)),
             )
             return
 
@@ -2221,6 +3079,7 @@ class MaxCommentsBot:
         self.delete_comment_media_files(
             deserialize_comment_media(deleted["media_json"])
         )
+        warning = self.delete_comment_discussion_copy(deleted)
 
         comment_count = self.store.get_comment_count(post["post_message_id"])
         self.refresh_post_comment_button(
@@ -2232,7 +3091,37 @@ class MaxCommentsBot:
             "ok": True,
             "deleted_comment_id": comment_id,
             "post": self.serialize_post(self.store.get_post(post["post_message_id"]) or post),
+            "warning": warning,
         }
+
+    def delete_comment_discussion_copy(self, comment: sqlite3.Row) -> str | None:
+        discussion_copy_message_id = safe_text(comment["discussion_copy_message_id"])
+        if not discussion_copy_message_id:
+            logger.info(
+                "Comment %s has no discussion_copy_message_id; skipping mirror deletion",
+                comment["id"],
+            )
+            return (
+                "Комментарий удалён из ленты. Копию в чате обсуждения автоматически удалить не удалось."
+            )
+
+        try:
+            self.api.delete_message(discussion_copy_message_id)
+        except MaxApiError as exc:
+            logger.warning(
+                "Failed to delete mirrored discussion message %s for comment %s: %s",
+                discussion_copy_message_id,
+                comment["id"],
+                exc,
+            )
+            if "24" in str(exc):
+                return (
+                    "Комментарий удалён из ленты. Копию в чате обсуждения уже нельзя удалить автоматически из-за ограничения MAX в 24 часа."
+                )
+            return (
+                "Комментарий удалён из ленты. Копию в чате обсуждения автоматически удалить не удалось."
+            )
+        return None
 
     def update_comment_from_webapp(
         self,
@@ -2259,6 +3148,7 @@ class MaxCommentsBot:
             raise MaxApiError("Comment is too long")
         if not clean_text and not media_items:
             raise MaxApiError("Comment is empty")
+        ensure_comment_text_has_no_links(clean_text)
 
         updated = self.store.update_comment_text(
             comment_id=comment_id,
@@ -2270,6 +3160,7 @@ class MaxCommentsBot:
 
         self.send_comment_edit_notice(
             post_message_id=post["post_message_id"],
+            comments_chat_id=self.resolve_post_comments_chat_id(post),
             display_name=auth_user.display_name,
             username=auth_user.username,
             text=clean_text,
@@ -2289,6 +3180,12 @@ class MaxCommentsBot:
         return {
             "post_message_id": post["post_message_id"],
             "post_ref": post_ref_for_message_id(post["post_message_id"]),
+            "channel_chat_id": int(post["channel_chat_id"]),
+            "comments_chat_id": (
+                int(post["comments_chat_id"])
+                if post["comments_chat_id"] is not None
+                else None
+            ),
             "comment_code": comment_code_for_post(post["post_message_id"]),
             "post_text": post["post_text"],
             "post_preview": snippet(post["post_text"], 220),
@@ -2367,7 +3264,7 @@ class CommentWebServer:
         app = self.app
 
         class Handler(BaseHTTPRequestHandler):
-            server_version = "MaxCommentsWeb/1.0"
+            server_version = f"MaxCommentsWeb/{APP_VERSION}"
 
             def do_GET(self) -> None:
                 parsed = parse.urlparse(self.path)
@@ -2385,7 +3282,7 @@ class CommentWebServer:
                     self.serve_comment_media(path)
                     return
                 if path == "/api/healthz":
-                    self.send_json(HTTPStatus.OK, {"ok": True})
+                    self.send_json(HTTPStatus.OK, {"ok": True, "version": APP_VERSION})
                     return
                 if path.startswith("/api/posts/"):
                     self.handle_api_get(path, parse.parse_qs(parsed.query, keep_blank_values=True))
@@ -2410,6 +3307,7 @@ class CommentWebServer:
                 if path == "/api/healthz":
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("X-App-Version", APP_VERSION)
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
@@ -2545,7 +3443,7 @@ class CommentWebServer:
                     self.send_json(HTTPStatus.UNAUTHORIZED, {"error": str(exc)})
                     return
                 except MaxApiError as exc:
-                    self.send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": humanize_comment_error_message(str(exc))})
                     return
                 self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
@@ -2577,7 +3475,7 @@ class CommentWebServer:
                     status = HTTPStatus.BAD_REQUEST
                     if "not found" in str(exc).lower():
                         status = HTTPStatus.NOT_FOUND
-                    self.send_json(status, {"error": str(exc)})
+                    self.send_json(status, {"error": humanize_comment_error_message(str(exc))})
                     return
 
                 self.send_json(HTTPStatus.CREATED, result)
@@ -2611,7 +3509,7 @@ class CommentWebServer:
                         status = HTTPStatus.NOT_FOUND
                     elif "only admins" in message or "only your own" in message:
                         status = HTTPStatus.FORBIDDEN
-                    self.send_json(status, {"error": str(exc)})
+                    self.send_json(status, {"error": humanize_comment_error_message(str(exc))})
                     return
 
                 self.send_json(HTTPStatus.OK, result)
@@ -2653,7 +3551,7 @@ class CommentWebServer:
                         status = HTTPStatus.NOT_FOUND
                     elif "only your own" in message:
                         status = HTTPStatus.FORBIDDEN
-                    self.send_json(status, {"error": str(exc)})
+                    self.send_json(status, {"error": humanize_comment_error_message(str(exc))})
                     return
 
                 self.send_json(HTTPStatus.OK, result)

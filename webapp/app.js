@@ -6,6 +6,9 @@
   const AUTO_REFRESH_INTERVAL_MS = 4000;
   const AUTO_REFRESH_NEAR_BOTTOM_PX = 88;
   const BOTTOM_SCROLL_RETRY_DELAYS_MS = [72, 180, 360];
+  const LINKS_BLOCKED_MESSAGE = "Ссылки запрещены правилами сервиса.";
+  const COMMENT_LINK_RE =
+    /(^|[^@\w])((?:https?:\/\/|ftp:\/\/|www\.)\S+|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d{2,5})?(?:\/[^\s]*)?)/i;
 
   const state = {
     postRef: null,
@@ -170,6 +173,10 @@
       return firstLine;
     }
     return `${firstLine.slice(0, 81)}...`;
+  }
+
+  function containsForbiddenLink(text) {
+    return COMMENT_LINK_RE.test(String(text || ""));
   }
 
   function updateComposerCount() {
@@ -961,13 +968,18 @@
     setBanner("Удаляем комментарий…", "loading");
 
     try {
-      await fetchJson(`/api/posts/${encodeURIComponent(state.postRef)}/comments/${commentId}`, {
+      const result = await fetchJson(`/api/posts/${encodeURIComponent(state.postRef)}/comments/${commentId}`, {
         method: "DELETE",
         headers: buildApiHeaders(),
       });
       await loadThread({ loadOlder: false });
-      clearBanner();
-      haptic("success");
+      if (result && result.warning) {
+        setBanner(String(result.warning), "warning");
+        haptic("warning");
+      } else {
+        clearBanner();
+        haptic("success");
+      }
     } catch (error) {
       setBanner(error.message || "Не удалось удалить комментарий.", "error");
       haptic("error");
@@ -1010,6 +1022,11 @@
     const isEditing = state.editingCommentId !== null;
     const replyToCommentId = state.replyToCommentId;
     if ((!isEditing && !text && !photo) || !state.postRef) {
+      return;
+    }
+    if (containsForbiddenLink(text)) {
+      setBanner(LINKS_BLOCKED_MESSAGE, "error");
+      haptic("warning");
       return;
     }
 
@@ -1201,6 +1218,16 @@
       event.preventDefault();
       elements.form.requestSubmit();
     }
+  });
+  elements.input.addEventListener("paste", function (event) {
+    const clipboard = event.clipboardData || window.clipboardData;
+    const pastedText = clipboard ? clipboard.getData("text") : "";
+    if (!containsForbiddenLink(pastedText)) {
+      return;
+    }
+    event.preventDefault();
+    setBanner(LINKS_BLOCKED_MESSAGE, "error");
+    haptic("warning");
   });
   document.addEventListener("click", function (event) {
     if (state.menuOpenedAt && Date.now() - state.menuOpenedAt < 250) {

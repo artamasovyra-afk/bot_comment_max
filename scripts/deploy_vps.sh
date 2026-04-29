@@ -24,6 +24,7 @@ SCP_OPTS=(
 APP_FILES=(
   "$ROOT_DIR/bot.py"
   "$ROOT_DIR/config.py"
+  "$ROOT_DIR/VERSION"
 )
 
 WEBAPP_FILES=(
