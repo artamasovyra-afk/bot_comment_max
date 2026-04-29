@@ -15,6 +15,12 @@ SSH_OPTS=(
   -o StrictHostKeyChecking=yes
 )
 
+SCP_OPTS=(
+  -P "$DEPLOY_PORT"
+  -o BatchMode=yes
+  -o StrictHostKeyChecking=yes
+)
+
 APP_FILES=(
   "$ROOT_DIR/bot.py"
   "$ROOT_DIR/config.py"
@@ -26,8 +32,8 @@ WEBAPP_FILES=(
   "$ROOT_DIR/webapp/app.js"
 )
 
-scp "${SSH_OPTS[@]}" "${APP_FILES[@]}" "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/"
-scp "${SSH_OPTS[@]}" "${WEBAPP_FILES[@]}" "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/webapp/"
+scp "${SCP_OPTS[@]}" "${APP_FILES[@]}" "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/"
+scp "${SCP_OPTS[@]}" "${WEBAPP_FILES[@]}" "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/webapp/"
 
 ssh "${SSH_OPTS[@]}" "$DEPLOY_USER@$DEPLOY_HOST" \
   "cd '$DEPLOY_PATH' && python3 -m py_compile bot.py config.py && systemctl restart '$DEPLOY_SERVICE' && systemctl is-active '$DEPLOY_SERVICE'"
