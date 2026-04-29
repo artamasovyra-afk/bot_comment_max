@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+    <title>Комментарии к посту</title>
+    <link rel="stylesheet" href="/webapp/app.css?v=20260429r">
+    <script src="https://st.max.ru/js/max-web-app.js"></script>
+  </head>
+  <body>
+    <div class="app" id="app-root">
+      <main class="chat-shell">
+        <section class="thread-card">
+          <div class="state-banner" id="state-banner">Загружаем комментарии…</div>
+          <div class="thread-actions">
+            <button id="load-older-button" class="thread-button" type="button" hidden>
+              Показать ранние сообщения
+            </button>
+          </div>
+          <div id="comments-list" class="comments-list"></div>
+        </section>
+
+        <footer class="composer-dock">
+          <div id="reply-state" class="reply-state" hidden>
+            <div class="reply-state__copy">
+              <div class="reply-state__title">Ответ на комментарий</div>
+              <div id="reply-state-caption" class="reply-state__caption">
+                Ответ будет привязан к выбранному комментарию
+              </div>
+            </div>
+            <button type="button" id="reply-cancel" class="reply-state__cancel">Отмена</button>
+          </div>
+          <div id="editor-state" class="editor-state" hidden>
+            <div class="editor-state__copy">
+              <div class="editor-state__title">Редактирование комментария</div>
+              <div id="editor-state-caption" class="editor-state__caption">
+                Измените текст и отправьте комментарий заново
+              </div>
+            </div>
+            <button type="button" id="editor-cancel" class="editor-state__cancel">Отмена</button>
+          </div>
+          <div id="composer-preview" class="composer-preview" hidden>
+            <div class="composer-preview__card">
+              <img id="composer-preview-image" class="composer-preview__image" alt="Фото к комментарию">
+              <div class="composer-preview__meta">
+                <div class="composer-preview__title">Фото будет отправлено с комментарием</div>
+                <div id="composer-preview-caption" class="composer-preview__caption">Одно изображение</div>
+              </div>
+              <button type="button" id="composer-preview-remove" class="composer-preview__remove" aria-label="Убрать фото">
+                ×
+              </button>
+            </div>
+          </div>
+          <form id="comment-form" class="composer">
+            <input
+              id="photo-input"
+              type="file"
+              accept="image/*"
+              class="composer__file-input"
+              hidden
+            >
+            <button type="button" id="photo-button" class="composer__media-button" aria-label="Прикрепить фото">
+              <svg viewBox="0 0 24 24" aria-hidden="true" class="composer__media-icon">
+                <path d="M7 5.5A2.5 2.5 0 0 0 4.5 8v8A2.5 2.5 0 0 0 7 18.5h10a2.5 2.5 0 0 0 2.5-2.5V8A2.5 2.5 0 0 0 17 5.5H7Zm0 1.5h10c.55 0 1 .45 1 1v6.41l-2.63-2.63a1.5 1.5 0 0 0-2.12 0l-2.04 2.04-1.08-1.08a1.5 1.5 0 0 0-2.12 0L6 14.75V8c0-.55.45-1 1-1Zm2.25 1.25a1.25 1.25 0 1 0 0 2.5 1.25 1.25 0 0 0 0-2.5Z"></path>
+              </svg>
+            </button>
+            <textarea
+              id="comment-input"
+              class="composer__input composer__input--singleline"
+              rows="1"
+              maxlength="4000"
+              placeholder="Сообщение"
+              aria-label="Сообщение"
+            ></textarea>
+            <button type="submit" id="submit-button" class="send-button send-button--icon" aria-label="Отправить">
+              <svg viewBox="0 0 24 24" aria-hidden="true" class="send-button__icon">
+                <path d="M12 4.75 18.25 11h-4.1v8.25H9.85V11h-4.1L12 4.75Z"></path>
+              </svg>
+            </button>
+          </form>
+        </footer>
+      </main>
+    </div>
+
+    <template id="comment-template">
+      <article class="message">
+        <div class="message__avatar"></div>
+        <div class="message__content">
+          <div class="message__bubble">
+            <div class="message__meta">
+              <div class="message__author"></div>
+            </div>
+            <div class="message__reply" hidden>
+              <div class="message__reply-author"></div>
+              <div class="message__reply-text"></div>
+            </div>
+            <div class="message__media" hidden></div>
+            <p class="message__text"></p>
+            <time class="message__time"></time>
+          </div>
+        </div>
+      </article>
+    </template>
+
+    <template id="post-template">
+      <section class="post-card">
+        <p class="post-card__text"></p>
+        <div class="post-card__media" hidden></div>
+      </section>
+    </template>
+
+    <div id="comment-menu-backdrop" class="comment-menu-backdrop" hidden></div>
+    <div id="comment-menu" class="comment-menu" hidden>
+      <button type="button" id="comment-menu-reply" class="comment-menu__item">
+        Ответить
+      </button>
+      <button type="button" id="comment-menu-edit" class="comment-menu__item">
+        Редактировать
+      </button>
+      <button type="button" id="comment-menu-delete" class="comment-menu__item comment-menu__item--danger">
+        Удалить
+      </button>
+    </div>
+
+    <script src="/webapp/app.js?v=20260429r"></script>
+  </body>
+</html>
