@@ -394,6 +394,21 @@ def normalize_comments_page_limit(raw_value: Any) -> int:
     return max(1, min(limit, COMMENTS_PAGE_SIZE_MAX))
 
 
+def chat_title_from_payload(payload: dict[str, Any]) -> str:
+    title = safe_text(
+        payload.get("title")
+        or payload.get("name")
+        or payload.get("chat_title")
+        or payload.get("chat_name")
+    )
+    if title:
+        return title
+    nested_chat = payload.get("chat")
+    if isinstance(nested_chat, dict):
+        return chat_title_from_payload(nested_chat)
+    return ""
+
+
 @dataclass
 class PendingComment:
     user_id: int
@@ -516,6 +531,9 @@ class MaxApiClient:
         if not isinstance(subscriptions, list):
             return []
         return [item for item in subscriptions if isinstance(item, dict)]
+
+    def get_chat(self, chat_id: int) -> dict[str, Any]:
+        return self._request("GET", f"/chats/{int(chat_id)}")
 
     def create_subscription(
         self,
@@ -1339,6 +1357,7 @@ class MaxCommentsBot:
         self.bind_cleanup_thread: threading.Thread | None = None
         self.update_queue: queue.Queue = queue.Queue()
         self.update_worker_thread: threading.Thread | None = None
+        self.chat_title_cache: dict[int, tuple[str, float]] = {}
 
     def run(self) -> None:
         logger.info("Starting MAX Comments bot version %s", APP_VERSION)
@@ -1988,11 +2007,34 @@ class MaxCommentsBot:
             lines.append(line)
         self.api.send_message(user_id=user_id, text="\n".join(lines))
 
+    def get_chat_title_cached(self, chat_id: int) -> str:
+        normalized_chat_id = int(chat_id)
+        cached = self.chat_title_cache.get(normalized_chat_id)
+        now = time.time()
+        if cached is not None and now - cached[1] < 10 * 60:
+            return cached[0]
+        try:
+            payload = self.api.get_chat(normalized_chat_id)
+        except MaxApiError:
+            logger.exception("Failed to load chat title for %s", normalized_chat_id)
+            return cached[0] if cached is not None else ""
+        title = chat_title_from_payload(payload)
+        self.chat_title_cache[normalized_chat_id] = (title, now)
+        return title
+
     def serialize_channel_binding(self, binding: sqlite3.Row) -> dict[str, Any]:
+        channel_chat_id = int(binding["channel_chat_id"])
+        comments_chat_id = int(binding["comments_chat_id"])
+        channel_title = self.get_chat_title_cached(channel_chat_id)
+        comments_chat_title = self.get_chat_title_cached(comments_chat_id)
         same_chat = int(binding["channel_chat_id"]) == int(binding["comments_chat_id"])
         return {
-            "channel_chat_id": int(binding["channel_chat_id"]),
-            "comments_chat_id": int(binding["comments_chat_id"]),
+            "channel_chat_id": channel_chat_id,
+            "channel_title": channel_title,
+            "channel_label": channel_title or str(channel_chat_id),
+            "comments_chat_id": comments_chat_id,
+            "comments_chat_title": comments_chat_title,
+            "comments_chat_label": comments_chat_title or str(comments_chat_id),
             "comments_chat_url": safe_text(binding["comments_chat_url"]),
             "created_at": safe_text(binding["created_at"]),
             "updated_at": safe_text(binding["updated_at"]),

@@ -79,7 +79,9 @@ function safeHttpUrl(value) {
 }
 
 function optionLabel(channel) {
-  return `${channel.channel_chat_id} → ${channel.comments_chat_id}`;
+  const channelName = channel.channel_label || String(channel.channel_chat_id);
+  const commentsName = channel.comments_chat_label || String(channel.comments_chat_id);
+  return `${channelName} → ${commentsName}`;
 }
 
 function fillStatus(data) {
@@ -120,8 +122,10 @@ function renderChannels(channels) {
     item.innerHTML = `
       <div class="item-row">
         <div>
-          <div class="item-title">${channel.channel_chat_id}</div>
-          <div class="item-meta">Чат комментариев: ${channel.comments_chat_id}</div>
+          <div class="item-title">${escapeHtml(channel.channel_label || channel.channel_chat_id)}</div>
+          <div class="item-meta">Канал: ${escapeHtml(channel.channel_label || channel.channel_chat_id)}</div>
+          <div class="item-meta">Чат комментариев: ${escapeHtml(channel.comments_chat_label || channel.comments_chat_id)}</div>
+          <div class="item-meta">ID: ${channel.channel_chat_id} → ${channel.comments_chat_id}</div>
           ${channel.comments_chat_url ? `<div class="item-meta">${escapeHtml(channel.comments_chat_url)}</div>` : ""}
         </div>
         <span class="pill">${channel.same_chat ? "один чат" : "отдельный чат"}</span>
