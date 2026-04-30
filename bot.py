@@ -208,8 +208,21 @@ def comment_code_for_post(post_message_id: str) -> str:
     return f"c{digest[:8]}"
 
 
+def comment_count_label(comment_count: int) -> str:
+    value = max(int(comment_count), 0)
+    mod10 = value % 10
+    mod100 = value % 100
+    if mod10 == 1 and mod100 != 11:
+        noun = "комментарий"
+    elif 2 <= mod10 <= 4 and not 12 <= mod100 <= 14:
+        noun = "комментария"
+    else:
+        noun = "комментариев"
+    return f"{value} {noun}"
+
+
 def comment_button_text(comment_count: int) -> str:
-    return f"💬 {max(comment_count, 0)}"
+    return comment_count_label(comment_count)
 
 
 def max_share_url(text: str) -> str:
