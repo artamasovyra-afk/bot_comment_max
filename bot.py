@@ -1712,6 +1712,8 @@ class MaxCommentsBot:
 
     def handle_senderless_channel_command(self, message: dict[str, Any], text: str) -> bool:
         command, _, raw_args = text.partition(" ")
+        if command == "/bind_comments":
+            return self.handle_senderless_bind_comments_command(message, raw_args.strip())
         if command not in {"/setup_channel", "/bind_channel"}:
             return False
         recipient = message.get("recipient") or {}
@@ -1761,6 +1763,59 @@ class MaxCommentsBot:
             message=synthetic_message,
             args=raw_args.strip(),
             response_chat_id=channel_chat_id,
+        )
+        return True
+
+    def handle_senderless_bind_comments_command(self, message: dict[str, Any], args: str) -> bool:
+        recipient = message.get("recipient") or {}
+        try:
+            comments_chat_id = int(recipient.get("chat_id"))
+        except (TypeError, ValueError):
+            return True
+
+        bind_code = safe_text(args).upper()
+        if not bind_code:
+            self.api.send_message(
+                chat_id=comments_chat_id,
+                text="Формат: `/bind_comments CODE`",
+            )
+            return True
+
+        pending = self.get_valid_pending_channel_binding(bind_code)
+        if pending is None:
+            self.api.send_message(
+                chat_id=comments_chat_id,
+                text="Код привязки не найден или уже истёк. Запустите `/setup_channel` заново в канале.",
+            )
+            return True
+
+        try:
+            chat = self.api.get_chat(comments_chat_id)
+        except MaxApiError as exc:
+            logger.exception("Failed to resolve senderless comments chat: %s", comments_chat_id)
+            self.api.send_message(
+                chat_id=comments_chat_id,
+                text=humanize_comment_error_message(str(exc)),
+            )
+            return True
+
+        synthetic_message = dict(message)
+        synthetic_message["sender"] = {"user_id": pending.requested_by_user_id}
+        synthetic_recipient = dict(recipient)
+        synthetic_recipient.update(
+            {
+                "chat_id": comments_chat_id,
+                "chat_type": safe_text(chat.get("type")) or safe_text(recipient.get("chat_type")),
+                "title": chat_title_from_payload(chat) or safe_text(recipient.get("title")),
+                "link": safe_text(chat.get("link")) or safe_text(recipient.get("link")),
+            }
+        )
+        synthetic_message["recipient"] = synthetic_recipient
+        self.complete_channel_binding(
+            user_id=pending.requested_by_user_id,
+            message=synthetic_message,
+            args=bind_code,
+            response_chat_id=comments_chat_id,
         )
         return True
 
@@ -2324,33 +2379,44 @@ class MaxCommentsBot:
             ),
         )
 
-    def complete_channel_binding(self, *, user_id: int, message: dict[str, Any], args: str) -> None:
+    def complete_channel_binding(
+        self,
+        *,
+        user_id: int,
+        message: dict[str, Any],
+        args: str,
+        response_chat_id: int | None = None,
+    ) -> None:
         bind_code = safe_text(args).upper()
         if not bind_code:
-            self.api.send_message(
+            self.send_setup_channel_response(
                 user_id=user_id,
+                response_chat_id=response_chat_id,
                 text="Формат: `/bind_comments CODE`",
             )
             return
 
         pending = self.get_valid_pending_channel_binding(bind_code)
         if pending is None:
-            self.api.send_message(
+            self.send_setup_channel_response(
                 user_id=user_id,
+                response_chat_id=response_chat_id,
                 text="Код привязки не найден или уже истёк. Запустите `/bind_channel` заново в канале.",
             )
             return
         if int(pending.requested_by_user_id) != int(user_id):
-            self.api.send_message(
+            self.send_setup_channel_response(
                 user_id=user_id,
+                response_chat_id=response_chat_id,
                 text="Этот код привязки создан другим пользователем. Завершить привязку должен тот же администратор.",
             )
             return
 
         comments_chat_id, comments_title, _chat_type, comments_chat_link = self.current_chat_context(message)
         if comments_chat_id is None:
-            self.api.send_message(
+            self.send_setup_channel_response(
                 user_id=user_id,
+                response_chat_id=response_chat_id,
                 text="Эту команду нужно отправить прямо в чате комментариев.",
             )
             return
@@ -2373,8 +2439,9 @@ class MaxCommentsBot:
                 "\n\nВнимание: канал и чат комментариев совпадают. "
                 "Посты и техническая лента обсуждения будут смешиваться."
             )
-        self.api.send_message(
+        self.send_setup_channel_response(
             user_id=user_id,
+            response_chat_id=response_chat_id,
             text=(
                 "Привязка завершена.\n"
                 f"Канал: `{pending.channel_title or '-'} ({pending.channel_chat_id})`\n"
