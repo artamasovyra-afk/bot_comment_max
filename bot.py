@@ -1681,6 +1681,8 @@ class MaxCommentsBot:
         sender = message.get("sender") or {}
         user_id = sender.get("user_id")
         if not user_id:
+            if text.startswith("/") and self.handle_senderless_channel_command(message, text):
+                return
             return
         if self.is_own_message(sender):
             return
@@ -1707,6 +1709,60 @@ class MaxCommentsBot:
             return
 
         self.save_user_comment(message, pending, text)
+
+    def handle_senderless_channel_command(self, message: dict[str, Any], text: str) -> bool:
+        command, _, raw_args = text.partition(" ")
+        if command not in {"/setup_channel", "/bind_channel"}:
+            return False
+        recipient = message.get("recipient") or {}
+        try:
+            channel_chat_id = int(recipient.get("chat_id"))
+        except (TypeError, ValueError):
+            return True
+
+        try:
+            chat = self.api.get_chat(channel_chat_id)
+        except MaxApiError as exc:
+            logger.exception("Failed to resolve senderless setup command chat: %s", channel_chat_id)
+            self.api.send_message(
+                chat_id=channel_chat_id,
+                text=humanize_comment_error_message(str(exc)),
+            )
+            return True
+
+        owner_id = validate_positive_int(
+            chat.get("owner_id"),
+            minimum=1,
+            maximum=10**18,
+        )
+        if owner_id is None or owner_id not in ADMIN_USER_IDS:
+            self.api.send_message(
+                chat_id=channel_chat_id,
+                text=(
+                    "Не удалось выполнить настройку: владелец канала не найден в списке администраторов бота."
+                ),
+            )
+            return True
+
+        synthetic_message = dict(message)
+        synthetic_message["sender"] = {"user_id": owner_id}
+        synthetic_recipient = dict(recipient)
+        synthetic_recipient.update(
+            {
+                "chat_id": channel_chat_id,
+                "chat_type": safe_text(chat.get("type")) or safe_text(recipient.get("chat_type")),
+                "title": chat_title_from_payload(chat) or safe_text(recipient.get("title")),
+                "link": safe_text(chat.get("link")) or safe_text(recipient.get("link")),
+            }
+        )
+        synthetic_message["recipient"] = synthetic_recipient
+        self.begin_channel_binding(
+            user_id=owner_id,
+            message=synthetic_message,
+            args=raw_args.strip(),
+            response_chat_id=channel_chat_id,
+        )
+        return True
 
     def handle_command(self, message: dict[str, Any], text: str) -> None:
         sender = message.get("sender") or {}
@@ -2161,7 +2217,35 @@ class MaxCommentsBot:
             }
         ]
 
-    def begin_channel_binding(self, *, user_id: int, message: dict[str, Any], args: str) -> None:
+    def send_setup_channel_response(
+        self,
+        *,
+        user_id: int,
+        response_chat_id: int | None,
+        text: str,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> None:
+        if response_chat_id is not None:
+            self.api.send_message(
+                chat_id=response_chat_id,
+                text=text,
+                attachments=attachments,
+            )
+            return
+        self.api.send_message(
+            user_id=user_id,
+            text=text,
+            attachments=attachments,
+        )
+
+    def begin_channel_binding(
+        self,
+        *,
+        user_id: int,
+        message: dict[str, Any],
+        args: str,
+        response_chat_id: int | None = None,
+    ) -> None:
         channel_chat_id, title, chat_type, chat_link = self.current_chat_context(message)
         if channel_chat_id is None:
             self.api.send_message(
@@ -2182,8 +2266,9 @@ class MaxCommentsBot:
                 channel_chat_id=channel_chat_id,
                 comments_chat_id=channel_chat_id,
             )
-            self.api.send_message(
+            self.send_setup_channel_response(
                 user_id=user_id,
+                response_chat_id=response_chat_id,
                 text=(
                     "Канал создан в админке и подключён в режиме одного чата.\n"
                     f"Канал: `{title or '-'} ({channel_chat_id})`\n"
@@ -2211,9 +2296,14 @@ class MaxCommentsBot:
             f"Код действует {BIND_CHANNEL_CODE_TTL_SECONDS // 60} минут.",
         ]
         share_url = max_share_url(f"/bind_comments {bind_code}")
-        self.api.send_message(user_id=user_id, text="\n".join(lines))
-        self.api.send_message(
+        self.send_setup_channel_response(
             user_id=user_id,
+            response_chat_id=response_chat_id,
+            text="\n".join(lines),
+        )
+        self.send_setup_channel_response(
+            user_id=user_id,
+            response_chat_id=response_chat_id,
             text=(
                 "Готовые кнопки для завершения привязки.\n"
                 "Можно выбрать отдельный чат комментариев или сразу подключить комментарии в этом же чате."
