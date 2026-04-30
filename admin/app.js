@@ -280,24 +280,6 @@ async function handlePublish(event) {
   }
 }
 
-async function handleAttach(event) {
-  event.preventDefault();
-  setNotice("");
-  try {
-    const result = await requestJson("/api/admin/attach", {
-      method: "POST",
-      body: JSON.stringify({
-        post_message_id: $("#attach-message-id").value.trim(),
-      }),
-    });
-    event.currentTarget.reset();
-    await loadState();
-    setNotice(`Комментарии прикреплены к посту: ${result.post_message_id}`);
-  } catch (error) {
-    setNotice(error.message, "error");
-  }
-}
-
 async function handleSync() {
   setNotice("");
   try {
@@ -332,7 +314,6 @@ $("#refresh-button").addEventListener("click", loadState);
 $("#sync-button").addEventListener("click", handleSync);
 $("#channel-form").addEventListener("submit", handleChannelSubmit);
 $("#publish-form").addEventListener("submit", handlePublish);
-$("#attach-form").addEventListener("submit", handleAttach);
 $("#channels-list").addEventListener("click", handleListClick);
 
 loadState();

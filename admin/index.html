@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Админка MAX Comments</title>
-    <link rel="stylesheet" href="/admin/app.css?v=20260430c" />
+    <link rel="stylesheet" href="/admin/app.css?v=20260430d" />
   </head>
   <body>
     <main class="shell">
@@ -60,23 +60,6 @@
 
         <section class="panel">
           <div class="panel-header">
-            <h2>Публикация</h2>
-          </div>
-          <form id="publish-form" class="form-grid">
-            <label class="field">
-              <span>Канал</span>
-              <select id="publish-channel" required></select>
-            </label>
-            <label class="field full">
-              <span>Текст поста</span>
-              <textarea id="publish-text" rows="5" maxlength="4000" required></textarea>
-            </label>
-            <button class="primary-button" type="submit">Опубликовать</button>
-          </form>
-        </section>
-
-        <section class="panel">
-          <div class="panel-header">
             <h2>Каналы</h2>
             <button id="sync-button" class="ghost-button" type="button">Синхронизировать</button>
           </div>
@@ -98,25 +81,12 @@
           <div id="channels-list" class="list"></div>
         </section>
 
-        <section class="panel">
-          <div class="panel-header">
-            <h2>Существующий пост</h2>
-          </div>
-          <form id="attach-form" class="form-grid compact">
-            <label class="field wide">
-              <span>Message ID поста</span>
-              <input id="attach-message-id" required />
-            </label>
-            <button class="primary-button" type="submit">Прикрепить</button>
-          </form>
-        </section>
-
         <section class="columns">
           <article class="panel">
             <div class="panel-header">
               <h2>Последние посты</h2>
             </div>
-            <div id="posts-list" class="list"></div>
+            <div id="posts-list" class="list posts-list"></div>
           </article>
 
           <article class="panel">
@@ -126,9 +96,26 @@
             <div id="pending-list" class="list"></div>
           </article>
         </section>
+
+        <section class="panel publish-panel">
+          <div class="panel-header">
+            <h2>Публикация</h2>
+          </div>
+          <form id="publish-form" class="form-grid">
+            <label class="field">
+              <span>Канал</span>
+              <select id="publish-channel" required></select>
+            </label>
+            <label class="field full">
+              <span>Текст поста</span>
+              <textarea id="publish-text" rows="5" maxlength="4000" required></textarea>
+            </label>
+            <button class="primary-button" type="submit">Опубликовать</button>
+          </form>
+        </section>
       </section>
     </main>
 
-    <script src="/admin/app.js?v=20260430c"></script>
+    <script src="/admin/app.js?v=20260430d"></script>
   </body>
 </html>
