@@ -172,7 +172,7 @@ function renderPending(bindings) {
   const list = $("#pending-list");
   list.innerHTML = "";
   if (!bindings.length) {
-    list.innerHTML = '<div class="empty">Активных кодов нет.</div>';
+    list.innerHTML = '<div class="empty">Каналов в процессе настройки нет.</div>';
     return;
   }
   for (const binding of bindings) {
@@ -181,12 +181,16 @@ function renderPending(bindings) {
     item.innerHTML = `
       <div class="item-row">
         <div>
-          <div class="item-title">${escapeHtml(binding.bind_code)}</div>
-          <div class="item-meta">${escapeHtml(binding.channel_title || "Канал")} (${binding.channel_chat_id})</div>
+          <div class="item-title">${escapeHtml(binding.channel_label || "Канал")}</div>
+          <div class="item-meta">ID канала: ${binding.channel_chat_id}</div>
+          <div class="item-meta">Команда: ${escapeHtml(binding.setup_command || `/bind_comments ${binding.bind_code}`)}</div>
         </div>
-        <span class="pill">${escapeHtml(binding.remaining_display)}</span>
+        <span class="pill">ожидает чат</span>
       </div>
-      <div class="item-meta">Админ: ${binding.requested_by_user_id}</div>
+      <div class="item-row">
+        <span class="item-meta">Админ: ${binding.requested_by_user_id}</span>
+        <span class="item-meta">Осталось: ${escapeHtml(binding.remaining_display)}</span>
+      </div>
     `;
     list.append(item);
   }

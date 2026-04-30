@@ -1742,9 +1742,10 @@ class MaxCommentsBot:
                     "`/bind_status` - показать активные коды незавершённых привязок\n"
                     "`/chatinfo` - показать данные текущего чата\n\n"
                     "Быстрая привязка без ручного ввода ID:\n"
+                    "`/setup_channel` - создать канал в админке и начать подключение\n"
                     "`/bind_channel` - отправить прямо в канале\n"
                     "`/bind_comments CODE` - отправить в чате комментариев\n"
-                    "`/bind_channel same` - если комментарии должны жить в этом же чате\n\n"
+                    "`/setup_channel same` - если комментарии должны жить в этом же чате\n\n"
                     "Если администратор публикует пост вручную прямо в канале, кнопка комментариев тоже добавится автоматически.\n\n"
                     "Диагностика:\n"
                     "`/me` - показать мой user id"
@@ -1796,7 +1797,7 @@ class MaxCommentsBot:
             )
             return
 
-        if command == "/bind_channel":
+        if command in {"/bind_channel", "/setup_channel"}:
             self.begin_channel_binding(user_id=user_id, message=message, args=args)
             return
 
@@ -2068,14 +2069,17 @@ class MaxCommentsBot:
         expires_at = created_at.timestamp() + BIND_CHANNEL_CODE_TTL_SECONDS
         remaining_seconds = max(int(expires_at - current_time.timestamp()), 0)
         return {
+            "status": "pending_comments_chat",
             "bind_code": pending.bind_code,
             "requested_by_user_id": pending.requested_by_user_id,
             "channel_chat_id": pending.channel_chat_id,
             "channel_title": pending.channel_title or "",
+            "channel_label": pending.channel_title or str(pending.channel_chat_id),
             "created_at": pending.created_at,
             "created_at_display": format_utc_timestamp(pending.created_at),
             "remaining_seconds": remaining_seconds,
             "remaining_display": format_duration_compact(remaining_seconds),
+            "setup_command": f"/bind_comments {pending.bind_code}",
         }
 
     def get_admin_state(self) -> dict[str, Any]:
@@ -2181,9 +2185,9 @@ class MaxCommentsBot:
             self.api.send_message(
                 user_id=user_id,
                 text=(
-                    "Канал подключён в режиме одного чата.\n"
-                    f"Канал: `{channel_chat_id}`\n"
-                    f"Чат комментариев: `{channel_chat_id}`\n"
+                    "Канал создан в админке и подключён в режиме одного чата.\n"
+                    f"Канал: `{title or '-'} ({channel_chat_id})`\n"
+                    f"Чат комментариев: `{title or '-'} ({channel_chat_id})`\n"
                     f"Подцеплено постов при первичной синхронизации: `{attached_count}`"
                 ),
             )
@@ -2197,11 +2201,11 @@ class MaxCommentsBot:
             channel_title=title or None,
         )
         lines = [
-            "Канал подготовлен к подключению комментариев.",
+            "Канал создан в админке со статусом `Ожидает чат комментариев`.",
             f"Канал: `{title or '-'} ({channel_chat_id})`",
             f"Код привязки: `{bind_code}`",
             "",
-            "Теперь откройте нужный чат комментариев и отправьте туда:",
+            "Теперь создайте или откройте нужный чат комментариев и отправьте туда:",
             f"`/bind_comments {bind_code}`",
             "",
             f"Код действует {BIND_CHANNEL_CODE_TTL_SECONDS // 60} минут.",
@@ -2224,7 +2228,7 @@ class MaxCommentsBot:
                     {
                         "type": "message",
                         "text": "Комментарии в этом чате",
-                        "payload": "/bind_channel same",
+                        "payload": "/setup_channel same",
                     },
                 ]
             ),
