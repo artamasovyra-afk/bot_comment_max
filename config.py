@@ -62,6 +62,7 @@ COMMENTS_CHAT_ID = optional_int_env("MAX_COMMENTS_CHAT_ID")
 COMMENTS_CHAT_URL = os.getenv("MAX_COMMENTS_CHAT_URL", "").strip()
 
 ADMIN_USER_IDS = parse_optional_admin_ids(optional_env("MAX_ADMIN_USER_IDS"))
+ADMIN_PANEL_TOKEN = optional_env("MAX_ADMIN_PANEL_TOKEN")
 
 DATABASE_PATH = os.getenv("MAX_DATABASE_PATH", str(BASE_DIR / "data" / "max_comments.sqlite3"))
 POLL_TIMEOUT_SECONDS = int(os.getenv("MAX_POLL_TIMEOUT_SECONDS", "30"))

@@ -8,6 +8,7 @@ All notable changes to this project will be tracked here.
 
 - Переключаемый режим доставки событий `polling/webhook` с webhook-endpoint внутри встроенного HTTP-сервера.
 - Автоматическое создание и обновление webhook-подписки MAX через `/subscriptions`.
+- Браузерная админка `/admin` для управления каналами, публикациями, привязкой постов и синхронизацией.
 
 ### Changed
 

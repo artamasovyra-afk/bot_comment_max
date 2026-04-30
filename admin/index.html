@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Админка MAX Comments</title>
+    <link rel="stylesheet" href="/admin/app.css?v=20260430a" />
+  </head>
+  <body>
+    <main class="shell">
+      <section id="login-view" class="login-view hidden">
+        <form id="login-form" class="login-panel">
+          <div>
+            <p class="eyebrow">MAX Comments</p>
+            <h1>Админка бота</h1>
+          </div>
+          <label class="field">
+            <span>Токен доступа</span>
+            <input id="login-token" type="password" autocomplete="current-password" required />
+          </label>
+          <button class="primary-button" type="submit">Войти</button>
+          <p id="login-error" class="form-error" aria-live="polite"></p>
+        </form>
+      </section>
+
+      <section id="admin-view" class="admin-view hidden">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">MAX Comments</p>
+            <h1>Панель управления</h1>
+          </div>
+          <div class="topbar-actions">
+            <button id="refresh-button" class="icon-button" type="button" title="Обновить">
+              <span aria-hidden="true">↻</span>
+            </button>
+            <button id="logout-button" class="ghost-button" type="button">Выйти</button>
+          </div>
+        </header>
+
+        <div id="notice" class="notice hidden" aria-live="polite"></div>
+
+        <section class="status-grid" aria-label="Статус">
+          <article class="status-tile">
+            <span>Версия</span>
+            <strong id="status-version">-</strong>
+          </article>
+          <article class="status-tile">
+            <span>Режим</span>
+            <strong id="status-mode">-</strong>
+          </article>
+          <article class="status-tile">
+            <span>Бот</span>
+            <strong id="status-bot">-</strong>
+          </article>
+          <article class="status-tile">
+            <span>Каналов</span>
+            <strong id="status-channels">0</strong>
+          </article>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Публикация</h2>
+          </div>
+          <form id="publish-form" class="form-grid">
+            <label class="field">
+              <span>Канал</span>
+              <select id="publish-channel" required></select>
+            </label>
+            <label class="field full">
+              <span>Текст поста</span>
+              <textarea id="publish-text" rows="5" maxlength="4000" required></textarea>
+            </label>
+            <button class="primary-button" type="submit">Опубликовать</button>
+          </form>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Каналы</h2>
+            <button id="sync-button" class="ghost-button" type="button">Синхронизировать</button>
+          </div>
+          <form id="channel-form" class="form-grid compact">
+            <label class="field">
+              <span>ID канала</span>
+              <input id="channel-id" inputmode="numeric" required />
+            </label>
+            <label class="field">
+              <span>ID чата комментариев</span>
+              <input id="comments-chat-id" inputmode="numeric" required />
+            </label>
+            <label class="field">
+              <span>Ссылка на чат</span>
+              <input id="comments-chat-url" type="url" />
+            </label>
+            <button class="primary-button" type="submit">Добавить</button>
+          </form>
+          <div id="channels-list" class="list"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Существующий пост</h2>
+          </div>
+          <form id="attach-form" class="form-grid compact">
+            <label class="field wide">
+              <span>Message ID поста</span>
+              <input id="attach-message-id" required />
+            </label>
+            <button class="primary-button" type="submit">Прикрепить</button>
+          </form>
+        </section>
+
+        <section class="columns">
+          <article class="panel">
+            <div class="panel-header">
+              <h2>Последние посты</h2>
+            </div>
+            <div id="posts-list" class="list"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-header">
+              <h2>Коды привязки</h2>
+            </div>
+            <div id="pending-list" class="list"></div>
+          </article>
+        </section>
+      </section>
+    </main>
+
+    <script src="/admin/app.js?v=20260430a"></script>
+  </body>
+</html>

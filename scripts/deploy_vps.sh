@@ -33,8 +33,18 @@ WEBAPP_FILES=(
   "$ROOT_DIR/webapp/app.js"
 )
 
+ADMIN_FILES=(
+  "$ROOT_DIR/admin/index.html"
+  "$ROOT_DIR/admin/app.css"
+  "$ROOT_DIR/admin/app.js"
+)
+
+ssh "${SSH_OPTS[@]}" "$DEPLOY_USER@$DEPLOY_HOST" \
+  "mkdir -p '$DEPLOY_PATH/webapp' '$DEPLOY_PATH/admin'"
+
 scp "${SCP_OPTS[@]}" "${APP_FILES[@]}" "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/"
 scp "${SCP_OPTS[@]}" "${WEBAPP_FILES[@]}" "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/webapp/"
+scp "${SCP_OPTS[@]}" "${ADMIN_FILES[@]}" "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/admin/"
 
 ssh "${SSH_OPTS[@]}" "$DEPLOY_USER@$DEPLOY_HOST" \
   "cd '$DEPLOY_PATH' && python3 -m py_compile bot.py config.py && systemctl restart '$DEPLOY_SERVICE' && systemctl is-active '$DEPLOY_SERVICE'"

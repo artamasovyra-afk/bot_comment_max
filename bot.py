@@ -21,6 +21,7 @@ from typing import Any
 from urllib import error, parse, request
 
 from config import (
+    ADMIN_PANEL_TOKEN,
     ADMIN_USER_IDS,
     BOT_TOKEN,
     CHANNEL_SYNC_INTERVAL_SECONDS,
@@ -52,6 +53,7 @@ logger = logging.getLogger("max-comments-bot")
 APP_ROOT_DIR = Path(__file__).resolve().parent
 VERSION_FILE = APP_ROOT_DIR / "VERSION"
 WEBAPP_DIR = APP_ROOT_DIR / "webapp"
+ADMIN_DIR = APP_ROOT_DIR / "admin"
 COMMENT_MEDIA_DIR = Path(DATABASE_PATH).resolve().parent / "comment_media"
 COMMENT_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 COMMENT_IMAGE_DATA_URL_MAX_LENGTH = 16 * 1024 * 1024
@@ -62,6 +64,8 @@ BIND_CHANNEL_CODE_TTL_SECONDS = 30 * 60
 BIND_CHANNEL_CLEANUP_INTERVAL_SECONDS = 10 * 60
 SUPPORTED_DELIVERY_MODES = {"polling", "webhook"}
 WEBHOOK_UPDATE_TYPES = ["message_created"]
+ADMIN_SESSION_COOKIE = "max_comments_admin"
+ADMIN_SESSION_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
 def read_app_version() -> str:
@@ -1984,6 +1988,121 @@ class MaxCommentsBot:
             lines.append(line)
         self.api.send_message(user_id=user_id, text="\n".join(lines))
 
+    def serialize_channel_binding(self, binding: sqlite3.Row) -> dict[str, Any]:
+        same_chat = int(binding["channel_chat_id"]) == int(binding["comments_chat_id"])
+        return {
+            "channel_chat_id": int(binding["channel_chat_id"]),
+            "comments_chat_id": int(binding["comments_chat_id"]),
+            "comments_chat_url": safe_text(binding["comments_chat_url"]),
+            "created_at": safe_text(binding["created_at"]),
+            "updated_at": safe_text(binding["updated_at"]),
+            "same_chat": same_chat,
+        }
+
+    def serialize_post_summary(self, post: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "post_message_id": safe_text(post["post_message_id"]),
+            "post_ref": post_ref_for_message_id(post["post_message_id"]),
+            "channel_chat_id": int(post["channel_chat_id"]),
+            "comments_chat_id": int(post["comments_chat_id"]) if post["comments_chat_id"] is not None else None,
+            "post_url": safe_text(post["post_url"]),
+            "post_text": safe_text(post["post_text"]),
+            "comment_count": int(post["comment_count"]),
+            "created_at": safe_text(post["created_at"]),
+            "updated_at": safe_text(post["updated_at"]),
+        }
+
+    def serialize_pending_channel_binding_status(
+        self,
+        pending: PendingChannelBinding,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        current_time = now or datetime.now(timezone.utc)
+        try:
+            created_at = datetime.fromisoformat(pending.created_at)
+        except ValueError:
+            created_at = current_time
+        expires_at = created_at.timestamp() + BIND_CHANNEL_CODE_TTL_SECONDS
+        remaining_seconds = max(int(expires_at - current_time.timestamp()), 0)
+        return {
+            "bind_code": pending.bind_code,
+            "requested_by_user_id": pending.requested_by_user_id,
+            "channel_chat_id": pending.channel_chat_id,
+            "channel_title": pending.channel_title or "",
+            "created_at": pending.created_at,
+            "created_at_display": format_utc_timestamp(pending.created_at),
+            "remaining_seconds": remaining_seconds,
+            "remaining_display": format_duration_compact(remaining_seconds),
+        }
+
+    def get_admin_state(self) -> dict[str, Any]:
+        self.purge_expired_bind_codes()
+        now = datetime.now(timezone.utc)
+        return {
+            "app": {
+                "version": APP_VERSION,
+                "delivery_mode": self.delivery_mode,
+                "web_app_public_url": WEB_APP_PUBLIC_URL,
+                "webhook_public_url": self.webhook_url(),
+                "webhook_path": WEBHOOK_PATH,
+                "bot_username": self.get_bot_username(),
+                "channel_sync_interval_seconds": CHANNEL_SYNC_INTERVAL_SECONDS,
+                "admin_count": len(ADMIN_USER_IDS),
+            },
+            "channels": [
+                self.serialize_channel_binding(binding)
+                for binding in self.list_channel_bindings()
+            ],
+            "posts": [
+                self.serialize_post_summary(post)
+                for post in self.store.list_posts(limit=30)
+            ],
+            "pending_bindings": [
+                self.serialize_pending_channel_binding_status(pending, now=now)
+                for pending in self.store.list_pending_channel_bindings()
+            ],
+        }
+
+    def admin_add_channel_binding(
+        self,
+        *,
+        channel_chat_id: int,
+        comments_chat_id: int,
+        comments_chat_url: str | None = None,
+        sync_now: bool = True,
+    ) -> dict[str, Any]:
+        self.store.upsert_channel_binding(
+            channel_chat_id=channel_chat_id,
+            comments_chat_id=comments_chat_id,
+            comments_chat_url=comments_chat_url or None,
+        )
+        self.start_channel_sync()
+        attached_count = 0
+        if sync_now:
+            attached_count = self.sync_recent_channel_posts_for_binding(
+                channel_chat_id=channel_chat_id,
+                comments_chat_id=comments_chat_id,
+            )
+        binding = self.get_channel_binding(channel_chat_id)
+        if binding is None:
+            raise MaxApiError("Channel is not connected")
+        return {
+            "ok": True,
+            "binding": self.serialize_channel_binding(binding),
+            "attached_count": attached_count,
+        }
+
+    def admin_remove_channel_binding(self, *, channel_chat_id: int) -> dict[str, Any]:
+        deleted = self.store.delete_channel_binding(channel_chat_id)
+        if not deleted:
+            raise MaxApiError("Channel is not connected")
+        return {"ok": True, "channel_chat_id": channel_chat_id}
+
+    def admin_sync_recent_channel_posts(self) -> dict[str, Any]:
+        attached_count = self.sync_recent_channel_posts()
+        return {"ok": True, "attached_count": attached_count}
+
     def build_link_keyboard(self, buttons: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [
             {
@@ -2482,7 +2601,7 @@ class MaxCommentsBot:
             raise MaxApiError("Post was registered but could not be reloaded")
         return stored_post
 
-    def publish_post(self, text: str, *, admin_user_id: int, channel_chat_id: int) -> None:
+    def publish_post(self, text: str, *, admin_user_id: int | None, channel_chat_id: int) -> dict[str, Any]:
         binding = self.get_channel_binding(channel_chat_id)
         if binding is None:
             raise MaxApiError("Channel is not connected")
@@ -2513,9 +2632,18 @@ class MaxCommentsBot:
         ]
         if extra_link:
             lines.append(f"WebApp: {extra_link}")
-        self.api.send_message(user_id=admin_user_id, text="\n".join(lines))
+        if admin_user_id is not None:
+            self.api.send_message(user_id=admin_user_id, text="\n".join(lines))
+        return {
+            "ok": True,
+            "post_message_id": post_message_id,
+            "post_url": safe_text(post_url),
+            "webapp_url": safe_text(extra_link),
+            "channel_chat_id": int(binding["channel_chat_id"]),
+            "comments_chat_id": int(binding["comments_chat_id"]),
+        }
 
-    def attach_existing_post(self, post_message_id: str, *, admin_user_id: int) -> None:
+    def attach_existing_post(self, post_message_id: str, *, admin_user_id: int | None) -> dict[str, Any]:
         message = self.api.get_message(post_message_id)
         post_text = safe_text(((message.get("body") or {}).get("text")))
         recipient = message.get("recipient") or {}
@@ -2534,13 +2662,20 @@ class MaxCommentsBot:
             source_attachments=self.extract_post_attachments_from_message(message),
         )
 
-        self.api.send_message(
-            user_id=admin_user_id,
-            text=(
-                "Комментарии подключены к существующему посту.\n"
-                f"ID поста: `{post_message_id}`"
-            ),
-        )
+        if admin_user_id is not None:
+            self.api.send_message(
+                user_id=admin_user_id,
+                text=(
+                    "Комментарии подключены к существующему посту.\n"
+                    f"ID поста: `{post_message_id}`"
+                ),
+            )
+        return {
+            "ok": True,
+            "post_message_id": post_message_id,
+            "channel_chat_id": int(binding["channel_chat_id"]),
+            "comments_chat_id": int(binding["comments_chat_id"]),
+        }
 
     def build_comment_button(
         self,
@@ -3438,6 +3573,15 @@ class CommentWebServer:
             def do_GET(self) -> None:
                 parsed = parse.urlparse(self.path)
                 path = parsed.path
+                if path in {"/admin", "/admin/", "/admin/index.html"}:
+                    self.serve_admin_static("index.html", "text/html; charset=utf-8")
+                    return
+                if path == "/admin/app.css":
+                    self.serve_admin_static("app.css", "text/css; charset=utf-8")
+                    return
+                if path == "/admin/app.js":
+                    self.serve_admin_static("app.js", "application/javascript; charset=utf-8")
+                    return
                 if path in {"/", "/index.html", "/webapp", "/webapp/"}:
                     self.serve_static("index.html", "text/html; charset=utf-8")
                     return
@@ -3461,6 +3605,11 @@ class CommentWebServer:
                         },
                     )
                     return
+                if path == "/api/admin/state":
+                    if not self.require_admin():
+                        return
+                    self.send_json(HTTPStatus.OK, app.get_admin_state())
+                    return
                 if path.startswith("/api/posts/"):
                     self.handle_api_get(path, parse.parse_qs(parsed.query, keep_blank_values=True))
                     return
@@ -3469,6 +3618,15 @@ class CommentWebServer:
             def do_HEAD(self) -> None:
                 parsed = parse.urlparse(self.path)
                 path = parsed.path
+                if path in {"/admin", "/admin/", "/admin/index.html"}:
+                    self.send_admin_static_headers("index.html", "text/html; charset=utf-8")
+                    return
+                if path == "/admin/app.css":
+                    self.send_admin_static_headers("app.css", "text/css; charset=utf-8")
+                    return
+                if path == "/admin/app.js":
+                    self.send_admin_static_headers("app.js", "application/javascript; charset=utf-8")
+                    return
                 if path in {"/", "/index.html", "/webapp", "/webapp/"}:
                     self.send_static_headers("index.html", "text/html; charset=utf-8")
                     return
@@ -3499,6 +3657,15 @@ class CommentWebServer:
                 if path == WEBHOOK_PATH:
                     self.handle_webhook()
                     return
+                if path == "/admin/login":
+                    self.handle_admin_login()
+                    return
+                if path == "/admin/logout":
+                    self.handle_admin_logout()
+                    return
+                if path.startswith("/api/admin/"):
+                    self.handle_admin_post(path)
+                    return
                 if path.startswith("/api/posts/") and path.endswith("/comments"):
                     self.handle_create_comment(path)
                     return
@@ -3515,6 +3682,9 @@ class CommentWebServer:
             def do_DELETE(self) -> None:
                 parsed = parse.urlparse(self.path)
                 path = parsed.path
+                if path.startswith("/api/admin/"):
+                    self.handle_admin_delete(path)
+                    return
                 if path.startswith("/api/posts/") and "/comments/" in path:
                     self.handle_delete_comment(path)
                     return
@@ -3524,6 +3694,20 @@ class CommentWebServer:
                 file_path = WEBAPP_DIR / file_name
                 if not file_path.exists():
                     self.send_json(HTTPStatus.NOT_FOUND, {"error": "Static file not found"})
+                    return
+                payload = file_path.read_bytes()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def serve_admin_static(self, file_name: str, content_type: str) -> None:
+                file_path = ADMIN_DIR / file_name
+                if not file_path.exists():
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": "Admin file not found"})
                     return
                 payload = file_path.read_bytes()
                 self.send_response(HTTPStatus.OK)
@@ -3578,6 +3762,21 @@ class CommentWebServer:
 
             def send_static_headers(self, file_name: str, content_type: str) -> None:
                 file_path = WEBAPP_DIR / file_name
+                if not file_path.exists():
+                    self.send_response(HTTPStatus.NOT_FOUND)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                size = file_path.stat().st_size
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(size))
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.end_headers()
+
+            def send_admin_static_headers(self, file_name: str, content_type: str) -> None:
+                file_path = ADMIN_DIR / file_name
                 if not file_path.exists():
                     self.send_response(HTTPStatus.NOT_FOUND)
                     self.send_header("Content-Length", "0")
@@ -3684,6 +3883,97 @@ class CommentWebServer:
                     accepted += 1
                 self.send_json(HTTPStatus.OK, {"ok": True, "accepted": accepted})
 
+            def handle_admin_login(self) -> None:
+                if not ADMIN_PANEL_TOKEN:
+                    self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Admin panel is not configured"})
+                    return
+                payload = self.read_json_body()
+                if payload is None:
+                    return
+                provided = safe_text(payload.get("token"))
+                if not hmac.compare_digest(provided, safe_text(ADMIN_PANEL_TOKEN)):
+                    self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "Неверный токен доступа"})
+                    return
+                self.send_json(
+                    HTTPStatus.OK,
+                    {"ok": True},
+                    headers={"Set-Cookie": self.admin_session_cookie(safe_text(ADMIN_PANEL_TOKEN))},
+                )
+
+            def handle_admin_logout(self) -> None:
+                self.send_json(
+                    HTTPStatus.OK,
+                    {"ok": True},
+                    headers={"Set-Cookie": self.admin_session_cookie("", max_age=0)},
+                )
+
+            def handle_admin_post(self, path: str) -> None:
+                if not self.require_admin():
+                    return
+                payload = self.read_json_body()
+                if payload is None:
+                    return
+                try:
+                    if path == "/api/admin/channels":
+                        channel_chat_id = int(payload.get("channel_chat_id"))
+                        comments_chat_id = int(payload.get("comments_chat_id"))
+                        result = app.admin_add_channel_binding(
+                            channel_chat_id=channel_chat_id,
+                            comments_chat_id=comments_chat_id,
+                            comments_chat_url=safe_text(payload.get("comments_chat_url")) or None,
+                            sync_now=bool(payload.get("sync_now", True)),
+                        )
+                        self.send_json(HTTPStatus.OK, result)
+                        return
+                    if path == "/api/admin/publish":
+                        channel_chat_id = int(payload.get("channel_chat_id"))
+                        text = safe_text(payload.get("text"))
+                        if not text:
+                            raise MaxApiError("Post text is empty")
+                        result = app.publish_post(
+                            text,
+                            admin_user_id=None,
+                            channel_chat_id=channel_chat_id,
+                        )
+                        self.send_json(HTTPStatus.CREATED, result)
+                        return
+                    if path == "/api/admin/attach":
+                        post_message_id = safe_text(payload.get("post_message_id"))
+                        if not post_message_id:
+                            raise MaxApiError("Post message id is empty")
+                        result = app.attach_existing_post(post_message_id, admin_user_id=None)
+                        self.send_json(HTTPStatus.OK, result)
+                        return
+                    if path == "/api/admin/sync":
+                        self.send_json(HTTPStatus.OK, app.admin_sync_recent_channel_posts())
+                        return
+                except (TypeError, ValueError):
+                    self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Проверьте числовые ID"})
+                    return
+                except MaxApiError as exc:
+                    self.send_json(HTTPStatus.BAD_REQUEST, {"error": humanize_comment_error_message(str(exc))})
+                    return
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+
+            def handle_admin_delete(self, path: str) -> None:
+                if not self.require_admin():
+                    return
+                prefix = "/api/admin/channels/"
+                if not path.startswith(prefix):
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+                    return
+                raw_channel_chat_id = parse.unquote(path.removeprefix(prefix)).split("/", 1)[0]
+                try:
+                    channel_chat_id = int(raw_channel_chat_id)
+                    result = app.admin_remove_channel_binding(channel_chat_id=channel_chat_id)
+                except ValueError:
+                    self.send_json(HTTPStatus.BAD_REQUEST, {"error": "CHANNEL_ID должен быть числом"})
+                    return
+                except MaxApiError as exc:
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": humanize_comment_error_message(str(exc))})
+                    return
+                self.send_json(HTTPStatus.OK, result)
+
             def handle_delete_comment(self, path: str) -> None:
                 reference, suffix = self.extract_post_reference(path)
                 if reference is None or not suffix.startswith("/comments/"):
@@ -3774,6 +4064,18 @@ class CommentWebServer:
                 content_length = int(self.headers.get("Content-Length", "0") or "0")
                 return self.rfile.read(content_length)
 
+            def read_json_body(self) -> dict[str, Any] | None:
+                raw_body = self.read_body()
+                try:
+                    payload = json.loads(raw_body.decode("utf-8") or "{}")
+                except json.JSONDecodeError:
+                    self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid JSON"})
+                    return None
+                if not isinstance(payload, dict):
+                    self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid JSON"})
+                    return None
+                return payload
+
             def read_init_data_header(self) -> str:
                 return safe_text(
                     self.headers.get("X-Max-Init-Data")
@@ -3792,12 +4094,54 @@ class CommentWebServer:
                 )
                 return hmac.compare_digest(provided, expected)
 
-            def send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+            def admin_session_cookie(self, value: str, *, max_age: int = ADMIN_SESSION_MAX_AGE_SECONDS) -> str:
+                encoded_value = parse.quote(value, safe="")
+                secure = "; Secure" if WEB_APP_PUBLIC_URL.startswith("https://") else ""
+                return (
+                    f"{ADMIN_SESSION_COOKIE}={encoded_value}; Path=/; Max-Age={int(max_age)}; "
+                    f"HttpOnly; SameSite=Lax{secure}"
+                )
+
+            def admin_auth_token(self) -> str:
+                auth_header = safe_text(self.headers.get("Authorization") or self.headers.get("authorization"))
+                if auth_header.lower().startswith("bearer "):
+                    return auth_header[7:].strip()
+                cookie_header = safe_text(self.headers.get("Cookie") or self.headers.get("cookie"))
+                for raw_item in cookie_header.split(";"):
+                    name, separator, value = raw_item.strip().partition("=")
+                    if separator and name == ADMIN_SESSION_COOKIE:
+                        return parse.unquote(value)
+                return ""
+
+            def is_admin_authenticated(self) -> bool:
+                expected = safe_text(ADMIN_PANEL_TOKEN)
+                if not expected:
+                    return False
+                return hmac.compare_digest(self.admin_auth_token(), expected)
+
+            def require_admin(self) -> bool:
+                if not ADMIN_PANEL_TOKEN:
+                    self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Admin panel is not configured"})
+                    return False
+                if not self.is_admin_authenticated():
+                    self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "Unauthorized"})
+                    return False
+                return True
+
+            def send_json(
+                self,
+                status: HTTPStatus,
+                payload: dict[str, Any],
+                *,
+                headers: dict[str, str] | None = None,
+            ) -> None:
                 raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(raw)))
                 self.send_header("Cache-Control", "no-store")
+                for header_name, header_value in (headers or {}).items():
+                    self.send_header(header_name, header_value)
                 self.end_headers()
                 self.wfile.write(raw)
 

@@ -50,6 +50,7 @@
 ```bash
 export MAX_BOT_TOKEN="..."
 export MAX_ADMIN_USER_IDS="11111111,22222222"
+export MAX_ADMIN_PANEL_TOKEN="long-random-token"
 ```
 
 Переменные ниже остаются как legacy-bootstrap и могут автоматически создать первую привязку канала при пустой базе:
@@ -132,6 +133,27 @@ MAX_WEB_APP_PUBLIC_URL + MAX_WEBHOOK_PATH
 - удаляет устаревшие webhook-подписки с других URL
 
 При старте в режиме `polling` бот пытается отключить webhook на своём текущем URL, чтобы long polling снова работал.
+
+## Админка
+
+Браузерная админка доступна на:
+
+```text
+https://your-domain.example/admin
+```
+
+Вход выполняется по значению `MAX_ADMIN_PANEL_TOKEN`.
+
+Через админку можно:
+
+- смотреть состояние бота, версию и режим доставки событий
+- добавлять и удалять привязки каналов
+- публиковать посты в подключённые каналы
+- прикреплять комментарии к уже существующим постам
+- запускать ручную синхронизацию последних постов
+- смотреть последние посты и активные коды привязки
+
+Команды в MAX остаются как запасной способ управления.
 
 ## Подключение нескольких каналов
 
@@ -305,6 +327,12 @@ ssh root@188.225.58.60 'install -m 700 -d /root/.ssh && cat >> /root/.ssh/author
 ## API мини-приложения
 
 - `GET /api/healthz` — возвращает `ok`, текущую `version` и `delivery_mode`
+- `GET /api/admin/state`
+- `POST /api/admin/channels`
+- `DELETE /api/admin/channels/<channel_id>`
+- `POST /api/admin/publish`
+- `POST /api/admin/attach`
+- `POST /api/admin/sync`
 - `GET /api/posts/<post_ref>`
 - `GET /api/posts/<post_ref>/comments`
 - `POST /api/posts/<post_ref>/comments`
