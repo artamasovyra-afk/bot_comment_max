@@ -67,6 +67,10 @@ export MAX_WEB_SERVER_ENABLED="1"
 export MAX_WEB_SERVER_HOST="127.0.0.1"
 export MAX_WEB_SERVER_PORT="8080"
 export MAX_WEB_APP_PUBLIC_URL="https://your-domain.example"
+export MAX_DELIVERY_MODE="polling"
+export MAX_WEBHOOK_PATH="/webhook"
+export MAX_WEBHOOK_PUBLIC_URL="https://your-domain.example/webhook"
+export MAX_WEBHOOK_SECRET="change-me"
 export MAX_WEB_APP_AUTH_MAX_AGE_SECONDS="3600"
 export MAX_CHANNEL_SYNC_INTERVAL_SECONDS="5"
 ```
@@ -100,6 +104,34 @@ http://127.0.0.1:8080/
 3. Получаете публичный `https://your-domain.example`.
 4. Указываете этот URL в настройках мини-приложения MAX.
 5. Записываете тот же адрес в `MAX_WEB_APP_PUBLIC_URL`.
+
+## Режим доставки событий
+
+Бот умеет работать в двух режимах:
+
+- `MAX_DELIVERY_MODE=polling` — удобно для локальной разработки и диагностики
+- `MAX_DELIVERY_MODE=webhook` — рекомендуемый production-режим
+
+Для `webhook` нужно:
+
+- публичный `https`-домен
+- reverse proxy на `443`
+- `MAX_WEBHOOK_PUBLIC_URL` или `MAX_WEB_APP_PUBLIC_URL`
+- желательно `MAX_WEBHOOK_SECRET`
+
+Если `MAX_WEBHOOK_PUBLIC_URL` не задан, бот автоматически соберёт его как:
+
+```text
+MAX_WEB_APP_PUBLIC_URL + MAX_WEBHOOK_PATH
+```
+
+При старте в режиме `webhook` бот сам:
+
+- проверяет локальную готовность endpoint
+- создаёт или обновляет подписку через `POST /subscriptions`
+- удаляет устаревшие webhook-подписки с других URL
+
+При старте в режиме `polling` бот пытается отключить webhook на своём текущем URL, чтобы long polling снова работал.
 
 ## Подключение нескольких каналов
 
@@ -272,7 +304,7 @@ ssh root@188.225.58.60 'install -m 700 -d /root/.ssh && cat >> /root/.ssh/author
 
 ## API мини-приложения
 
-- `GET /api/healthz` — возвращает `ok` и текущую `version`
+- `GET /api/healthz` — возвращает `ok`, текущую `version` и `delivery_mode`
 - `GET /api/posts/<post_ref>`
 - `GET /api/posts/<post_ref>/comments`
 - `POST /api/posts/<post_ref>/comments`
@@ -307,7 +339,7 @@ ssh root@188.225.58.60 'install -m 700 -d /root/.ssh && cat >> /root/.ssh/author
 
 ## Важные замечания
 
-- Для production документация MAX рекомендует Webhook, но в этом проекте для простоты оставлен Long Polling.
+- Для production документация MAX рекомендует Webhook; в проекте теперь поддерживаются оба режима через `MAX_DELIVERY_MODE`.
 - Встроенный HTTP-сервер подходит для разработки и небольших инсталляций. Для production лучше поставить его за обратным прокси.
 - Проверка `initData` для WebApp реализована на стороне Python по официальному алгоритму HMAC-SHA256.
 - Если для какой-то привязки `CHANNEL_ID` и `COMMENTS_CHAT_ID` совпадают, посты и техническая лента обсуждения будут смешаны в одном месте.

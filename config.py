@@ -73,3 +73,13 @@ WEB_SERVER_PORT = int(os.getenv("MAX_WEB_SERVER_PORT", "8080"))
 WEB_APP_PUBLIC_URL = os.getenv("MAX_WEB_APP_PUBLIC_URL", "").strip().rstrip("/")
 WEB_APP_AUTH_MAX_AGE_SECONDS = int(os.getenv("MAX_WEB_APP_AUTH_MAX_AGE_SECONDS", "3600"))
 CHANNEL_SYNC_INTERVAL_SECONDS = int(os.getenv("MAX_CHANNEL_SYNC_INTERVAL_SECONDS", "5"))
+
+DELIVERY_MODE = os.getenv("MAX_DELIVERY_MODE", "polling").strip().lower() or "polling"
+WEBHOOK_PATH = os.getenv("MAX_WEBHOOK_PATH", "/webhook").strip() or "/webhook"
+if not WEBHOOK_PATH.startswith("/"):
+    WEBHOOK_PATH = f"/{WEBHOOK_PATH}"
+WEBHOOK_SECRET = optional_env("MAX_WEBHOOK_SECRET")
+WEBHOOK_PUBLIC_URL = (
+    optional_env("MAX_WEBHOOK_PUBLIC_URL")
+    or (f"{WEB_APP_PUBLIC_URL}{WEBHOOK_PATH}" if WEB_APP_PUBLIC_URL else "")
+)

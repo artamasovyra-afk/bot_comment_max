@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import mimetypes
+import queue
 import re
 import sqlite3
 import threading
@@ -26,6 +27,7 @@ from config import (
     COMMENTS_CHAT_ID,
     COMMENTS_CHAT_URL,
     DATABASE_PATH,
+    DELIVERY_MODE,
     MAX_API_BASE_URL,
     POLL_LIMIT,
     POLL_TIMEOUT_SECONDS,
@@ -35,6 +37,9 @@ from config import (
     WEB_SERVER_ENABLED,
     WEB_SERVER_HOST,
     WEB_SERVER_PORT,
+    WEBHOOK_PATH,
+    WEBHOOK_PUBLIC_URL,
+    WEBHOOK_SECRET,
 )
 
 
@@ -55,6 +60,8 @@ COMMENT_LINK_RE = re.compile(
 )
 BIND_CHANNEL_CODE_TTL_SECONDS = 30 * 60
 BIND_CHANNEL_CLEANUP_INTERVAL_SECONDS = 10 * 60
+SUPPORTED_DELIVERY_MODES = {"polling", "webhook"}
+WEBHOOK_UPDATE_TYPES = ["message_created"]
 
 
 def read_app_version() -> str:
@@ -495,9 +502,33 @@ class MaxApiClient:
             "limit": POLL_LIMIT,
             "timeout": POLL_TIMEOUT_SECONDS,
             "marker": marker,
-            "types": ["message_created"],
+            "types": WEBHOOK_UPDATE_TYPES,
         }
         return self._request("GET", "/updates", query=query)
+
+    def get_subscriptions(self) -> list[dict[str, Any]]:
+        payload = self._request("GET", "/subscriptions")
+        subscriptions = payload.get("subscriptions") or []
+        if not isinstance(subscriptions, list):
+            return []
+        return [item for item in subscriptions if isinstance(item, dict)]
+
+    def create_subscription(
+        self,
+        *,
+        url: str,
+        update_types: list[str] | None = None,
+        secret: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"url": url}
+        if update_types:
+            payload["update_types"] = update_types
+        if safe_text(secret):
+            payload["secret"] = safe_text(secret)
+        return self._request("POST", "/subscriptions", payload=payload)
+
+    def delete_subscription(self, *, url: str) -> dict[str, Any]:
+        return self._request("DELETE", "/subscriptions", query={"url": url})
 
     def create_upload(self, upload_type: str) -> dict[str, Any]:
         return self._request("POST", "/uploads", query={"type": upload_type})
@@ -1296,14 +1327,18 @@ class MaxCommentsBot:
         self.api = MaxApiClient(BOT_TOKEN, MAX_API_BASE_URL)
         self.store = CommentStore(DATABASE_PATH)
         self.bootstrap_legacy_channel_binding()
+        self.delivery_mode = self.resolve_delivery_mode()
         self.marker: int | None = None
         self.bot_info: dict[str, Any] | None = None
         self.web_server: CommentWebServer | None = None
         self.channel_sync_thread: threading.Thread | None = None
         self.bind_cleanup_thread: threading.Thread | None = None
+        self.update_queue: queue.Queue = queue.Queue()
+        self.update_worker_thread: threading.Thread | None = None
 
     def run(self) -> None:
         logger.info("Starting MAX Comments bot version %s", APP_VERSION)
+        logger.info("Delivery mode: %s", self.delivery_mode)
         self.bot_info = self.api.get_me()
         logger.info(
             "Connected as %s (@%s)",
@@ -1311,21 +1346,155 @@ class MaxCommentsBot:
             self.bot_info.get("username"),
         )
         self.purge_expired_bind_codes()
+        self.start_update_worker()
         self.start_web_server()
+        self.configure_delivery_mode()
         self.start_channel_sync()
         self.start_bind_cleanup()
+        if self.delivery_mode == "webhook":
+            self.run_webhook_loop()
+            return
+        self.run_polling_loop()
+
+    def resolve_delivery_mode(self) -> str:
+        mode = safe_text(DELIVERY_MODE).lower() or "polling"
+        if mode not in SUPPORTED_DELIVERY_MODES:
+            raise RuntimeError(
+                f"Unsupported MAX_DELIVERY_MODE={DELIVERY_MODE!r}. "
+                f"Use one of: {', '.join(sorted(SUPPORTED_DELIVERY_MODES))}"
+            )
+        return mode
+
+    def webhook_url(self) -> str:
+        return safe_text(WEBHOOK_PUBLIC_URL)
+
+    def webhook_secret(self) -> str:
+        return safe_text(WEBHOOK_SECRET)
+
+    def start_update_worker(self) -> None:
+        if self.update_worker_thread is not None:
+            return
+        self.update_worker_thread = threading.Thread(
+            target=self.update_worker_loop,
+            name="update-worker",
+            daemon=True,
+        )
+        self.update_worker_thread.start()
+
+    def update_worker_loop(self) -> None:
+        while True:
+            update = self.update_queue.get()
+            try:
+                self.handle_update(update)
+            except Exception:
+                logger.exception("Update worker failed")
+            finally:
+                self.update_queue.task_done()
+
+    def enqueue_update(self, update: dict[str, Any]) -> None:
+        if not isinstance(update, dict):
+            return
+        self.update_queue.put(update)
+
+    def configure_delivery_mode(self) -> None:
+        if self.delivery_mode == "webhook":
+            self.ensure_webhook_ready()
+            self.ensure_webhook_subscription()
+            return
+        self.disable_matching_webhook_subscription_if_present()
+
+    def run_webhook_loop(self) -> None:
+        logger.info("Webhook delivery is active on %s", self.webhook_url())
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            logger.info("Shutting down")
+
+    def run_polling_loop(self) -> None:
         while True:
             try:
                 payload = self.api.get_updates(self.marker)
                 self.marker = payload.get("marker", self.marker)
                 for update in payload.get("updates", []):
-                    self.handle_update(update)
+                    self.enqueue_update(update)
             except KeyboardInterrupt:
                 logger.info("Shutting down")
                 break
             except Exception:
                 logger.exception("Polling loop failed, retrying in 3 seconds")
                 time.sleep(3)
+
+    def ensure_webhook_ready(self) -> None:
+        webhook_url = self.webhook_url()
+        if not webhook_url:
+            raise RuntimeError(
+                "MAX_WEBHOOK_PUBLIC_URL or MAX_WEB_APP_PUBLIC_URL must be configured for webhook mode"
+            )
+        if not webhook_url.startswith("https://"):
+            raise RuntimeError("Webhook mode requires an HTTPS webhook URL")
+        if not WEB_SERVER_ENABLED:
+            raise RuntimeError("Webhook mode requires MAX_WEB_SERVER_ENABLED=1")
+        if WEBHOOK_PATH and not self.webhook_url().endswith(WEBHOOK_PATH):
+            logger.warning(
+                "Webhook URL %s does not end with configured path %s",
+                webhook_url,
+                WEBHOOK_PATH,
+            )
+        if not self.webhook_secret():
+            logger.warning("MAX_WEBHOOK_SECRET is empty. Webhook requests will not be secret-protected")
+
+    def ensure_webhook_subscription(self) -> None:
+        webhook_url = self.webhook_url()
+        subscriptions = self.api.get_subscriptions()
+        found_current = False
+        for subscription in subscriptions:
+            url = safe_text(subscription.get("url"))
+            if not url:
+                continue
+            if url == webhook_url:
+                found_current = True
+            try:
+                self.api.delete_subscription(url=url)
+                if url == webhook_url:
+                    logger.info("Removed existing MAX webhook subscription for refresh: %s", url)
+                else:
+                    logger.info("Removed stale MAX webhook subscription: %s", url)
+            except MaxApiError:
+                if url == webhook_url:
+                    logger.exception("Failed to refresh existing MAX webhook subscription: %s", url)
+                else:
+                    logger.exception("Failed to remove stale MAX webhook subscription: %s", url)
+        if found_current:
+            logger.info("Refreshing MAX webhook subscription for %s", webhook_url)
+        result = self.api.create_subscription(
+            url=webhook_url,
+            update_types=WEBHOOK_UPDATE_TYPES,
+            secret=self.webhook_secret() or None,
+        )
+        logger.info("Created MAX webhook subscription for %s: %s", webhook_url, result)
+
+    def disable_matching_webhook_subscription_if_present(self) -> None:
+        webhook_url = self.webhook_url()
+        subscriptions = self.api.get_subscriptions()
+        other_urls: list[str] = []
+        for subscription in subscriptions:
+            url = safe_text(subscription.get("url"))
+            if not url:
+                continue
+            if not webhook_url or url != webhook_url:
+                other_urls.append(url)
+                continue
+            try:
+                self.api.delete_subscription(url=url)
+                logger.info("Disabled MAX webhook subscription for polling mode: %s", url)
+            except MaxApiError:
+                logger.exception("Failed to disable MAX webhook subscription for polling mode: %s", url)
+        if other_urls:
+            logger.warning(
+                "MAX still has webhook subscriptions configured while polling mode is active: %s",
+                ", ".join(other_urls),
+            )
 
     def start_web_server(self) -> None:
         if not WEB_SERVER_ENABLED:
@@ -3282,7 +3451,15 @@ class CommentWebServer:
                     self.serve_comment_media(path)
                     return
                 if path == "/api/healthz":
-                    self.send_json(HTTPStatus.OK, {"ok": True, "version": APP_VERSION})
+                    self.send_json(
+                        HTTPStatus.OK,
+                        {
+                            "ok": True,
+                            "version": APP_VERSION,
+                            "delivery_mode": app.delivery_mode,
+                            "webhook_path": WEBHOOK_PATH,
+                        },
+                    )
                     return
                 if path.startswith("/api/posts/"):
                     self.handle_api_get(path, parse.parse_qs(parsed.query, keep_blank_values=True))
@@ -3308,6 +3485,7 @@ class CommentWebServer:
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
                     self.send_header("X-App-Version", APP_VERSION)
+                    self.send_header("X-Delivery-Mode", app.delivery_mode)
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
@@ -3318,6 +3496,9 @@ class CommentWebServer:
             def do_POST(self) -> None:
                 parsed = parse.urlparse(self.path)
                 path = parsed.path
+                if path == WEBHOOK_PATH:
+                    self.handle_webhook()
+                    return
                 if path.startswith("/api/posts/") and path.endswith("/comments"):
                     self.handle_create_comment(path)
                     return
@@ -3480,6 +3661,29 @@ class CommentWebServer:
 
                 self.send_json(HTTPStatus.CREATED, result)
 
+            def handle_webhook(self) -> None:
+                if app.delivery_mode != "webhook":
+                    self.send_json(HTTPStatus.CONFLICT, {"error": "Webhook mode is disabled"})
+                    return
+                if not self.verify_webhook_secret():
+                    self.send_json(HTTPStatus.FORBIDDEN, {"error": "Invalid webhook secret"})
+                    return
+                raw_body = self.read_body()
+                try:
+                    payload = json.loads(raw_body.decode("utf-8") or "{}")
+                except json.JSONDecodeError:
+                    self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid JSON"})
+                    return
+
+                updates = payload if isinstance(payload, list) else [payload]
+                accepted = 0
+                for update in updates:
+                    if not isinstance(update, dict):
+                        continue
+                    app.enqueue_update(update)
+                    accepted += 1
+                self.send_json(HTTPStatus.OK, {"ok": True, "accepted": accepted})
+
             def handle_delete_comment(self, path: str) -> None:
                 reference, suffix = self.extract_post_reference(path)
                 if reference is None or not suffix.startswith("/comments/"):
@@ -3576,6 +3780,17 @@ class CommentWebServer:
                     or self.headers.get("x-max-init-data")
                     or ""
                 )
+
+            def verify_webhook_secret(self) -> bool:
+                expected = app.webhook_secret()
+                if not expected:
+                    return True
+                provided = safe_text(
+                    self.headers.get("X-Max-Bot-Api-Secret")
+                    or self.headers.get("x-max-bot-api-secret")
+                    or ""
+                )
+                return hmac.compare_digest(provided, expected)
 
             def send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
                 raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")

@@ -4,6 +4,20 @@ All notable changes to this project will be tracked here.
 
 ## [Unreleased]
 
+### Added
+
+- Переключаемый режим доставки событий `polling/webhook` с webhook-endpoint внутри встроенного HTTP-сервера.
+- Автоматическое создание и обновление webhook-подписки MAX через `/subscriptions`.
+
+### Changed
+
+- `GET /api/healthz` теперь возвращает `delivery_mode`, а сервис читает рабочую версию из файла `VERSION`.
+- Продовый `.env` можно перевести на webhook без отдельного внешнего обработчика.
+
+### Fixed
+
+- ...
+
 ## [0.1.0] - 2026-04-30
 
 ### Added
