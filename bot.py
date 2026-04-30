@@ -52,6 +52,8 @@ logger = logging.getLogger("max-comments-bot")
 
 APP_ROOT_DIR = Path(__file__).resolve().parent
 VERSION_FILE = APP_ROOT_DIR / "VERSION"
+DATA_DIR = APP_ROOT_DIR / "data"
+TABOO_WORDS_FILE = DATA_DIR / "taboo_words_ru_en_uk.json"
 WEBAPP_DIR = APP_ROOT_DIR / "webapp"
 ADMIN_DIR = APP_ROOT_DIR / "admin"
 COMMENT_MEDIA_DIR = Path(DATABASE_PATH).resolve().parent / "comment_media"
@@ -66,6 +68,12 @@ SUPPORTED_DELIVERY_MODES = {"polling", "webhook"}
 WEBHOOK_UPDATE_TYPES = ["message_created"]
 ADMIN_SESSION_COOKIE = "max_comments_admin"
 ADMIN_SESSION_MAX_AGE_SECONDS = 24 * 60 * 60
+COMMENT_BLOCKED_CODE = "COMMENT_BLOCKED"
+COMMENT_BLOCKED_MESSAGE = "Комментарий содержит запрещённые выражения. Исправьте текст и попробуйте снова."
+MODERATION_TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁёІіЇїЄєҐґ']+", re.UNICODE)
+MODERATION_COMPACT_RE = re.compile(r"[^0-9A-Za-zА-Яа-яЁёІіЇїЄєҐґ']+", re.UNICODE)
+MODERATION_REPEATED_CHAR_RE = re.compile(r"(.)\1{2,}", re.UNICODE)
+TABOO_RULES_CACHE: dict[str, Any] | None = None
 
 
 def read_app_version() -> str:
@@ -142,6 +150,128 @@ def ensure_comment_text_has_no_links(text: str) -> None:
         raise MaxApiError("Links are not allowed in comments")
 
 
+def normalize_moderation_text(value: Any) -> str:
+    text = safe_text(value).lower()
+    text = text.replace("ё", "е").replace("’", "'").replace("`", "'")
+    text = MODERATION_REPEATED_CHAR_RE.sub(r"\1\1", text)
+    return " ".join(text.split())
+
+
+def compact_moderation_text(value: Any) -> str:
+    return MODERATION_COMPACT_RE.sub("", normalize_moderation_text(value))
+
+
+def moderation_terms_from_language_map(value: Any) -> list[str]:
+    if not isinstance(value, dict):
+        return []
+    terms: list[str] = []
+    for language_terms in value.values():
+        if not isinstance(language_terms, list):
+            continue
+        terms.extend(safe_text(item) for item in language_terms if safe_text(item))
+    return terms
+
+
+def load_taboo_rules() -> dict[str, Any]:
+    global TABOO_RULES_CACHE
+    if TABOO_RULES_CACHE is not None:
+        return TABOO_RULES_CACHE
+
+    empty_rules: dict[str, Any] = {
+        "exact_words": {},
+        "phrases": {},
+        "fragments": {},
+        "allowlist": set(),
+    }
+    try:
+        payload = json.loads(TABOO_WORDS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.exception("Failed to load taboo words file: %s", TABOO_WORDS_FILE)
+        TABOO_RULES_CACHE = empty_rules
+        return TABOO_RULES_CACHE
+
+    rules: dict[str, Any] = {
+        "exact_words": {},
+        "phrases": {},
+        "fragments": {},
+        "allowlist": set(),
+    }
+    categories = payload.get("categories") if isinstance(payload, dict) else {}
+    if isinstance(categories, dict):
+        for category, language_map in categories.items():
+            category_key = safe_text(category) or "taboo"
+            for raw_term in moderation_terms_from_language_map(language_map):
+                normalized = normalize_moderation_text(raw_term)
+                compact = compact_moderation_text(raw_term)
+                if not compact:
+                    continue
+                if " " in normalized:
+                    rules["phrases"].setdefault(category_key, set()).add(normalized)
+                else:
+                    rules["exact_words"].setdefault(category_key, set()).add(compact)
+
+    fragments = payload.get("contains_fragments") if isinstance(payload, dict) else {}
+    if isinstance(fragments, dict):
+        for language, raw_fragments in fragments.items():
+            if not isinstance(raw_fragments, list):
+                continue
+            category_key = f"fragment:{safe_text(language) or 'unknown'}"
+            for raw_fragment in raw_fragments:
+                compact = compact_moderation_text(raw_fragment)
+                if compact:
+                    rules["fragments"].setdefault(category_key, set()).add(compact)
+
+    allowlist = payload.get("allowlist") if isinstance(payload, dict) else {}
+    for raw_term in moderation_terms_from_language_map(allowlist):
+        compact = compact_moderation_text(raw_term)
+        if compact:
+            rules["allowlist"].add(compact)
+
+    TABOO_RULES_CACHE = rules
+    return TABOO_RULES_CACHE
+
+
+def check_comment_text_for_taboo(text: str) -> dict[str, Any]:
+    normalized = normalize_moderation_text(text)
+    if not normalized:
+        return {"blocked": False}
+
+    rules = load_taboo_rules()
+    allowlist = rules.get("allowlist") or set()
+    tokens = {
+        compact_moderation_text(token)
+        for token in MODERATION_TOKEN_RE.findall(normalized)
+    }
+    tokens = {token for token in tokens if token and token not in allowlist}
+
+    for category, words in (rules.get("exact_words") or {}).items():
+        if tokens.intersection(words):
+            return {"blocked": True, "category": category}
+
+    phrase_text = f" {normalized} "
+    for category, phrases in (rules.get("phrases") or {}).items():
+        for phrase in phrases:
+            if f" {phrase} " in phrase_text:
+                return {"blocked": True, "category": category}
+
+    compact_chunks = [
+        compact_moderation_text(chunk)
+        for chunk in normalized.split()
+    ]
+    for category, fragments in (rules.get("fragments") or {}).items():
+        for chunk in compact_chunks:
+            if any(fragment in chunk for fragment in fragments):
+                return {"blocked": True, "category": category}
+
+    return {"blocked": False}
+
+
+def ensure_comment_text_has_no_taboo(text: str) -> None:
+    result = check_comment_text_for_taboo(text)
+    if result.get("blocked"):
+        raise CommentBlockedError(category=safe_text(result.get("category")) or "taboo")
+
+
 def humanize_comment_error_message(message: str) -> str:
     normalized = safe_text(message)
     if not normalized:
@@ -153,6 +283,7 @@ def humanize_comment_error_message(message: str) -> str:
         "Comment is empty": "Комментарий пустой. Напишите текст или прикрепите фото.",
         "Comment is too long": "Комментарий слишком длинный. Максимум 4000 символов.",
         "Links are not allowed in comments": "Ссылки запрещены правилами сервиса.",
+        COMMENT_BLOCKED_CODE: COMMENT_BLOCKED_MESSAGE,
         "Channel is not connected": "Этот канал не подключён к боту. Добавьте его через `/channel_add CHANNEL_ID COMMENTS_CHAT_ID`.",
         "Comments chat is not configured for this post": "Для этого поста не найден чат комментариев.",
         "You can edit only your own comments": "Можно редактировать только свои комментарии.",
@@ -472,6 +603,12 @@ class AuthenticatedWebAppUser:
 
 class MaxApiError(RuntimeError):
     pass
+
+
+class CommentBlockedError(MaxApiError):
+    def __init__(self, *, category: str = "taboo") -> None:
+        super().__init__(COMMENT_BLOCKED_CODE)
+        self.category = category
 
 
 class WebAppAuthError(RuntimeError):
@@ -3380,6 +3517,7 @@ class MaxCommentsBot:
         if not clean_text and not media_items:
             raise MaxApiError("Comment is empty")
         ensure_comment_text_has_no_links(clean_text)
+        ensure_comment_text_has_no_taboo(clean_text)
         parent_comment = None
         if parent_comment_id is not None:
             parent_comment = self.store.get_comment(int(parent_comment_id))
@@ -3490,6 +3628,7 @@ class MaxCommentsBot:
                 "Comment is empty",
                 "Comment is too long",
                 "Links are not allowed in comments",
+                COMMENT_BLOCKED_CODE,
             }
             if safe_text(str(exc)) in recoverable_errors:
                 self.store.set_pending_comment(user_id, pending.post_message_id)
@@ -3720,6 +3859,7 @@ class MaxCommentsBot:
         if not clean_text and not media_items:
             raise MaxApiError("Comment is empty")
         ensure_comment_text_has_no_links(clean_text)
+        ensure_comment_text_has_no_taboo(clean_text)
 
         updated = self.store.update_comment_text(
             comment_id=comment_id,
@@ -4118,6 +4258,16 @@ class CommentWebServer:
                 except WebAppAuthError as exc:
                     self.send_json(HTTPStatus.UNAUTHORIZED, {"error": str(exc)})
                     return
+                except CommentBlockedError:
+                    self.send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "ok": False,
+                            "error": COMMENT_BLOCKED_CODE,
+                            "message": COMMENT_BLOCKED_MESSAGE,
+                        },
+                    )
+                    return
                 except MaxApiError as exc:
                     status = HTTPStatus.BAD_REQUEST
                     if "not found" in str(exc).lower():
@@ -4262,6 +4412,16 @@ class CommentWebServer:
                     )
                 except WebAppAuthError as exc:
                     self.send_json(HTTPStatus.UNAUTHORIZED, {"error": str(exc)})
+                    return
+                except CommentBlockedError:
+                    self.send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "ok": False,
+                            "error": COMMENT_BLOCKED_CODE,
+                            "message": COMMENT_BLOCKED_MESSAGE,
+                        },
+                    )
                     return
                 except MaxApiError as exc:
                     status = HTTPStatus.BAD_REQUEST

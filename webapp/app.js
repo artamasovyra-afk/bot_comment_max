@@ -7,6 +7,10 @@
   const AUTO_REFRESH_NEAR_BOTTOM_PX = 88;
   const BOTTOM_SCROLL_RETRY_DELAYS_MS = [72, 180, 360];
   const LINKS_BLOCKED_MESSAGE = "Ссылки запрещены правилами сервиса.";
+  const COMMENT_BLOCKED_CODE = "COMMENT_BLOCKED";
+  const COMMENT_BLOCKED_TITLE = "Комментарий не опубликован";
+  const COMMENT_BLOCKED_TEXT =
+    "В комментарии есть запрещённые выражения. Пожалуйста, измените формулировку и отправьте комментарий снова.";
   const COMMENT_LINK_RE =
     /(^|[^@\w])((?:https?:\/\/|ftp:\/\/|www\.)\S+|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d{2,5})?(?:\/[^\s]*)?)/i;
 
@@ -63,6 +67,10 @@
     commentMenuReply: document.getElementById("comment-menu-reply"),
     commentMenuEdit: document.getElementById("comment-menu-edit"),
     commentMenuDelete: document.getElementById("comment-menu-delete"),
+    blockedModal: document.getElementById("comment-blocked-modal"),
+    blockedTitle: document.getElementById("comment-blocked-title"),
+    blockedText: document.getElementById("comment-blocked-text"),
+    blockedFix: document.getElementById("comment-blocked-fix"),
   };
 
   const webApp = window.WebApp || null;
@@ -86,6 +94,40 @@
 
   function clearBanner() {
     setBanner("", "");
+  }
+
+  function clearComposerError() {
+    elements.input.classList.remove("composer__input--error");
+    elements.input.removeAttribute("aria-invalid");
+  }
+
+  function markComposerError() {
+    elements.input.classList.add("composer__input--error");
+    elements.input.setAttribute("aria-invalid", "true");
+  }
+
+  function focusComposerInput() {
+    elements.input.focus();
+    try {
+      const end = elements.input.value.length;
+      elements.input.setSelectionRange(end, end);
+    } catch (_err) {
+      // Some embedded WebView builds do not support selection APIs on textarea.
+    }
+  }
+
+  function closeCommentBlockedDialog() {
+    elements.blockedModal.hidden = true;
+    focusComposerInput();
+  }
+
+  function showCommentBlockedDialog() {
+    clearBanner();
+    markComposerError();
+    elements.blockedTitle.textContent = COMMENT_BLOCKED_TITLE;
+    elements.blockedText.textContent = COMMENT_BLOCKED_TEXT;
+    elements.blockedModal.hidden = false;
+    elements.blockedFix.focus();
   }
 
   function haptic(kind) {
@@ -843,9 +885,18 @@
   async function fetchJson(url, options) {
     const response = await fetch(url, options);
     const rawText = await response.text();
-    const payload = rawText ? JSON.parse(rawText) : {};
+    let payload = {};
+    try {
+      payload = rawText ? JSON.parse(rawText) : {};
+    } catch (_err) {
+      payload = {};
+    }
     if (!response.ok) {
-      throw new Error(payload.error || "Ошибка запроса");
+      const error = new Error(payload.message || payload.error || "Ошибка запроса");
+      error.code = payload.error || "";
+      error.status = response.status;
+      error.payload = payload;
+      throw error;
     }
     return payload;
   }
@@ -1082,6 +1133,11 @@
       clearBanner();
       haptic("success");
     } catch (error) {
+      if (error.code === COMMENT_BLOCKED_CODE) {
+        showCommentBlockedDialog();
+        haptic("warning");
+        return;
+      }
       setBanner(error.message || "Не удалось отправить комментарий.", "error");
       haptic("error");
     } finally {
@@ -1160,7 +1216,10 @@
   }
 
   elements.form.addEventListener("submit", onSubmit);
-  elements.input.addEventListener("input", updateComposerCount);
+  elements.input.addEventListener("input", function () {
+    updateComposerCount();
+    clearComposerError();
+  });
   elements.photoButton.addEventListener("click", onPickPhoto);
   elements.photoInput.addEventListener("change", onPhotoChange);
   elements.replyCancel.addEventListener("click", cancelReplying);
@@ -1187,6 +1246,12 @@
     }
   });
   elements.commentMenuBackdrop.addEventListener("click", closeCommentMenu);
+  elements.blockedFix.addEventListener("click", closeCommentBlockedDialog);
+  elements.blockedModal.addEventListener("click", function (event) {
+    if (event.target === elements.blockedModal) {
+      closeCommentBlockedDialog();
+    }
+  });
   elements.list.addEventListener("scroll", function () {
     state.stickToBottom = isListNearBottom();
     closeCommentMenu();
@@ -1201,6 +1266,10 @@
   });
   elements.input.addEventListener("keydown", function (event) {
     if (event.key === "Escape") {
+      if (!elements.blockedModal.hidden) {
+        closeCommentBlockedDialog();
+        return;
+      }
       if (state.contextMenuCommentId !== null) {
         closeCommentMenu();
         return;

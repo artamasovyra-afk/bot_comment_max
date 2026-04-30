@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
     <title>Комментарии к посту</title>
-    <link rel="stylesheet" href="/webapp/app.css?v=20260430a">
+    <link rel="stylesheet" href="/webapp/app.css?v=20260430b">
     <script src="https://st.max.ru/js/max-web-app.js"></script>
   </head>
   <body>
@@ -78,8 +78,27 @@
               </svg>
             </button>
           </form>
+          <p id="composer-policy-hint" class="composer-hint">
+            Комментарии с оскорблениями, угрозами и ненормативной лексикой не публикуются.
+          </p>
         </footer>
       </main>
+    </div>
+
+    <div id="comment-blocked-modal" class="modal-backdrop" hidden>
+      <section
+        class="modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="comment-blocked-title"
+        aria-describedby="comment-blocked-text"
+      >
+        <h2 id="comment-blocked-title" class="modal-card__title">Комментарий не опубликован</h2>
+        <p id="comment-blocked-text" class="modal-card__text">
+          В комментарии есть запрещённые выражения. Пожалуйста, измените формулировку и отправьте комментарий снова.
+        </p>
+        <button id="comment-blocked-fix" class="modal-card__button" type="button">Исправить</button>
+      </section>
     </div>
 
     <template id="comment-template">
@@ -122,6 +141,6 @@
       </button>
     </div>
 
-    <script src="/webapp/app.js?v=20260430a"></script>
+    <script src="/webapp/app.js?v=20260430b"></script>
   </body>
 </html>

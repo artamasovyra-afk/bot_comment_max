@@ -11,3 +11,4 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m py_compile bot.py config.py
+python3 -m json.tool data/taboo_words_ru_en_uk.json >/dev/null
