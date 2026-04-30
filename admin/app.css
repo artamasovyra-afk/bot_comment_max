@@ -156,6 +156,25 @@ h2 {
   margin-bottom: 14px;
 }
 
+.posts-filters {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.85fr) minmax(220px, 1.15fr);
+  gap: 10px;
+  margin: -2px 0 12px;
+}
+
+.filter-field {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.filter-field span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .columns {
   display: grid;
   grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.65fr);
@@ -427,7 +446,8 @@ textarea:focus {
 
   .status-grid,
   .columns,
-  .form-grid {
+  .form-grid,
+  .posts-filters {
     grid-template-columns: 1fr;
   }
 

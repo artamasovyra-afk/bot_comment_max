@@ -1159,6 +1159,20 @@ class CommentStore:
             ).fetchall()
         return list(rows)
 
+    def list_comment_texts(self, post_message_id: str, limit: int = 100) -> list[str]:
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT text
+                FROM comments
+                WHERE post_message_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (post_message_id, limit),
+            ).fetchall()
+        return [safe_text(row["text"]) for row in rows if safe_text(row["text"])]
+
     def list_comments_page(
         self,
         post_message_id: str,
@@ -2200,6 +2214,7 @@ class MaxCommentsBot:
         }
 
     def serialize_post_summary(self, post: sqlite3.Row) -> dict[str, Any]:
+        comment_search_text = " ".join(self.store.list_comment_texts(post["post_message_id"]))
         return {
             "post_message_id": safe_text(post["post_message_id"]),
             "post_ref": post_ref_for_message_id(post["post_message_id"]),
@@ -2207,6 +2222,7 @@ class MaxCommentsBot:
             "comments_chat_id": int(post["comments_chat_id"]) if post["comments_chat_id"] is not None else None,
             "post_url": safe_text(post["post_url"]),
             "post_text": safe_text(post["post_text"]),
+            "comment_search_text": comment_search_text,
             "comment_count": int(post["comment_count"]),
             "created_at": safe_text(post["created_at"]),
             "updated_at": safe_text(post["updated_at"]),

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Админка MAX Comments</title>
-    <link rel="stylesheet" href="/admin/app.css?v=20260430e" />
+    <link rel="stylesheet" href="/admin/app.css?v=20260430f" />
   </head>
   <body>
     <main class="shell">
@@ -86,6 +86,21 @@
             <div class="panel-header">
               <h2>Последние посты</h2>
             </div>
+            <div class="posts-filters">
+              <label class="filter-field">
+                <span>Канал</span>
+                <select id="posts-channel-filter"></select>
+              </label>
+              <label class="filter-field search-field">
+                <span>Поиск</span>
+                <input
+                  id="posts-search"
+                  type="search"
+                  placeholder="Текст поста или комментария"
+                  autocomplete="off"
+                />
+              </label>
+            </div>
             <div id="posts-list" class="list posts-list"></div>
           </article>
 
@@ -116,6 +131,6 @@
       </section>
     </main>
 
-    <script src="/admin/app.js?v=20260430e"></script>
+    <script src="/admin/app.js?v=20260430f"></script>
   </body>
 </html>

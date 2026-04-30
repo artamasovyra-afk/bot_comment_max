@@ -1,5 +1,9 @@
 const state = {
   data: null,
+  filters: {
+    postsChannelId: "",
+    postsSearch: "",
+  },
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -84,6 +88,16 @@ function optionLabel(channel) {
   return `${channelName} → ${commentsName}`;
 }
 
+function channelLabelById(channelId) {
+  const channels = state.data?.channels || [];
+  const channel = channels.find((item) => String(item.channel_chat_id) === String(channelId));
+  return channel ? channel.channel_label || String(channel.channel_chat_id) : String(channelId);
+}
+
+function normalizeSearch(value) {
+  return String(value || "").trim().toLocaleLowerCase("ru-RU");
+}
+
 function fillStatus(data) {
   $("#status-version").textContent = data.app.version || "-";
   $("#status-mode").textContent = data.app.delivery_mode || "-";
@@ -107,6 +121,43 @@ function renderPublishChannels(channels) {
     option.textContent = optionLabel(channel);
     select.append(option);
   }
+}
+
+function renderPostFilters(channels) {
+  const select = $("#posts-channel-filter");
+  const search = $("#posts-search");
+  const selectedChannelId = state.filters.postsChannelId;
+  select.innerHTML = '<option value="">Все каналы</option>';
+
+  for (const channel of channels) {
+    const option = document.createElement("option");
+    option.value = channel.channel_chat_id;
+    option.textContent = channel.channel_label || String(channel.channel_chat_id);
+    select.append(option);
+  }
+
+  if (selectedChannelId && Array.from(select.options).some((option) => option.value === selectedChannelId)) {
+    select.value = selectedChannelId;
+  } else {
+    select.value = "";
+    state.filters.postsChannelId = "";
+  }
+  search.value = state.filters.postsSearch;
+}
+
+function filterPosts(posts) {
+  const channelId = state.filters.postsChannelId;
+  const query = normalizeSearch(state.filters.postsSearch);
+  return posts.filter((post) => {
+    if (channelId && String(post.channel_chat_id) !== channelId) {
+      return false;
+    }
+    if (!query) {
+      return true;
+    }
+    const searchableText = normalizeSearch(`${post.post_text || ""} ${post.comment_search_text || ""}`);
+    return searchableText.includes(query);
+  });
 }
 
 function renderChannels(channels) {
@@ -159,7 +210,12 @@ function renderPosts(posts) {
     list.innerHTML = '<div class="empty">Пока нет зарегистрированных постов.</div>';
     return;
   }
-  for (const post of posts) {
+  const filteredPosts = filterPosts(posts);
+  if (!filteredPosts.length) {
+    list.innerHTML = '<div class="empty">По выбранному фильтру посты не найдены.</div>';
+    return;
+  }
+  for (const post of filteredPosts) {
     const item = document.createElement("article");
     item.className = "item";
     const postUrl = safeHttpUrl(post.post_url);
@@ -167,7 +223,7 @@ function renderPosts(posts) {
       <div class="item-row">
         <div>
           <div class="item-title">${escapeHtml(post.post_text || "Пост без текста")}</div>
-          <div class="item-meta">Канал: ${post.channel_chat_id}</div>
+          <div class="item-meta">Канал: ${escapeHtml(channelLabelById(post.channel_chat_id))}</div>
           <div class="item-meta">Message ID: ${escapeHtml(post.post_message_id)}</div>
         </div>
         <span class="pill">${post.comment_count} комм.</span>
@@ -214,6 +270,7 @@ function render(data) {
   fillStatus(data);
   renderPublishChannels(data.channels);
   renderChannels(data.channels);
+  renderPostFilters(data.channels);
   renderPosts(data.posts);
   renderPending(data.pending_bindings);
 }
@@ -321,6 +378,14 @@ async function handleListClick(event) {
   }
 }
 
+function handlePostsFilterChange() {
+  state.filters.postsChannelId = $("#posts-channel-filter").value;
+  state.filters.postsSearch = $("#posts-search").value;
+  if (state.data) {
+    renderPosts(state.data.posts);
+  }
+}
+
 $("#login-form").addEventListener("submit", handleLogin);
 $("#logout-button").addEventListener("click", handleLogout);
 $("#refresh-button").addEventListener("click", loadState);
@@ -328,5 +393,7 @@ $("#sync-button").addEventListener("click", handleSync);
 $("#channel-form").addEventListener("submit", handleChannelSubmit);
 $("#publish-form").addEventListener("submit", handlePublish);
 $("#channels-list").addEventListener("click", handleListClick);
+$("#posts-channel-filter").addEventListener("change", handlePostsFilterChange);
+$("#posts-search").addEventListener("input", handlePostsFilterChange);
 
 loadState();
