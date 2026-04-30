@@ -217,6 +217,12 @@ def max_share_url(text: str) -> str:
 
 
 CHANNEL_POST_FOOTER = "Комментарии к этому посту открываются в мини-приложении по кнопке ниже."
+SETUP_SERVICE_MESSAGE_PREFIXES = (
+    "Канал создан в админке",
+    "Готовые кнопки для завершения привязки",
+    "Привязка завершена.",
+    "Не удалось выполнить настройку:",
+)
 COMMENTS_PAGE_SIZE_DEFAULT = 40
 COMMENTS_PAGE_SIZE_MAX = 100
 
@@ -227,6 +233,13 @@ def strip_managed_channel_footer(post_text: str) -> str:
     if footer_marker in clean_text:
         return clean_text.split(footer_marker, 1)[0].rstrip()
     return clean_text
+
+
+def is_setup_service_message_text(post_text: str) -> bool:
+    clean_text = safe_text(post_text)
+    if any(clean_text.startswith(prefix) for prefix in SETUP_SERVICE_MESSAGE_PREFIXES):
+        return True
+    return "Код привязки:" in clean_text and "/bind_comments" in clean_text
 
 
 def serialize_message_attachments(attachments: list[dict[str, Any]] | None) -> str:
@@ -2691,6 +2704,8 @@ class MaxCommentsBot:
         if post_text.startswith("/"):
             return False
         if CHANNEL_POST_FOOTER in post_text:
+            return False
+        if is_setup_service_message_text(post_text):
             return False
 
         raw_attachments = body.get("attachments") or []
