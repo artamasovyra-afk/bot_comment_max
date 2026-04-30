@@ -38,6 +38,8 @@
     bottomScrollTimeoutIds: [],
     contextMenuCommentId: null,
     menuOpenedAt: 0,
+    reportingCommentId: null,
+    submittingReport: false,
   };
 
   const elements = {
@@ -67,10 +69,17 @@
     commentMenuReply: document.getElementById("comment-menu-reply"),
     commentMenuEdit: document.getElementById("comment-menu-edit"),
     commentMenuDelete: document.getElementById("comment-menu-delete"),
+    commentMenuReport: document.getElementById("comment-menu-report"),
     blockedModal: document.getElementById("comment-blocked-modal"),
     blockedTitle: document.getElementById("comment-blocked-title"),
     blockedText: document.getElementById("comment-blocked-text"),
     blockedFix: document.getElementById("comment-blocked-fix"),
+    reportModal: document.getElementById("report-modal"),
+    reportForm: document.getElementById("report-form"),
+    reportReason: document.getElementById("report-reason"),
+    reportDetails: document.getElementById("report-details"),
+    reportCancel: document.getElementById("report-cancel"),
+    reportSubmit: document.getElementById("report-submit"),
   };
 
   const webApp = window.WebApp || null;
@@ -584,6 +593,10 @@
     const node = elements.template.content.firstElementChild.cloneNode(true);
     node.classList.add("message--empty");
     node.querySelector(".message__avatar").remove();
+    const menuButton = node.querySelector(".message__menu-button");
+    if (menuButton) {
+      menuButton.remove();
+    }
     node.querySelector(".message__author").textContent = "Лента комментариев";
     node.querySelector(".message__time").textContent = "Сейчас";
     node.querySelector(".message__text").textContent =
@@ -622,8 +635,20 @@
     return Number(comment.user_id) === Number(state.currentUserId);
   }
 
+  function canReportComment(comment) {
+    if (!comment || !state.insideMax || state.currentUserId === null) {
+      return false;
+    }
+    return Number(comment.user_id) !== Number(state.currentUserId);
+  }
+
   function hasCommentActions(comment) {
-    return canReplyComment(comment) || canEditComment(comment) || canDeleteComment(comment);
+    return (
+      canReplyComment(comment) ||
+      canEditComment(comment) ||
+      canDeleteComment(comment) ||
+      canReportComment(comment)
+    );
   }
 
   function getCommentById(commentId) {
@@ -679,6 +704,7 @@
     elements.commentMenuReply.hidden = !canReplyComment(comment);
     elements.commentMenuEdit.hidden = !canEditComment(comment);
     elements.commentMenuDelete.hidden = !canDeleteComment(comment);
+    elements.commentMenuReport.hidden = !canReportComment(comment);
     elements.commentMenu.hidden = false;
     elements.commentMenuBackdrop.hidden = false;
     positionCommentMenu(clientX, clientY);
@@ -762,11 +788,86 @@
     elements.input.focus();
   }
 
+  function closeReportModal() {
+    state.reportingCommentId = null;
+    elements.reportModal.hidden = true;
+    elements.reportDetails.value = "";
+    elements.reportReason.value = "insult";
+    elements.reportSubmit.disabled = false;
+  }
+
+  function beginReportingComment(commentId) {
+    const comment = getCommentById(commentId);
+    if (!canReportComment(comment)) {
+      return;
+    }
+    closeCommentMenu();
+    state.reportingCommentId = Number(commentId);
+    elements.reportReason.value = "insult";
+    elements.reportDetails.value = "";
+    elements.reportSubmit.disabled = false;
+    elements.reportModal.hidden = false;
+    elements.reportReason.focus();
+  }
+
+  async function submitReport(event) {
+    event.preventDefault();
+    if (state.submittingReport || state.reportingCommentId === null) {
+      return;
+    }
+    const comment = getCommentById(state.reportingCommentId);
+    if (!canReportComment(comment)) {
+      closeReportModal();
+      return;
+    }
+    state.submittingReport = true;
+    elements.reportSubmit.disabled = true;
+    try {
+      const result = await fetchJson(`/api/comments/${encodeURIComponent(state.reportingCommentId)}/report`, {
+        method: "POST",
+        headers: buildApiHeaders({
+          "Content-Type": "application/json",
+        }),
+        body: JSON.stringify({
+          initData: state.initData,
+          reason: elements.reportReason.value,
+          details: elements.reportDetails.value.trim(),
+        }),
+      });
+      closeReportModal();
+      setBanner(result.message || "Жалоба отправлена. Администратор канала проверит комментарий.", "success");
+      haptic("success");
+    } catch (error) {
+      setBanner(error.message || "Не удалось отправить жалобу.", "error");
+      haptic("warning");
+      if (error.code === "REPORT_ALREADY_EXISTS") {
+        closeReportModal();
+      }
+    } finally {
+      state.submittingReport = false;
+      elements.reportSubmit.disabled = false;
+    }
+  }
+
   function bindCommentActionHandlers(node, comment) {
     if (!hasCommentActions(comment)) {
       return;
     }
     node.classList.add("message--actionable");
+    const menuButton = node.querySelector(".message__menu-button");
+    if (menuButton) {
+      menuButton.hidden = false;
+      menuButton.addEventListener("click", function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (state.submitting || state.deletingCommentId !== null) {
+          return;
+        }
+        const rect = menuButton.getBoundingClientRect();
+        openCommentMenu(comment.id, rect.left, rect.bottom + 4);
+        haptic("light");
+      });
+    }
     if (useTapCommentActions()) {
       node.addEventListener("click", function () {
         if (state.submitting || state.deletingCommentId !== null) {
@@ -845,6 +946,7 @@
       const replyNode = node.querySelector(".message__reply");
       const mediaNode = node.querySelector(".message__media");
       const textNode = node.querySelector(".message__text");
+      const menuButton = node.querySelector(".message__menu-button");
 
       if (isSelf) {
         node.classList.add("message--self");
@@ -859,6 +961,9 @@
       renderCommentMedia(mediaNode, comment.media);
       textNode.textContent = comment.text || "";
       textNode.hidden = !comment.text;
+      if (menuButton) {
+        menuButton.hidden = true;
+      }
       bindCommentActionHandlers(node, comment);
       elements.list.appendChild(node);
     });
@@ -1245,7 +1350,19 @@
       deleteComment(state.contextMenuCommentId);
     }
   });
+  elements.commentMenuReport.addEventListener("click", function () {
+    if (state.contextMenuCommentId !== null) {
+      beginReportingComment(state.contextMenuCommentId);
+    }
+  });
   elements.commentMenuBackdrop.addEventListener("click", closeCommentMenu);
+  elements.reportForm.addEventListener("submit", submitReport);
+  elements.reportCancel.addEventListener("click", closeReportModal);
+  elements.reportModal.addEventListener("click", function (event) {
+    if (event.target === elements.reportModal) {
+      closeReportModal();
+    }
+  });
   elements.blockedFix.addEventListener("click", closeCommentBlockedDialog);
   elements.blockedModal.addEventListener("click", function (event) {
     if (event.target === elements.blockedModal) {
@@ -1266,6 +1383,10 @@
   });
   elements.input.addEventListener("keydown", function (event) {
     if (event.key === "Escape") {
+      if (!elements.reportModal.hidden) {
+        closeReportModal();
+        return;
+      }
       if (!elements.blockedModal.hidden) {
         closeCommentBlockedDialog();
         return;

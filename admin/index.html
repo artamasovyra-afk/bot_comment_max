@@ -3,8 +3,9 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Админка MAX Comments</title>
-    <link rel="stylesheet" href="/admin/app.css?v=20260430f" />
+    <title>Админка канала</title>
+    <link rel="stylesheet" href="/admin/app.css?v=20260501a" />
+    <script src="https://st.max.ru/js/max-web-app.js"></script>
   </head>
   <body>
     <main class="shell">
@@ -12,10 +13,10 @@
         <form id="login-form" class="login-panel">
           <div>
             <p class="eyebrow">MAX Comments</p>
-            <h1>Админка бота</h1>
+            <h1>Вход администратора</h1>
           </div>
           <label class="field">
-            <span>Токен доступа</span>
+            <span>Токен доступа super-admin</span>
             <input id="login-token" type="password" autocomplete="current-password" required />
           </label>
           <button class="primary-button" type="submit">Войти</button>
@@ -23,13 +24,26 @@
         </form>
       </section>
 
+      <section id="denied-view" class="login-view hidden">
+        <article class="login-panel">
+          <p class="eyebrow">MAX Comments</p>
+          <h1>Доступ запрещён</h1>
+          <p class="muted">У вас нет прав для управления этим каналом.</p>
+        </article>
+      </section>
+
       <section id="admin-view" class="admin-view hidden">
         <header class="topbar">
           <div>
             <p class="eyebrow">MAX Comments</p>
-            <h1>Панель управления</h1>
+            <h1>Админка канала</h1>
+            <p id="admin-role" class="muted"></p>
           </div>
           <div class="topbar-actions">
+            <label class="channel-picker">
+              <span>Канал</span>
+              <select id="channel-select"></select>
+            </label>
             <button id="refresh-button" class="icon-button" type="button" title="Обновить">
               <span aria-hidden="true">↻</span>
             </button>
@@ -39,98 +53,103 @@
 
         <div id="notice" class="notice hidden" aria-live="polite"></div>
 
-        <section class="status-grid" aria-label="Статус">
-          <article class="status-tile">
-            <span>Версия</span>
-            <strong id="status-version">-</strong>
-          </article>
-          <article class="status-tile">
-            <span>Режим</span>
-            <strong id="status-mode">-</strong>
-          </article>
-          <article class="status-tile">
-            <span>Бот</span>
-            <strong id="status-bot">-</strong>
-          </article>
-          <article class="status-tile">
-            <span>Каналов</span>
-            <strong id="status-channels">0</strong>
-          </article>
+        <nav class="tabs" aria-label="Разделы админки">
+          <button class="tab is-active" type="button" data-tab="dashboard">Дашборд</button>
+          <button class="tab" type="button" data-tab="posts">Посты</button>
+          <button class="tab" type="button" data-tab="comments">Комментарии</button>
+          <button class="tab" type="button" data-tab="reports">Жалобы</button>
+        </nav>
+
+        <section id="dashboard-tab" class="tab-panel">
+          <section class="status-grid" aria-label="Статистика">
+            <article class="status-tile"><span>Пользователи канала</span><strong id="stat-users">0</strong></article>
+            <article class="status-tile"><span>Посты</span><strong id="stat-posts">0</strong></article>
+            <article class="status-tile"><span>Комментарии</span><strong id="stat-comments">0</strong></article>
+            <article class="status-tile"><span>Жалобы</span><strong id="stat-reports">0</strong></article>
+            <article class="status-tile"><span>Новые жалобы</span><strong id="stat-new-reports">0</strong></article>
+            <article class="status-tile"><span>Удалённые комментарии</span><strong id="stat-deleted-comments">0</strong></article>
+          </section>
+
+          <section class="columns three">
+            <article class="panel">
+              <div class="panel-header"><h2>Последние посты</h2></div>
+              <div id="latest-posts" class="list compact-list"></div>
+            </article>
+            <article class="panel">
+              <div class="panel-header"><h2>Последние комментарии</h2></div>
+              <div id="latest-comments" class="list compact-list"></div>
+            </article>
+            <article class="panel">
+              <div class="panel-header"><h2>Последние жалобы</h2></div>
+              <div id="latest-reports" class="list compact-list"></div>
+            </article>
+          </section>
         </section>
 
-        <section class="panel">
-          <div class="panel-header">
-            <h2>Каналы</h2>
-            <button id="sync-button" class="ghost-button" type="button">Синхронизировать</button>
-          </div>
-          <form id="channel-form" class="form-grid compact">
-            <label class="field">
-              <span>ID канала</span>
-              <input id="channel-id" inputmode="numeric" required />
-            </label>
-            <label class="field">
-              <span>ID чата комментариев</span>
-              <input id="comments-chat-id" inputmode="numeric" required />
-            </label>
-            <label class="field">
-              <span>Ссылка на чат</span>
-              <input id="comments-chat-url" type="url" />
-            </label>
-            <button class="primary-button" type="submit">Добавить</button>
-          </form>
-          <div id="channels-list" class="list"></div>
+        <section id="posts-tab" class="tab-panel hidden">
+          <section class="panel">
+            <div class="panel-header"><h2>Создать пост</h2></div>
+            <form id="post-form" class="form-grid post-form">
+              <label class="field">
+                <span>Заголовок</span>
+                <input id="post-title" maxlength="160" placeholder="Короткий заголовок" />
+              </label>
+              <label class="field full">
+                <span>Текст поста</span>
+                <textarea id="post-content" rows="5" maxlength="4000" required></textarea>
+              </label>
+              <button class="primary-button" type="submit">Опубликовать</button>
+            </form>
+          </section>
+          <section class="panel">
+            <div class="panel-header"><h2>Посты</h2></div>
+            <div id="posts-list" class="list"></div>
+          </section>
         </section>
 
-        <section class="columns">
-          <article class="panel">
-            <div class="panel-header">
-              <h2>Последние посты</h2>
-            </div>
+        <section id="comments-tab" class="tab-panel hidden">
+          <section class="panel">
+            <div class="panel-header"><h2>Комментарии</h2></div>
             <div class="posts-filters">
               <label class="filter-field">
-                <span>Канал</span>
-                <select id="posts-channel-filter"></select>
+                <span>Статус</span>
+                <select id="comments-status">
+                  <option value="">Все</option>
+                  <option value="active">Активные</option>
+                  <option value="deleted">Удалённые</option>
+                  <option value="hidden">Скрытые</option>
+                </select>
               </label>
               <label class="filter-field search-field">
-                <span>Поиск</span>
-                <input
-                  id="posts-search"
-                  type="search"
-                  placeholder="Текст поста или комментария"
-                  autocomplete="off"
-                />
+                <span>Пост</span>
+                <select id="comments-post"></select>
               </label>
             </div>
-            <div id="posts-list" class="list posts-list"></div>
-          </article>
-
-          <article class="panel">
-            <div class="panel-header">
-              <h2>Каналы на настройке</h2>
-            </div>
-            <div id="pending-list" class="list"></div>
-          </article>
+            <div id="comments-list" class="list"></div>
+          </section>
         </section>
 
-        <section class="panel publish-panel">
-          <div class="panel-header">
-            <h2>Публикация</h2>
-          </div>
-          <form id="publish-form" class="form-grid">
-            <label class="field">
-              <span>Канал</span>
-              <select id="publish-channel" required></select>
-            </label>
-            <label class="field full">
-              <span>Текст поста</span>
-              <textarea id="publish-text" rows="5" maxlength="4000" required></textarea>
-            </label>
-            <button class="primary-button" type="submit">Опубликовать</button>
-          </form>
+        <section id="reports-tab" class="tab-panel hidden">
+          <section class="panel">
+            <div class="panel-header"><h2>Жалобы</h2></div>
+            <div class="posts-filters">
+              <label class="filter-field">
+                <span>Статус</span>
+                <select id="reports-status">
+                  <option value="">Все</option>
+                  <option value="new">Новые</option>
+                  <option value="in_review">В работе</option>
+                  <option value="accepted">Принятые</option>
+                  <option value="rejected">Отклонённые</option>
+                </select>
+              </label>
+            </div>
+            <div id="reports-list" class="list"></div>
+          </section>
         </section>
       </section>
     </main>
 
-    <script src="/admin/app.js?v=20260430f"></script>
+    <script src="/admin/app.js?v=20260501a"></script>
   </body>
 </html>

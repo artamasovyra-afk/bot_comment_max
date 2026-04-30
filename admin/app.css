@@ -86,6 +86,13 @@ button {
   align-items: center;
 }
 
+.muted {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
 .eyebrow {
   margin: 0 0 6px;
   color: var(--accent-strong);
@@ -111,7 +118,7 @@ h2 {
 
 .status-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 12px;
   margin-bottom: 14px;
 }
@@ -179,6 +186,50 @@ h2 {
   display: grid;
   grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.65fr);
   gap: 14px;
+}
+
+.columns.three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.channel-picker {
+  display: grid;
+  min-width: min(280px, 38vw);
+  gap: 5px;
+}
+
+.channel-picker span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 14px;
+}
+
+.tab {
+  min-height: 40px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 15px;
+  background: #fff;
+  color: var(--text);
+  font: inherit;
+  font-weight: 800;
+}
+
+.tab.is-active {
+  border-color: rgba(0, 140, 255, 0.22);
+  background: var(--accent);
+  color: #fff;
+}
+
+.tab-panel {
+  min-width: 0;
 }
 
 .form-grid {
@@ -287,6 +338,12 @@ textarea:focus {
   gap: 10px;
 }
 
+.compact-list {
+  max-height: 260px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
 .posts-list {
   max-height: 244px;
   overflow-y: auto;
@@ -379,6 +436,14 @@ textarea:focus {
   overflow-wrap: anywhere;
 }
 
+.item-text {
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .item-meta {
   color: var(--muted);
   font-size: 13px;
@@ -395,6 +460,16 @@ textarea:focus {
   color: var(--accent-strong);
   font-size: 12px;
   font-weight: 800;
+}
+
+.pill.danger {
+  background: rgba(217, 61, 61, 0.1);
+  color: var(--danger);
+}
+
+.pill.success {
+  background: rgba(27, 154, 102, 0.1);
+  color: var(--success);
 }
 
 .notice {
@@ -446,6 +521,7 @@ textarea:focus {
 
   .status-grid,
   .columns,
+  .columns.three,
   .form-grid,
   .posts-filters {
     grid-template-columns: 1fr;
@@ -464,6 +540,13 @@ textarea:focus {
 
   .topbar-actions {
     width: 100%;
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .channel-picker {
+    width: 100%;
+    min-width: 0;
   }
 
   .topbar-actions .ghost-button {

@@ -70,6 +70,19 @@ ADMIN_SESSION_COOKIE = "max_comments_admin"
 ADMIN_SESSION_MAX_AGE_SECONDS = 24 * 60 * 60
 COMMENT_BLOCKED_CODE = "COMMENT_BLOCKED"
 COMMENT_BLOCKED_MESSAGE = "Комментарий содержит запрещённые выражения. Исправьте текст и попробуйте снова."
+REPORT_CREATED_MESSAGE = "Жалоба отправлена. Администратор канала проверит комментарий."
+REPORT_ALREADY_EXISTS_MESSAGE = "Вы уже отправляли жалобу на этот комментарий."
+COMMENT_NOT_FOUND_MESSAGE = "Комментарий не найден."
+ACCESS_DENIED_MESSAGE = "У вас нет прав для управления этим каналом."
+ROLE_USER = "user"
+ROLE_CHANNEL_ADMIN = "channel_admin"
+ROLE_SUPER_ADMIN = "super_admin"
+COMMENT_STATUS_ACTIVE = "active"
+COMMENT_STATUS_DELETED = "deleted"
+COMMENT_STATUS_HIDDEN = "hidden"
+COMMENT_STATUSES = {COMMENT_STATUS_ACTIVE, COMMENT_STATUS_DELETED, COMMENT_STATUS_HIDDEN}
+REPORT_REASONS = {"insult", "profanity", "threat", "spam", "hate", "other"}
+REPORT_STATUSES = {"new", "in_review", "accepted", "rejected"}
 MODERATION_TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁёІіЇїЄєҐґ']+", re.UNICODE)
 MODERATION_COMPACT_RE = re.compile(r"[^0-9A-Za-zА-Яа-яЁёІіЇїЄєҐґ']+", re.UNICODE)
 MODERATION_REPEATED_CHAR_RE = re.compile(r"(.)\1{2,}", re.UNICODE)
@@ -280,6 +293,7 @@ def humanize_comment_error_message(message: str) -> str:
         "Post not found": "Пост для комментария больше не найден. Попробуйте открыть обсуждение заново.",
         "Parent comment not found": "Комментарий, на который вы отвечаете, больше не найден.",
         "Comment not found": "Комментарий не найден.",
+        "Comment is deleted": "Комментарий удалён.",
         "Comment is empty": "Комментарий пустой. Напишите текст или прикрепите фото.",
         "Comment is too long": "Комментарий слишком длинный. Максимум 4000 символов.",
         "Links are not allowed in comments": "Ссылки запрещены правилами сервиса.",
@@ -288,6 +302,9 @@ def humanize_comment_error_message(message: str) -> str:
         "Comments chat is not configured for this post": "Для этого поста не найден чат комментариев.",
         "You can edit only your own comments": "Можно редактировать только свои комментарии.",
         "You can delete only your own comments": "Можно удалять только свои комментарии.",
+        "Access denied": ACCESS_DENIED_MESSAGE,
+        "Report already exists": REPORT_ALREADY_EXISTS_MESSAGE,
+        "Invalid report reason": "Выберите причину жалобы.",
     }.get(normalized, normalized)
 
 
@@ -601,6 +618,17 @@ class AuthenticatedWebAppUser:
     chat_type: str | None
 
 
+@dataclass
+class AdminContext:
+    user_id: int
+    role: str
+    channel_ids: set[int]
+
+    @property
+    def is_super_admin(self) -> bool:
+        return self.role == ROLE_SUPER_ADMIN
+
+
 class MaxApiError(RuntimeError):
     pass
 
@@ -845,10 +873,15 @@ class CommentStore:
                     post_message_id TEXT PRIMARY KEY,
                     channel_chat_id INTEGER NOT NULL,
                     comments_chat_id INTEGER,
+                    post_title TEXT,
                     post_url TEXT,
                     post_text TEXT,
                     post_attachments_json TEXT NOT NULL DEFAULT '[]',
                     discussion_message_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'published',
+                    deleted_at TEXT,
+                    deleted_by_user_id INTEGER,
+                    delete_reason TEXT,
                     comment_count INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -866,6 +899,10 @@ class CommentStore:
                     source_message_id TEXT,
                     discussion_copy_message_id TEXT,
                     source_kind TEXT NOT NULL DEFAULT 'bot',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    deleted_at TEXT,
+                    deleted_by_user_id INTEGER,
+                    delete_reason TEXT,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(post_message_id) REFERENCES posts(post_message_id)
                 );
@@ -882,6 +919,44 @@ class CommentStore:
                     requested_by_user_id INTEGER NOT NULL,
                     channel_chat_id INTEGER NOT NULL,
                     channel_title TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS channel_admins (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(user_id, channel_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS comment_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    comment_id INTEGER NOT NULL,
+                    post_id TEXT NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    reporter_user_id INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    details TEXT,
+                    status TEXT NOT NULL DEFAULT 'new',
+                    admin_comment TEXT,
+                    resolved_by_user_id INTEGER,
+                    resolved_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(comment_id, reporter_user_id),
+                    FOREIGN KEY(comment_id) REFERENCES comments(id),
+                    FOREIGN KEY(post_id) REFERENCES posts(post_message_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS admin_audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    admin_user_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    entity_id TEXT,
+                    payload TEXT,
                     created_at TEXT NOT NULL
                 );
                 """
@@ -910,10 +985,30 @@ class CommentStore:
             self.conn.execute(
                 "ALTER TABLE comments ADD COLUMN discussion_copy_message_id TEXT"
             )
+        if "status" not in comment_columns:
+            self.conn.execute(
+                "ALTER TABLE comments ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
+            )
+        if "deleted_at" not in comment_columns:
+            self.conn.execute(
+                "ALTER TABLE comments ADD COLUMN deleted_at TEXT"
+            )
+        if "deleted_by_user_id" not in comment_columns:
+            self.conn.execute(
+                "ALTER TABLE comments ADD COLUMN deleted_by_user_id INTEGER"
+            )
+        if "delete_reason" not in comment_columns:
+            self.conn.execute(
+                "ALTER TABLE comments ADD COLUMN delete_reason TEXT"
+            )
         post_columns = {
             row["name"]
             for row in self.conn.execute("PRAGMA table_info(posts)").fetchall()
         }
+        if "post_title" not in post_columns:
+            self.conn.execute(
+                "ALTER TABLE posts ADD COLUMN post_title TEXT"
+            )
         if "comments_chat_id" not in post_columns:
             self.conn.execute(
                 "ALTER TABLE posts ADD COLUMN comments_chat_id INTEGER"
@@ -927,6 +1022,40 @@ class CommentStore:
             self.conn.execute(
                 "ALTER TABLE posts ADD COLUMN post_attachments_json TEXT NOT NULL DEFAULT '[]'"
             )
+        if "status" not in post_columns:
+            self.conn.execute(
+                "ALTER TABLE posts ADD COLUMN status TEXT NOT NULL DEFAULT 'published'"
+            )
+        if "deleted_at" not in post_columns:
+            self.conn.execute(
+                "ALTER TABLE posts ADD COLUMN deleted_at TEXT"
+            )
+        if "deleted_by_user_id" not in post_columns:
+            self.conn.execute(
+                "ALTER TABLE posts ADD COLUMN deleted_by_user_id INTEGER"
+            )
+        if "delete_reason" not in post_columns:
+            self.conn.execute(
+                "ALTER TABLE posts ADD COLUMN delete_reason TEXT"
+            )
+        self.conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_channel_admins_user_id
+                ON channel_admins(user_id);
+            CREATE INDEX IF NOT EXISTS idx_channel_admins_channel_id
+                ON channel_admins(channel_id);
+            CREATE INDEX IF NOT EXISTS idx_posts_channel_status
+                ON posts(channel_chat_id, status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_comments_post_status
+                ON comments(post_message_id, status, id);
+            CREATE INDEX IF NOT EXISTS idx_comment_reports_channel_status
+                ON comment_reports(channel_id, status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_comment_reports_comment_id
+                ON comment_reports(comment_id);
+            CREATE INDEX IF NOT EXISTS idx_admin_audit_channel
+                ON admin_audit_log(channel_id, created_at);
+            """
+        )
 
     def upsert_channel_binding(
         self,
@@ -993,6 +1122,48 @@ class CommentStore:
             self.conn.commit()
         return cursor.rowcount > 0
 
+    def add_channel_admin(self, *, user_id: int, channel_id: int) -> None:
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO channel_admins (user_id, channel_id, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id, channel_id) DO NOTHING
+                """,
+                (int(user_id), int(channel_id), utc_now()),
+            )
+            self.conn.commit()
+
+    def list_channel_admin_channel_ids(self, user_id: int) -> set[int]:
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT channel_id
+                FROM channel_admins
+                WHERE user_id = ?
+                ORDER BY channel_id ASC
+                """,
+                (int(user_id),),
+            ).fetchall()
+        return {int(row["channel_id"]) for row in rows}
+
+    def list_channel_bindings_for_channels(self, channel_ids: set[int]) -> list[sqlite3.Row]:
+        normalized_ids = sorted({int(channel_id) for channel_id in channel_ids})
+        if not normalized_ids:
+            return []
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        with self.lock:
+            rows = self.conn.execute(
+                f"""
+                SELECT *
+                FROM channel_bindings
+                WHERE channel_chat_id IN ({placeholders})
+                ORDER BY channel_chat_id ASC
+                """,
+                tuple(normalized_ids),
+            ).fetchall()
+        return list(rows)
+
     def upsert_post(
         self,
         *,
@@ -1002,6 +1173,7 @@ class CommentStore:
         post_url: str | None,
         post_text: str,
         post_attachments: list[dict[str, Any]] | None = None,
+        post_title: str | None = None,
         discussion_message_id: str | None = None,
     ) -> None:
         now = utc_now()
@@ -1013,6 +1185,7 @@ class CommentStore:
                     post_message_id,
                     channel_chat_id,
                     comments_chat_id,
+                    post_title,
                     post_url,
                     post_text,
                     post_attachments_json,
@@ -1020,10 +1193,11 @@ class CommentStore:
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(post_message_id) DO UPDATE SET
                     channel_chat_id = excluded.channel_chat_id,
                     comments_chat_id = COALESCE(posts.comments_chat_id, excluded.comments_chat_id),
+                    post_title = COALESCE(excluded.post_title, posts.post_title),
                     post_url = excluded.post_url,
                     post_text = excluded.post_text,
                     post_attachments_json = excluded.post_attachments_json,
@@ -1034,6 +1208,7 @@ class CommentStore:
                     post_message_id,
                     channel_chat_id,
                     comments_chat_id,
+                    safe_text(post_title) or None,
                     post_url,
                     post_text,
                     post_attachments_json,
@@ -1063,17 +1238,76 @@ class CommentStore:
                 (post_message_id,),
             ).fetchone()
 
-    def list_posts(self, limit: int = 10) -> list[sqlite3.Row]:
+    def list_posts(
+        self,
+        limit: int = 10,
+        *,
+        channel_ids: set[int] | None = None,
+        status: str | None = None,
+    ) -> list[sqlite3.Row]:
+        query = ["SELECT * FROM posts"]
+        params: list[Any] = []
+        where: list[str] = []
+        if channel_ids is not None:
+            normalized_ids = sorted({int(channel_id) for channel_id in channel_ids})
+            if not normalized_ids:
+                return []
+            placeholders = ", ".join("?" for _ in normalized_ids)
+            where.append(f"channel_chat_id IN ({placeholders})")
+            params.extend(normalized_ids)
+        if status:
+            where.append("status = ?")
+            params.append(safe_text(status))
+        if where:
+            query.append("WHERE " + " AND ".join(where))
+        query.append("ORDER BY created_at DESC")
+        query.append("LIMIT ?")
+        params.append(max(1, min(int(limit), 500)))
         with self.lock:
             rows = self.conn.execute(
-                """
-                SELECT * FROM posts
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
-                (limit,),
+                "\n".join(query),
+                tuple(params),
             ).fetchall()
         return list(rows)
+
+    def soft_delete_post(
+        self,
+        *,
+        post_message_id: str,
+        deleted_by_user_id: int,
+        reason: str | None = None,
+    ) -> sqlite3.Row | None:
+        now = utc_now()
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM posts WHERE post_message_id = ?",
+                (post_message_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            self.conn.execute(
+                """
+                UPDATE posts
+                SET status = 'deleted',
+                    deleted_at = COALESCE(deleted_at, ?),
+                    deleted_by_user_id = ?,
+                    delete_reason = ?,
+                    updated_at = ?
+                WHERE post_message_id = ?
+                """,
+                (
+                    now,
+                    int(deleted_by_user_id),
+                    safe_text(reason) or None,
+                    now,
+                    post_message_id,
+                ),
+            )
+            self.conn.commit()
+            return self.conn.execute(
+                "SELECT * FROM posts WHERE post_message_id = ?",
+                (post_message_id,),
+            ).fetchone()
 
     def find_post_by_comment_code(self, comment_code: str) -> sqlite3.Row | None:
         with self.lock:
@@ -1288,7 +1522,7 @@ class CommentStore:
                 """
                 SELECT *
                 FROM comments
-                WHERE post_message_id = ?
+                WHERE post_message_id = ? AND status = 'active'
                 ORDER BY created_at ASC
                 LIMIT ?
                 """,
@@ -1302,7 +1536,7 @@ class CommentStore:
                 """
                 SELECT text
                 FROM comments
-                WHERE post_message_id = ?
+                WHERE post_message_id = ? AND status = 'active'
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
@@ -1320,7 +1554,7 @@ class CommentStore:
         query = [
             "SELECT *",
             "FROM comments",
-            "WHERE post_message_id = ?",
+            "WHERE post_message_id = ? AND status = 'active'",
         ]
         params: list[Any] = [post_message_id]
         if before_comment_id is not None:
@@ -1381,7 +1615,10 @@ class CommentStore:
         *,
         comment_id: int,
         post_message_id: str,
+        deleted_by_user_id: int | None = None,
+        reason: str | None = None,
     ) -> sqlite3.Row | None:
+        now = utc_now()
         with self.lock:
             row = self.conn.execute(
                 """
@@ -1393,25 +1630,105 @@ class CommentStore:
             ).fetchone()
             if row is None:
                 return None
-            self.conn.execute("DELETE FROM comments WHERE id = ?", (comment_id,))
-            self.conn.execute(
-                "UPDATE comments SET parent_comment_id = NULL WHERE parent_comment_id = ?",
-                (comment_id,),
-            )
+            was_active = safe_text(row["status"] if "status" in row.keys() else COMMENT_STATUS_ACTIVE) == COMMENT_STATUS_ACTIVE
             self.conn.execute(
                 """
-                UPDATE posts
-                SET comment_count = CASE
-                    WHEN comment_count > 0 THEN comment_count - 1
-                    ELSE 0
-                END,
-                updated_at = ?
-                WHERE post_message_id = ?
+                UPDATE comments
+                SET status = 'deleted',
+                    deleted_at = COALESCE(deleted_at, ?),
+                    deleted_by_user_id = COALESCE(?, deleted_by_user_id),
+                    delete_reason = COALESCE(?, delete_reason)
+                WHERE id = ?
                 """,
-                (utc_now(), post_message_id),
+                (
+                    now,
+                    int(deleted_by_user_id) if deleted_by_user_id is not None else None,
+                    safe_text(reason) or None,
+                    comment_id,
+                ),
             )
+            if was_active:
+                self.conn.execute(
+                    """
+                    UPDATE posts
+                    SET comment_count = CASE
+                        WHEN comment_count > 0 THEN comment_count - 1
+                        ELSE 0
+                    END,
+                    updated_at = ?
+                    WHERE post_message_id = ?
+                    """,
+                    (now, post_message_id),
+                )
             self.conn.commit()
         return row
+
+    def set_comment_status(
+        self,
+        *,
+        comment_id: int,
+        status: str,
+        moderator_user_id: int,
+        reason: str | None = None,
+    ) -> sqlite3.Row | None:
+        normalized_status = safe_text(status)
+        if normalized_status not in COMMENT_STATUSES:
+            raise ValueError("Invalid comment status")
+        now = utc_now()
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM comments WHERE id = ?",
+                (int(comment_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            old_status = safe_text(row["status"] if "status" in row.keys() else COMMENT_STATUS_ACTIVE)
+            if old_status == normalized_status:
+                return row
+            deleted_at = now if normalized_status in {COMMENT_STATUS_DELETED, COMMENT_STATUS_HIDDEN} else None
+            deleted_by_user_id = int(moderator_user_id) if normalized_status in {COMMENT_STATUS_DELETED, COMMENT_STATUS_HIDDEN} else None
+            self.conn.execute(
+                """
+                UPDATE comments
+                SET status = ?,
+                    deleted_at = ?,
+                    deleted_by_user_id = ?,
+                    delete_reason = ?
+                WHERE id = ?
+                """,
+                (
+                    normalized_status,
+                    deleted_at,
+                    deleted_by_user_id,
+                    safe_text(reason) or None,
+                    int(comment_id),
+                ),
+            )
+            if old_status == COMMENT_STATUS_ACTIVE and normalized_status != COMMENT_STATUS_ACTIVE:
+                self.conn.execute(
+                    """
+                    UPDATE posts
+                    SET comment_count = CASE WHEN comment_count > 0 THEN comment_count - 1 ELSE 0 END,
+                        updated_at = ?
+                    WHERE post_message_id = ?
+                    """,
+                    (now, safe_text(row["post_message_id"])),
+                )
+            elif old_status != COMMENT_STATUS_ACTIVE and normalized_status == COMMENT_STATUS_ACTIVE:
+                self.conn.execute(
+                    """
+                    UPDATE posts
+                    SET comment_count = comment_count + 1,
+                        updated_at = ?
+                    WHERE post_message_id = ?
+                    """,
+                    (now, safe_text(row["post_message_id"])),
+                )
+            self.conn.commit()
+            return self.conn.execute(
+                "SELECT * FROM comments WHERE id = ?",
+                (int(comment_id),),
+            ).fetchone()
 
     def update_comment_text(
         self,
@@ -1453,6 +1770,325 @@ class CommentStore:
                 "SELECT * FROM comments WHERE id = ?",
                 (comment_id,),
             ).fetchone()
+
+    def count_reports_for_comment(self, comment_id: int) -> int:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS count FROM comment_reports WHERE comment_id = ?",
+                (int(comment_id),),
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    def list_admin_comments(
+        self,
+        *,
+        channel_ids: set[int],
+        post_message_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[sqlite3.Row]:
+        normalized_ids = sorted({int(channel_id) for channel_id in channel_ids})
+        if not normalized_ids:
+            return []
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        query = [
+            """
+            SELECT
+                comments.*,
+                posts.channel_chat_id AS channel_chat_id,
+                posts.post_text AS post_text,
+                posts.post_title AS post_title,
+                COALESCE(report_counts.report_count, 0) AS report_count
+            FROM comments
+            JOIN posts ON posts.post_message_id = comments.post_message_id
+            LEFT JOIN (
+                SELECT comment_id, COUNT(*) AS report_count
+                FROM comment_reports
+                GROUP BY comment_id
+            ) AS report_counts ON report_counts.comment_id = comments.id
+            """,
+            f"WHERE posts.channel_chat_id IN ({placeholders})",
+        ]
+        params: list[Any] = list(normalized_ids)
+        if post_message_id:
+            query.append("AND comments.post_message_id = ?")
+            params.append(safe_text(post_message_id))
+        if status:
+            query.append("AND comments.status = ?")
+            params.append(safe_text(status))
+        query.append("ORDER BY comments.created_at DESC")
+        query.append("LIMIT ?")
+        params.append(max(1, min(int(limit), 500)))
+        with self.lock:
+            rows = self.conn.execute("\n".join(query), tuple(params)).fetchall()
+        return list(rows)
+
+    def create_comment_report(
+        self,
+        *,
+        comment_id: int,
+        post_id: str,
+        channel_id: int,
+        reporter_user_id: int,
+        reason: str,
+        details: str | None,
+    ) -> int:
+        now = utc_now()
+        with self.lock:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO comment_reports (
+                    comment_id,
+                    post_id,
+                    channel_id,
+                    reporter_user_id,
+                    reason,
+                    details,
+                    status,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?)
+                """,
+                (
+                    int(comment_id),
+                    safe_text(post_id),
+                    int(channel_id),
+                    int(reporter_user_id),
+                    safe_text(reason),
+                    safe_text(details) or None,
+                    now,
+                    now,
+                ),
+            )
+            self.conn.commit()
+            return int(cursor.lastrowid)
+
+    def list_reports(
+        self,
+        *,
+        channel_ids: set[int],
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[sqlite3.Row]:
+        normalized_ids = sorted({int(channel_id) for channel_id in channel_ids})
+        if not normalized_ids:
+            return []
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        query = [
+            """
+            SELECT
+                comment_reports.*,
+                comments.text AS comment_text,
+                comments.display_name AS comment_author,
+                comments.username AS comment_username,
+                comments.created_at AS comment_created_at,
+                comments.status AS comment_status,
+                posts.post_text AS post_text,
+                posts.post_title AS post_title,
+                COALESCE(report_counts.report_count, 0) AS report_count
+            FROM comment_reports
+            JOIN comments ON comments.id = comment_reports.comment_id
+            JOIN posts ON posts.post_message_id = comment_reports.post_id
+            LEFT JOIN (
+                SELECT comment_id, COUNT(*) AS report_count
+                FROM comment_reports
+                GROUP BY comment_id
+            ) AS report_counts ON report_counts.comment_id = comment_reports.comment_id
+            """,
+            f"WHERE comment_reports.channel_id IN ({placeholders})",
+        ]
+        params: list[Any] = list(normalized_ids)
+        if status:
+            query.append("AND comment_reports.status = ?")
+            params.append(safe_text(status))
+        query.append("ORDER BY comment_reports.created_at DESC")
+        query.append("LIMIT ?")
+        params.append(max(1, min(int(limit), 500)))
+        with self.lock:
+            rows = self.conn.execute("\n".join(query), tuple(params)).fetchall()
+        return list(rows)
+
+    def get_report(self, report_id: int) -> sqlite3.Row | None:
+        with self.lock:
+            return self.conn.execute(
+                """
+                SELECT
+                    comment_reports.*,
+                    comments.text AS comment_text,
+                    comments.display_name AS comment_author,
+                    comments.username AS comment_username,
+                    comments.created_at AS comment_created_at,
+                    comments.status AS comment_status,
+                    comments.media_json AS comment_media_json,
+                    posts.post_text AS post_text,
+                    posts.post_title AS post_title,
+                    COALESCE(report_counts.report_count, 0) AS report_count
+                FROM comment_reports
+                JOIN comments ON comments.id = comment_reports.comment_id
+                JOIN posts ON posts.post_message_id = comment_reports.post_id
+                LEFT JOIN (
+                    SELECT comment_id, COUNT(*) AS report_count
+                    FROM comment_reports
+                    GROUP BY comment_id
+                ) AS report_counts ON report_counts.comment_id = comment_reports.comment_id
+                WHERE comment_reports.id = ?
+                """,
+                (int(report_id),),
+            ).fetchone()
+
+    def update_report(
+        self,
+        *,
+        report_id: int,
+        status: str,
+        admin_comment: str | None,
+        resolved_by_user_id: int | None,
+    ) -> sqlite3.Row | None:
+        now = utc_now()
+        resolved_at = now if status in {"accepted", "rejected"} else None
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM comment_reports WHERE id = ?",
+                (int(report_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            self.conn.execute(
+                """
+                UPDATE comment_reports
+                SET status = ?,
+                    admin_comment = COALESCE(?, admin_comment),
+                    resolved_by_user_id = ?,
+                    resolved_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    safe_text(status),
+                    safe_text(admin_comment) or None,
+                    int(resolved_by_user_id) if resolved_by_user_id is not None and status in {"accepted", "rejected"} else None,
+                    resolved_at,
+                    now,
+                    int(report_id),
+                ),
+            )
+            self.conn.commit()
+        return self.get_report(report_id)
+
+    def dashboard_stats(self, *, channel_ids: set[int]) -> dict[str, int]:
+        normalized_ids = sorted({int(channel_id) for channel_id in channel_ids})
+        if not normalized_ids:
+            return {
+                "usersCount": 0,
+                "postsCount": 0,
+                "commentsCount": 0,
+                "reportsCount": 0,
+                "newReportsCount": 0,
+                "deletedCommentsCount": 0,
+            }
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        with self.lock:
+            users_count = self.conn.execute(
+                f"""
+                SELECT COUNT(DISTINCT comments.user_id) AS count
+                FROM comments
+                JOIN posts ON posts.post_message_id = comments.post_message_id
+                WHERE posts.channel_chat_id IN ({placeholders})
+                  AND comments.status = 'active'
+                """,
+                tuple(normalized_ids),
+            ).fetchone()["count"]
+            posts_count = self.conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM posts
+                WHERE channel_chat_id IN ({placeholders})
+                  AND status = 'published'
+                """,
+                tuple(normalized_ids),
+            ).fetchone()["count"]
+            comments_count = self.conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM comments
+                JOIN posts ON posts.post_message_id = comments.post_message_id
+                WHERE posts.channel_chat_id IN ({placeholders})
+                  AND comments.status = 'active'
+                """,
+                tuple(normalized_ids),
+            ).fetchone()["count"]
+            reports_count = self.conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM comment_reports
+                WHERE channel_id IN ({placeholders})
+                """,
+                tuple(normalized_ids),
+            ).fetchone()["count"]
+            new_reports_count = self.conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM comment_reports
+                WHERE channel_id IN ({placeholders})
+                  AND status = 'new'
+                """,
+                tuple(normalized_ids),
+            ).fetchone()["count"]
+            deleted_comments_count = self.conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM comments
+                JOIN posts ON posts.post_message_id = comments.post_message_id
+                WHERE posts.channel_chat_id IN ({placeholders})
+                  AND comments.status IN ('deleted', 'hidden')
+                """,
+                tuple(normalized_ids),
+            ).fetchone()["count"]
+        return {
+            "usersCount": int(users_count or 0),
+            "postsCount": int(posts_count or 0),
+            "commentsCount": int(comments_count or 0),
+            "reportsCount": int(reports_count or 0),
+            "newReportsCount": int(new_reports_count or 0),
+            "deletedCommentsCount": int(deleted_comments_count or 0),
+        }
+
+    def add_admin_audit_log(
+        self,
+        *,
+        admin_user_id: int,
+        channel_id: int,
+        action: str,
+        entity_type: str,
+        entity_id: str | int | None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO admin_audit_log (
+                    admin_user_id,
+                    channel_id,
+                    action,
+                    entity_type,
+                    entity_id,
+                    payload,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(admin_user_id),
+                    int(channel_id),
+                    safe_text(action),
+                    safe_text(entity_type),
+                    safe_text(entity_id) if entity_id is not None else None,
+                    json.dumps(payload or {}, ensure_ascii=False),
+                    utc_now(),
+                ),
+            )
+            self.conn.commit()
 
 
 def validate_webapp_init_data(
@@ -1924,11 +2560,11 @@ class MaxCommentsBot:
             minimum=1,
             maximum=10**18,
         )
-        if owner_id is None or owner_id not in ADMIN_USER_IDS:
+        if owner_id is None:
             self.api.send_message(
                 chat_id=channel_chat_id,
                 text=(
-                    "Не удалось выполнить настройку: владелец канала не найден в списке администраторов бота."
+                    "Не удалось выполнить настройку: MAX не вернул владельца канала."
                 ),
             )
             return True
@@ -2068,7 +2704,14 @@ class MaxCommentsBot:
             return
 
         if command == "/posts":
-            self.send_posts_overview(user_id)
+            context = self.admin_context_for_user(user_id)
+            if context is None:
+                self.api.send_message(
+                    user_id=user_id,
+                    text="Эта команда доступна только администратору канала.",
+                )
+                return
+            self.send_posts_overview(user_id, context=context)
             return
 
         if command == "/comment":
@@ -2231,8 +2874,13 @@ class MaxCommentsBot:
         )
         self.api.send_message(user_id=user_id, text=text)
 
-    def send_posts_overview(self, user_id: int) -> None:
-        posts = self.store.list_posts()
+    def send_posts_overview(self, user_id: int, *, context: AdminContext | None = None) -> None:
+        if context is None:
+            context = self.admin_context_for_user(user_id)
+        channel_ids = None
+        if context is not None and not context.is_super_admin:
+            channel_ids = context.channel_ids
+        posts = self.store.list_posts(channel_ids=channel_ids)
         if not posts:
             self.api.send_message(user_id=user_id, text="Пока нет зарегистрированных постов.")
             return
@@ -2358,9 +3006,11 @@ class MaxCommentsBot:
             "channel_chat_id": int(post["channel_chat_id"]),
             "comments_chat_id": int(post["comments_chat_id"]) if post["comments_chat_id"] is not None else None,
             "post_url": safe_text(post["post_url"]),
+            "post_title": safe_text(post["post_title"] if "post_title" in post.keys() else ""),
             "post_text": safe_text(post["post_text"]),
             "comment_search_text": comment_search_text,
             "comment_count": int(post["comment_count"]),
+            "status": safe_text(post["status"] if "status" in post.keys() else "published"),
             "created_at": safe_text(post["created_at"]),
             "updated_at": safe_text(post["updated_at"]),
         }
@@ -2515,6 +3165,7 @@ class MaxCommentsBot:
                 comments_chat_id=channel_chat_id,
                 comments_chat_url=chat_link,
             )
+            self.store.add_channel_admin(user_id=user_id, channel_id=channel_chat_id)
             self.start_channel_sync()
             attached_count = self.sync_recent_channel_posts_for_binding(
                 channel_chat_id=channel_chat_id,
@@ -2625,6 +3276,7 @@ class MaxCommentsBot:
             comments_chat_id=comments_chat_id,
             comments_chat_url=comments_chat_link,
         )
+        self.store.add_channel_admin(user_id=user_id, channel_id=pending.channel_chat_id)
         self.store.delete_pending_channel_binding(bind_code)
         self.start_channel_sync()
 
@@ -2675,6 +3327,7 @@ class MaxCommentsBot:
             comments_chat_id=comments_chat_id,
             comments_chat_url=comments_chat_url or None,
         )
+        self.store.add_channel_admin(user_id=user_id, channel_id=channel_chat_id)
         self.start_channel_sync()
 
         warning = ""
@@ -2955,7 +3608,8 @@ class MaxCommentsBot:
         comments_chat_id: int,
         post_url: str | None,
         post_text: str,
-        source_attachments: list[dict[str, Any]] | None,
+        post_title: str | None = None,
+        source_attachments: list[dict[str, Any]] | None = None,
     ) -> sqlite3.Row:
         clean_post_text = strip_managed_channel_footer(post_text)
         clean_attachments = list(source_attachments or [])
@@ -2973,6 +3627,7 @@ class MaxCommentsBot:
             post_url=post_url,
             post_text=clean_post_text,
             post_attachments=clean_attachments,
+            post_title=post_title,
             discussion_message_id=(
                 safe_text(existing_post["discussion_message_id"]) or None if existing_post is not None else None
             ),
@@ -3005,7 +3660,14 @@ class MaxCommentsBot:
             raise MaxApiError("Post was registered but could not be reloaded")
         return stored_post
 
-    def publish_post(self, text: str, *, admin_user_id: int | None, channel_chat_id: int) -> dict[str, Any]:
+    def publish_post(
+        self,
+        text: str,
+        *,
+        admin_user_id: int | None,
+        channel_chat_id: int,
+        post_title: str | None = None,
+    ) -> dict[str, Any]:
         binding = self.get_channel_binding(channel_chat_id)
         if binding is None:
             raise MaxApiError("Channel is not connected")
@@ -3025,6 +3687,7 @@ class MaxCommentsBot:
             comments_chat_id=int(binding["comments_chat_id"]),
             post_url=post_url,
             post_text=safe_text(channel_message.get("body", {}).get("text")) or text,
+            post_title=post_title,
             source_attachments=self.extract_post_attachments_from_message(channel_message),
         )
 
@@ -3523,6 +4186,8 @@ class MaxCommentsBot:
             parent_comment = self.store.get_comment(int(parent_comment_id))
             if parent_comment is None or safe_text(parent_comment["post_message_id"]) != safe_text(post_message_id):
                 raise MaxApiError("Parent comment not found")
+            if safe_text(parent_comment["status"] if "status" in parent_comment.keys() else COMMENT_STATUS_ACTIVE) != COMMENT_STATUS_ACTIVE:
+                raise MaxApiError("Parent comment not found")
 
         comment_id = self.store.add_comment(
             post_message_id=post_message_id,
@@ -3653,6 +4318,535 @@ class MaxCommentsBot:
     def is_admin_user(self, user_id: int) -> bool:
         return int(user_id) in ADMIN_USER_IDS
 
+    def admin_context_for_user(self, user_id: int) -> AdminContext | None:
+        normalized_user_id = int(user_id)
+        if self.is_admin_user(normalized_user_id):
+            return AdminContext(
+                user_id=normalized_user_id,
+                role=ROLE_SUPER_ADMIN,
+                channel_ids=set(),
+            )
+        channel_ids = self.store.list_channel_admin_channel_ids(normalized_user_id)
+        if channel_ids:
+            return AdminContext(
+                user_id=normalized_user_id,
+                role=ROLE_CHANNEL_ADMIN,
+                channel_ids=channel_ids,
+            )
+        return None
+
+    def token_super_admin_context(self) -> AdminContext | None:
+        if not ADMIN_PANEL_TOKEN:
+            return None
+        fallback_user_id = min(ADMIN_USER_IDS) if ADMIN_USER_IDS else 0
+        return AdminContext(
+            user_id=int(fallback_user_id),
+            role=ROLE_SUPER_ADMIN,
+            channel_ids=set(),
+        )
+
+    def bound_channel_ids(self) -> set[int]:
+        return {int(binding["channel_chat_id"]) for binding in self.list_channel_bindings()}
+
+    def resolve_admin_channel_ids(
+        self,
+        context: AdminContext,
+        *,
+        requested_channel_id: int | None = None,
+    ) -> set[int]:
+        bound_ids = self.bound_channel_ids()
+        if context.is_super_admin:
+            if requested_channel_id is not None:
+                channel_id = int(requested_channel_id)
+                if channel_id not in bound_ids:
+                    raise MaxApiError("Channel is not connected")
+                return {channel_id}
+            return bound_ids
+
+        allowed_ids = context.channel_ids.intersection(bound_ids)
+        if requested_channel_id is not None:
+            channel_id = int(requested_channel_id)
+            if channel_id not in allowed_ids:
+                raise MaxApiError("Access denied")
+            return {channel_id}
+        if not allowed_ids:
+            raise MaxApiError("Access denied")
+        return allowed_ids
+
+    def require_admin_access_to_channel(self, context: AdminContext, channel_id: int) -> None:
+        self.resolve_admin_channel_ids(context, requested_channel_id=int(channel_id))
+
+    def list_channel_bindings_for_admin(self, context: AdminContext) -> list[sqlite3.Row]:
+        if context.is_super_admin:
+            return self.list_channel_bindings()
+        return self.store.list_channel_bindings_for_channels(context.channel_ids)
+
+    def serialize_admin_identity(self, context: AdminContext) -> dict[str, Any]:
+        return {
+            "user_id": context.user_id,
+            "role": context.role,
+            "is_super_admin": context.is_super_admin,
+        }
+
+    def primary_channel_payload(self, bindings: list[sqlite3.Row]) -> dict[str, Any] | None:
+        if not bindings:
+            return None
+        return self.serialize_channel_binding(bindings[0])
+
+    def serialize_admin_post(self, post: sqlite3.Row) -> dict[str, Any]:
+        text = safe_text(post["post_text"])
+        title = safe_text(post["post_title"] if "post_title" in post.keys() else "")
+        if not title:
+            title = snippet(text.splitlines()[0] if text.splitlines() else text, 90)
+        return {
+            "id": safe_text(post["post_message_id"]),
+            "post_message_id": safe_text(post["post_message_id"]),
+            "post_ref": post_ref_for_message_id(post["post_message_id"]),
+            "channel_id": int(post["channel_chat_id"]),
+            "channel_chat_id": int(post["channel_chat_id"]),
+            "title": title or "Пост без заголовка",
+            "content": text,
+            "status": safe_text(post["status"] if "status" in post.keys() else "published"),
+            "comment_count": int(post["comment_count"]),
+            "post_url": safe_text(post["post_url"]),
+            "webapp_url": self.direct_webapp_url(post["post_message_id"]),
+            "created_at": safe_text(post["created_at"]),
+            "updated_at": safe_text(post["updated_at"]),
+        }
+
+    def serialize_admin_comment(self, comment: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": int(comment["id"]),
+            "post_id": safe_text(comment["post_message_id"]),
+            "post_message_id": safe_text(comment["post_message_id"]),
+            "channel_id": int(comment["channel_chat_id"]),
+            "author": safe_text(comment["display_name"]),
+            "username": safe_text(comment["username"]),
+            "text": safe_text(comment["text"]),
+            "status": safe_text(comment["status"] if "status" in comment.keys() else COMMENT_STATUS_ACTIVE),
+            "created_at": safe_text(comment["created_at"]),
+            "deleted_at": safe_text(comment["deleted_at"] if "deleted_at" in comment.keys() else ""),
+            "delete_reason": safe_text(comment["delete_reason"] if "delete_reason" in comment.keys() else ""),
+            "post_title": safe_text(comment["post_title"] if "post_title" in comment.keys() else "") or snippet(safe_text(comment["post_text"]), 90),
+            "post_preview": snippet(safe_text(comment["post_text"]), 140),
+            "reports_count": int(comment["report_count"] if "report_count" in comment.keys() else 0),
+        }
+
+    def serialize_report(self, report: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": int(report["id"]),
+            "comment_id": int(report["comment_id"]),
+            "post_id": safe_text(report["post_id"]),
+            "channel_id": int(report["channel_id"]),
+            "reason": safe_text(report["reason"]),
+            "details": safe_text(report["details"]),
+            "status": safe_text(report["status"]),
+            "admin_comment": safe_text(report["admin_comment"]),
+            "resolved_by_user_id": int(report["resolved_by_user_id"]) if report["resolved_by_user_id"] is not None else None,
+            "resolved_at": safe_text(report["resolved_at"]),
+            "created_at": safe_text(report["created_at"]),
+            "updated_at": safe_text(report["updated_at"]),
+            "comment_text": safe_text(report["comment_text"]),
+            "comment_author": safe_text(report["comment_author"]),
+            "comment_username": safe_text(report["comment_username"]),
+            "comment_created_at": safe_text(report["comment_created_at"]),
+            "comment_status": safe_text(report["comment_status"]),
+            "post_title": safe_text(report["post_title"] if "post_title" in report.keys() else "") or snippet(safe_text(report["post_text"]), 90),
+            "post_preview": snippet(safe_text(report["post_text"]), 140),
+            "reports_count": int(report["report_count"] if "report_count" in report.keys() else 0),
+        }
+
+    def admin_dashboard(
+        self,
+        context: AdminContext,
+        *,
+        requested_channel_id: int | None = None,
+    ) -> dict[str, Any]:
+        channel_ids = self.resolve_admin_channel_ids(
+            context,
+            requested_channel_id=requested_channel_id,
+        )
+        bindings = [
+            binding
+            for binding in self.list_channel_bindings_for_admin(context)
+            if int(binding["channel_chat_id"]) in channel_ids
+        ]
+        latest_posts = self.store.list_posts(
+            limit=6,
+            channel_ids=channel_ids,
+            status="published",
+        )
+        latest_comments = self.store.list_admin_comments(
+            channel_ids=channel_ids,
+            status=COMMENT_STATUS_ACTIVE,
+            limit=6,
+        )
+        latest_reports = self.store.list_reports(
+            channel_ids=channel_ids,
+            limit=6,
+        )
+        return {
+            "ok": True,
+            "admin": self.serialize_admin_identity(context),
+            "channel": self.primary_channel_payload(bindings),
+            "channels": [self.serialize_channel_binding(binding) for binding in bindings],
+            "stats": self.store.dashboard_stats(channel_ids=channel_ids),
+            "latestPosts": [self.serialize_admin_post(post) for post in latest_posts],
+            "latestComments": [self.serialize_admin_comment(comment) for comment in latest_comments],
+            "latestReports": [self.serialize_report(report) for report in latest_reports],
+        }
+
+    def admin_list_posts(
+        self,
+        context: AdminContext,
+        *,
+        requested_channel_id: int | None = None,
+    ) -> dict[str, Any]:
+        channel_ids = self.resolve_admin_channel_ids(
+            context,
+            requested_channel_id=requested_channel_id,
+        )
+        posts = self.store.list_posts(limit=100, channel_ids=channel_ids)
+        return {
+            "ok": True,
+            "posts": [self.serialize_admin_post(post) for post in posts],
+        }
+
+    def admin_create_post(
+        self,
+        context: AdminContext,
+        *,
+        requested_channel_id: int | None,
+        title: str,
+        content: str,
+    ) -> dict[str, Any]:
+        clean_title = safe_text(title)
+        clean_content = safe_text(content)
+        if len(clean_title) > 160:
+            raise MaxApiError("Заголовок слишком длинный. Максимум 160 символов.")
+        if len(clean_content) > 4000:
+            raise MaxApiError("Текст поста слишком длинный. Максимум 4000 символов.")
+        if not clean_title and not clean_content:
+            raise MaxApiError("Post text is empty")
+
+        channel_ids = self.resolve_admin_channel_ids(
+            context,
+            requested_channel_id=requested_channel_id,
+        )
+        if len(channel_ids) != 1:
+            raise MaxApiError("Выберите канал для публикации.")
+        channel_id = next(iter(channel_ids))
+        publish_text = "\n\n".join(part for part in [clean_title, clean_content] if part)
+        result = self.publish_post(
+            publish_text,
+            admin_user_id=None,
+            channel_chat_id=channel_id,
+            post_title=clean_title or None,
+        )
+        post = self.store.get_post(result["post_message_id"])
+        if post is None:
+            raise MaxApiError("Post was registered but could not be reloaded")
+        self.store.add_admin_audit_log(
+            admin_user_id=context.user_id,
+            channel_id=channel_id,
+            action="create_post",
+            entity_type="post",
+            entity_id=post["post_message_id"],
+            payload={"title": clean_title},
+        )
+        return {
+            "ok": True,
+            "post": self.serialize_admin_post(post),
+        }
+
+    def admin_get_post(
+        self,
+        context: AdminContext,
+        *,
+        post_reference: str,
+    ) -> dict[str, Any]:
+        post = self.resolve_post_reference(post_reference)
+        if post is None:
+            raise MaxApiError("Post not found")
+        self.require_admin_access_to_channel(context, int(post["channel_chat_id"]))
+        return {
+            "ok": True,
+            "post": self.serialize_admin_post(post),
+        }
+
+    def admin_delete_post(
+        self,
+        context: AdminContext,
+        *,
+        post_reference: str,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        post = self.resolve_post_reference(post_reference)
+        if post is None:
+            raise MaxApiError("Post not found")
+        channel_id = int(post["channel_chat_id"])
+        self.require_admin_access_to_channel(context, channel_id)
+        deleted = self.store.soft_delete_post(
+            post_message_id=post["post_message_id"],
+            deleted_by_user_id=context.user_id,
+            reason=reason or "Удалено администратором",
+        )
+        if deleted is None:
+            raise MaxApiError("Post not found")
+        self.store.add_admin_audit_log(
+            admin_user_id=context.user_id,
+            channel_id=channel_id,
+            action="delete_post",
+            entity_type="post",
+            entity_id=post["post_message_id"],
+            payload={"reason": safe_text(reason)},
+        )
+        return {
+            "ok": True,
+            "post": self.serialize_admin_post(deleted),
+        }
+
+    def admin_list_comments(
+        self,
+        context: AdminContext,
+        *,
+        requested_channel_id: int | None = None,
+        post_reference: str | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_status = safe_text(status)
+        if normalized_status and normalized_status not in COMMENT_STATUSES:
+            raise MaxApiError("Invalid comment status")
+        channel_ids = self.resolve_admin_channel_ids(
+            context,
+            requested_channel_id=requested_channel_id,
+        )
+        post_message_id = None
+        if post_reference:
+            post = self.resolve_post_reference(post_reference)
+            if post is None:
+                raise MaxApiError("Post not found")
+            self.require_admin_access_to_channel(context, int(post["channel_chat_id"]))
+            post_message_id = safe_text(post["post_message_id"])
+            channel_ids = {int(post["channel_chat_id"])}
+        comments = self.store.list_admin_comments(
+            channel_ids=channel_ids,
+            post_message_id=post_message_id,
+            status=normalized_status or None,
+            limit=200,
+        )
+        return {
+            "ok": True,
+            "comments": [self.serialize_admin_comment(comment) for comment in comments],
+        }
+
+    def admin_set_comment_status(
+        self,
+        context: AdminContext,
+        *,
+        comment_id: int,
+        status: str,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_status = safe_text(status)
+        if normalized_status not in COMMENT_STATUSES:
+            raise MaxApiError("Invalid comment status")
+        clean_reason = safe_text(reason)
+        if len(clean_reason) > 500:
+            raise MaxApiError("Причина слишком длинная. Максимум 500 символов.")
+        comment = self.store.get_comment(comment_id)
+        if comment is None:
+            raise MaxApiError("Comment not found")
+        post = self.store.get_post(comment["post_message_id"])
+        if post is None:
+            raise MaxApiError("Post not found")
+        channel_id = int(post["channel_chat_id"])
+        self.require_admin_access_to_channel(context, channel_id)
+
+        updated = self.store.set_comment_status(
+            comment_id=comment_id,
+            status=normalized_status,
+            moderator_user_id=context.user_id,
+            reason=clean_reason or None,
+        )
+        if updated is None:
+            raise MaxApiError("Comment not found")
+        if normalized_status != COMMENT_STATUS_ACTIVE:
+            self.delete_comment_media_files(deserialize_comment_media(comment["media_json"]))
+            self.delete_comment_discussion_copy(comment)
+        self.refresh_post_comment_button(
+            post["post_message_id"],
+            comment_count=self.store.get_comment_count(post["post_message_id"]),
+        )
+        self.store.add_admin_audit_log(
+            admin_user_id=context.user_id,
+            channel_id=channel_id,
+            action="restore_comment" if normalized_status == COMMENT_STATUS_ACTIVE else "delete_comment",
+            entity_type="comment",
+            entity_id=comment_id,
+            payload={"status": normalized_status, "reason": clean_reason},
+        )
+        return {
+            "ok": True,
+            "comment": self.serialize_comment(updated),
+            "admin_comment": None,
+        }
+
+    def report_comment_from_webapp(
+        self,
+        *,
+        comment_id: int,
+        init_data: str,
+        reason: str,
+        details: str | None = None,
+    ) -> dict[str, Any]:
+        auth_user = self.authenticate_webapp_user(init_data)
+        normalized_reason = safe_text(reason)
+        if normalized_reason not in REPORT_REASONS:
+            raise MaxApiError("Invalid report reason")
+        clean_details = safe_text(details)
+        if len(clean_details) > 1000:
+            raise MaxApiError("Описание жалобы слишком длинное. Максимум 1000 символов.")
+
+        comment = self.store.get_comment(comment_id)
+        if comment is None:
+            raise MaxApiError("Comment not found")
+        if safe_text(comment["status"] if "status" in comment.keys() else COMMENT_STATUS_ACTIVE) != COMMENT_STATUS_ACTIVE:
+            raise MaxApiError("Comment not found")
+        if int(comment["user_id"]) == int(auth_user.user_id):
+            raise MaxApiError("Нельзя пожаловаться на свой комментарий.")
+        post = self.store.get_post(comment["post_message_id"])
+        if post is None or safe_text(post["status"] if "status" in post.keys() else "published") != "published":
+            raise MaxApiError("Comment not found")
+
+        try:
+            self.store.create_comment_report(
+                comment_id=comment_id,
+                post_id=safe_text(comment["post_message_id"]),
+                channel_id=int(post["channel_chat_id"]),
+                reporter_user_id=auth_user.user_id,
+                reason=normalized_reason,
+                details=clean_details or None,
+            )
+        except sqlite3.IntegrityError as exc:
+            raise MaxApiError("Report already exists") from exc
+        return {
+            "ok": True,
+            "message": REPORT_CREATED_MESSAGE,
+        }
+
+    def admin_list_reports(
+        self,
+        context: AdminContext,
+        *,
+        requested_channel_id: int | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_status = safe_text(status)
+        if normalized_status and normalized_status not in REPORT_STATUSES:
+            raise MaxApiError("Invalid report status")
+        channel_ids = self.resolve_admin_channel_ids(
+            context,
+            requested_channel_id=requested_channel_id,
+        )
+        reports = self.store.list_reports(
+            channel_ids=channel_ids,
+            status=normalized_status or None,
+            limit=200,
+        )
+        return {
+            "ok": True,
+            "reports": [self.serialize_report(report) for report in reports],
+        }
+
+    def admin_get_report(self, context: AdminContext, *, report_id: int) -> dict[str, Any]:
+        report = self.store.get_report(report_id)
+        if report is None:
+            raise MaxApiError("Report not found")
+        self.require_admin_access_to_channel(context, int(report["channel_id"]))
+        return {
+            "ok": True,
+            "report": self.serialize_report(report),
+        }
+
+    def admin_update_report(
+        self,
+        context: AdminContext,
+        *,
+        report_id: int,
+        status: str,
+        action: str | None = None,
+        admin_comment: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_status = safe_text(status)
+        if normalized_status not in REPORT_STATUSES:
+            raise MaxApiError("Invalid report status")
+        clean_admin_comment = safe_text(admin_comment)
+        if len(clean_admin_comment) > 1000:
+            raise MaxApiError("Комментарий администратора слишком длинный. Максимум 1000 символов.")
+        report = self.store.get_report(report_id)
+        if report is None:
+            raise MaxApiError("Report not found")
+        channel_id = int(report["channel_id"])
+        self.require_admin_access_to_channel(context, channel_id)
+
+        normalized_action = safe_text(action)
+        if normalized_action == "delete_comment":
+            comment = self.store.get_comment(int(report["comment_id"]))
+            if comment is not None:
+                deleted = self.store.delete_comment(
+                    comment_id=int(report["comment_id"]),
+                    post_message_id=safe_text(report["post_id"]),
+                    deleted_by_user_id=context.user_id,
+                    reason=clean_admin_comment or "Жалоба принята",
+                )
+                if deleted is not None:
+                    self.delete_comment_media_files(deserialize_comment_media(deleted["media_json"]))
+                    self.delete_comment_discussion_copy(deleted)
+                    self.refresh_post_comment_button(
+                        safe_text(report["post_id"]),
+                        comment_count=self.store.get_comment_count(safe_text(report["post_id"])),
+                    )
+                    self.store.add_admin_audit_log(
+                        admin_user_id=context.user_id,
+                        channel_id=channel_id,
+                        action="delete_comment",
+                        entity_type="comment",
+                        entity_id=int(report["comment_id"]),
+                        payload={"source": "report", "report_id": report_id},
+                    )
+            normalized_status = "accepted"
+
+        updated = self.store.update_report(
+            report_id=report_id,
+            status=normalized_status,
+            admin_comment=clean_admin_comment or None,
+            resolved_by_user_id=context.user_id if normalized_status in {"accepted", "rejected"} else None,
+        )
+        if updated is None:
+            raise MaxApiError("Report not found")
+        audit_action = {
+            "in_review": "review_report",
+            "accepted": "accept_report",
+            "rejected": "reject_report",
+        }.get(normalized_status, "update_report")
+        self.store.add_admin_audit_log(
+            admin_user_id=context.user_id,
+            channel_id=channel_id,
+            action=audit_action,
+            entity_type="report",
+            entity_id=report_id,
+            payload={
+                "status": normalized_status,
+                "action": normalized_action,
+                "admin_comment": clean_admin_comment,
+            },
+        )
+        return {
+            "ok": True,
+            "report": self.serialize_report(updated),
+        }
+
     def build_viewer_payload(
         self,
         init_data: str,
@@ -3664,16 +4858,22 @@ class MaxCommentsBot:
             viewer = self.authenticate_webapp_user(clean_init_data)
         except WebAppAuthError:
             return None
+        admin_context = self.admin_context_for_user(viewer.user_id)
         return {
             "user_id": viewer.user_id,
             "display_name": viewer.display_name,
             "username": viewer.username,
             "is_admin": self.is_admin_user(viewer.user_id),
+            "role": admin_context.role if admin_context else ROLE_USER,
         }
 
     def get_post_payload(self, reference: str) -> dict[str, Any]:
         post = self.resolve_post_reference(reference)
         if post is None:
+            raise MaxApiError("Post not found")
+        if safe_text(post["status"] if "status" in post.keys() else "published") != "published":
+            raise MaxApiError("Post not found")
+        if safe_text(post["status"] if "status" in post.keys() else "published") != "published":
             raise MaxApiError("Post not found")
         return self.serialize_post(post)
 
@@ -3687,6 +4887,8 @@ class MaxCommentsBot:
     ) -> dict[str, Any]:
         post = self.resolve_post_reference(reference)
         if post is None:
+            raise MaxApiError("Post not found")
+        if safe_text(post["status"] if "status" in post.keys() else "published") != "published":
             raise MaxApiError("Post not found")
         normalized_limit = normalize_comments_page_limit(limit)
         rows, has_more = self.store.list_comments_page(
@@ -3739,6 +4941,8 @@ class MaxCommentsBot:
         post = self.resolve_post_reference(reference)
         if post is None:
             raise MaxApiError("Post not found")
+        if safe_text(post["status"] if "status" in post.keys() else "published") != "published":
+            raise MaxApiError("Post not found")
         media_items = self.build_comment_media_from_webapp(photo)
         if not clean_text and not media_items:
             raise MaxApiError("Comment is empty")
@@ -3772,8 +4976,12 @@ class MaxCommentsBot:
         post = self.resolve_post_reference(reference)
         if post is None:
             raise MaxApiError("Post not found")
+        if safe_text(post["status"] if "status" in post.keys() else "published") != "published":
+            raise MaxApiError("Post not found")
         comment = self.store.get_comment(comment_id)
         if comment is None or safe_text(comment["post_message_id"]) != safe_text(post["post_message_id"]):
+            raise MaxApiError("Comment not found")
+        if safe_text(comment["status"] if "status" in comment.keys() else COMMENT_STATUS_ACTIVE) != COMMENT_STATUS_ACTIVE:
             raise MaxApiError("Comment not found")
         is_admin = self.is_admin_user(auth_user.user_id)
         is_author = int(comment["user_id"]) == int(auth_user.user_id)
@@ -3783,6 +4991,8 @@ class MaxCommentsBot:
         deleted = self.store.delete_comment(
             comment_id=comment_id,
             post_message_id=post["post_message_id"],
+            deleted_by_user_id=auth_user.user_id,
+            reason="Удалено пользователем",
         )
         if deleted is None:
             raise MaxApiError("Comment not found")
@@ -3845,9 +5055,13 @@ class MaxCommentsBot:
         post = self.resolve_post_reference(reference)
         if post is None:
             raise MaxApiError("Post not found")
+        if safe_text(post["status"] if "status" in post.keys() else "published") != "published":
+            raise MaxApiError("Post not found")
 
         comment = self.store.get_comment(comment_id)
         if comment is None or safe_text(comment["post_message_id"]) != safe_text(post["post_message_id"]):
+            raise MaxApiError("Comment not found")
+        if safe_text(comment["status"] if "status" in comment.keys() else COMMENT_STATUS_ACTIVE) != COMMENT_STATUS_ACTIVE:
             raise MaxApiError("Comment not found")
         if int(comment["user_id"]) != int(auth_user.user_id):
             raise MaxApiError("You can edit only your own comments")
@@ -3898,11 +5112,13 @@ class MaxCommentsBot:
                 else None
             ),
             "comment_code": comment_code_for_post(post["post_message_id"]),
+            "post_title": safe_text(post["post_title"] if "post_title" in post.keys() else ""),
             "post_text": post["post_text"],
             "post_preview": snippet(post["post_text"], 220),
             "post_url": post["post_url"],
             "media": extract_post_media_from_attachments(post_attachments),
             "comment_count": int(post["comment_count"]),
+            "status": safe_text(post["status"] if "status" in post.keys() else "published"),
             "created_at": post["created_at"],
             "updated_at": post["updated_at"],
             "discussion_message_id": post["discussion_message_id"],
@@ -3927,19 +5143,22 @@ class MaxCommentsBot:
             "media": deserialize_comment_media(comment["media_json"]),
             "parent_comment": self.serialize_parent_comment(parent_comment),
             "source_kind": comment["source_kind"],
+            "status": safe_text(comment["status"] if "status" in comment.keys() else COMMENT_STATUS_ACTIVE),
             "created_at": comment["created_at"],
         }
 
     def serialize_parent_comment(self, comment: sqlite3.Row | None) -> dict[str, Any] | None:
         if comment is None:
             return None
+        is_deleted = safe_text(comment["status"] if "status" in comment.keys() else COMMENT_STATUS_ACTIVE) != COMMENT_STATUS_ACTIVE
         return {
             "id": int(comment["id"]),
             "user_id": int(comment["user_id"]),
             "display_name": comment["display_name"],
             "username": comment["username"],
-            "text": comment_reply_preview_text(comment),
-            "has_media": bool(deserialize_comment_media(comment["media_json"])),
+            "text": "Комментарий удалён модератором" if is_deleted else comment_reply_preview_text(comment),
+            "has_media": False if is_deleted else bool(deserialize_comment_media(comment["media_json"])),
+            "status": safe_text(comment["status"] if "status" in comment.keys() else COMMENT_STATUS_ACTIVE),
         }
 
     @staticmethod
@@ -4013,9 +5232,19 @@ class CommentWebServer:
                     )
                     return
                 if path == "/api/admin/state":
-                    if not self.require_admin():
+                    context = self.require_admin_context()
+                    if context is None:
+                        return
+                    if not context.is_super_admin:
+                        try:
+                            self.send_json(HTTPStatus.OK, app.admin_dashboard(context))
+                        except MaxApiError as exc:
+                            self.send_max_api_error(exc)
                         return
                     self.send_json(HTTPStatus.OK, app.get_admin_state())
+                    return
+                if path.startswith("/api/admin/"):
+                    self.handle_admin_get(path, parse.parse_qs(parsed.query, keep_blank_values=True))
                     return
                 if path.startswith("/api/posts/"):
                     self.handle_api_get(path, parse.parse_qs(parsed.query, keep_blank_values=True))
@@ -4073,6 +5302,9 @@ class CommentWebServer:
                 if path.startswith("/api/admin/"):
                     self.handle_admin_post(path)
                     return
+                if path.startswith("/api/comments/") and path.endswith("/report"):
+                    self.handle_report_comment(path)
+                    return
                 if path.startswith("/api/posts/") and path.endswith("/comments"):
                     self.handle_create_comment(path)
                     return
@@ -4081,6 +5313,9 @@ class CommentWebServer:
             def do_PATCH(self) -> None:
                 parsed = parse.urlparse(self.path)
                 path = parsed.path
+                if path.startswith("/api/admin/"):
+                    self.handle_admin_patch(path)
+                    return
                 if path.startswith("/api/posts/") and "/comments/" in path:
                     self.handle_update_comment(path)
                     return
@@ -4324,14 +5559,144 @@ class CommentWebServer:
                     headers={"Set-Cookie": self.admin_session_cookie("", max_age=0)},
                 )
 
+            def admin_context_from_init_data(self) -> AdminContext | None:
+                init_data = self.read_init_data_header()
+                if not init_data:
+                    return None
+                try:
+                    user = app.authenticate_webapp_user(init_data)
+                except WebAppAuthError:
+                    return None
+                return app.admin_context_for_user(user.user_id)
+
+            def require_admin_context(self) -> AdminContext | None:
+                context = self.admin_context_from_init_data()
+                if context is not None:
+                    return context
+                if self.is_admin_authenticated():
+                    return app.token_super_admin_context()
+                if self.read_init_data_header():
+                    self.send_json(
+                        HTTPStatus.FORBIDDEN,
+                        {
+                            "ok": False,
+                            "error": "ACCESS_DENIED",
+                            "message": ACCESS_DENIED_MESSAGE,
+                        },
+                    )
+                    return None
+                self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "Unauthorized"})
+                return None
+
+            def query_int(self, query: dict[str, list[str]], key: str) -> int | None:
+                values = query.get(key) or []
+                if not values or not safe_text(values[0]):
+                    return None
+                return int(values[0])
+
+            def admin_error_status(self, exc: MaxApiError) -> HTTPStatus:
+                message = str(exc).lower()
+                if "access denied" in message:
+                    return HTTPStatus.FORBIDDEN
+                if "not found" in message or "not connected" in message:
+                    return HTTPStatus.NOT_FOUND
+                return HTTPStatus.BAD_REQUEST
+
+            def send_max_api_error(self, exc: MaxApiError) -> None:
+                self.send_json(
+                    self.admin_error_status(exc),
+                    {
+                        "ok": False,
+                        "error": safe_text(str(exc)),
+                        "message": humanize_comment_error_message(str(exc)),
+                    },
+                )
+
+            def handle_admin_get(self, path: str, query: dict[str, list[str]]) -> None:
+                context = self.require_admin_context()
+                if context is None:
+                    return
+                try:
+                    channel_id = self.query_int(query, "channel_id")
+                    if path == "/api/admin/dashboard":
+                        self.send_json(HTTPStatus.OK, app.admin_dashboard(context, requested_channel_id=channel_id))
+                        return
+                    if path == "/api/admin/posts":
+                        self.send_json(HTTPStatus.OK, app.admin_list_posts(context, requested_channel_id=channel_id))
+                        return
+                    if path.startswith("/api/admin/posts/"):
+                        tail = parse.unquote(path.removeprefix("/api/admin/posts/"))
+                        if tail.endswith("/comments"):
+                            post_reference = tail[: -len("/comments")]
+                            status = safe_text((query.get("status") or [""])[0]) or None
+                            self.send_json(
+                                HTTPStatus.OK,
+                                app.admin_list_comments(
+                                    context,
+                                    post_reference=post_reference,
+                                    status=status,
+                                ),
+                            )
+                            return
+                        self.send_json(HTTPStatus.OK, app.admin_get_post(context, post_reference=tail))
+                        return
+                    if path == "/api/admin/comments":
+                        status = safe_text((query.get("status") or [""])[0]) or None
+                        post_reference = safe_text((query.get("post_id") or [""])[0]) or None
+                        self.send_json(
+                            HTTPStatus.OK,
+                            app.admin_list_comments(
+                                context,
+                                requested_channel_id=channel_id,
+                                post_reference=post_reference,
+                                status=status,
+                            ),
+                        )
+                        return
+                    if path == "/api/admin/reports":
+                        status = safe_text((query.get("status") or [""])[0]) or None
+                        self.send_json(
+                            HTTPStatus.OK,
+                            app.admin_list_reports(
+                                context,
+                                requested_channel_id=channel_id,
+                                status=status,
+                            ),
+                        )
+                        return
+                    if path.startswith("/api/admin/reports/"):
+                        report_id = int(parse.unquote(path.removeprefix("/api/admin/reports/")).split("/", 1)[0])
+                        self.send_json(HTTPStatus.OK, app.admin_get_report(context, report_id=report_id))
+                        return
+                except ValueError:
+                    self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "INVALID_ID", "message": "Некорректный ID"})
+                    return
+                except MaxApiError as exc:
+                    self.send_max_api_error(exc)
+                    return
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+
             def handle_admin_post(self, path: str) -> None:
-                if not self.require_admin():
+                context = self.require_admin_context()
+                if context is None:
                     return
                 payload = self.read_json_body()
                 if payload is None:
                     return
                 try:
+                    if path == "/api/admin/posts":
+                        channel_id = validate_positive_int(payload.get("channel_id"), minimum=1, maximum=10**18)
+                        result = app.admin_create_post(
+                            context,
+                            requested_channel_id=channel_id,
+                            title=safe_text(payload.get("title")),
+                            content=safe_text(payload.get("content")),
+                        )
+                        self.send_json(HTTPStatus.CREATED, result)
+                        return
                     if path == "/api/admin/channels":
+                        if not context.is_super_admin:
+                            raise MaxApiError("Access denied")
                         channel_chat_id = int(payload.get("channel_chat_id"))
                         comments_chat_id = int(payload.get("comments_chat_id"))
                         result = app.admin_add_channel_binding(
@@ -4343,10 +5708,12 @@ class CommentWebServer:
                         self.send_json(HTTPStatus.OK, result)
                         return
                     if path == "/api/admin/publish":
-                        channel_chat_id = int(payload.get("channel_chat_id"))
+                        channel_chat_id = validate_positive_int(payload.get("channel_chat_id"), minimum=1, maximum=10**18)
                         text = safe_text(payload.get("text"))
                         if not text:
                             raise MaxApiError("Post text is empty")
+                        channel_ids = app.resolve_admin_channel_ids(context, requested_channel_id=channel_chat_id)
+                        channel_chat_id = next(iter(channel_ids))
                         result = app.publish_post(
                             text,
                             admin_user_id=None,
@@ -4355,6 +5722,8 @@ class CommentWebServer:
                         self.send_json(HTTPStatus.CREATED, result)
                         return
                     if path == "/api/admin/attach":
+                        if not context.is_super_admin:
+                            raise MaxApiError("Access denied")
                         post_message_id = safe_text(payload.get("post_message_id"))
                         if not post_message_id:
                             raise MaxApiError("Post message id is empty")
@@ -4362,22 +5731,82 @@ class CommentWebServer:
                         self.send_json(HTTPStatus.OK, result)
                         return
                     if path == "/api/admin/sync":
+                        if not context.is_super_admin:
+                            raise MaxApiError("Access denied")
                         self.send_json(HTTPStatus.OK, app.admin_sync_recent_channel_posts())
                         return
                 except (TypeError, ValueError):
                     self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Проверьте числовые ID"})
                     return
                 except MaxApiError as exc:
-                    self.send_json(HTTPStatus.BAD_REQUEST, {"error": humanize_comment_error_message(str(exc))})
+                    self.send_max_api_error(exc)
+                    return
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+
+            def handle_admin_patch(self, path: str) -> None:
+                context = self.require_admin_context()
+                if context is None:
+                    return
+                payload = self.read_json_body()
+                if payload is None:
+                    return
+                try:
+                    if path.startswith("/api/admin/comments/") and path.endswith("/status"):
+                        raw_comment_id = path.removeprefix("/api/admin/comments/").removesuffix("/status")
+                        comment_id = int(parse.unquote(raw_comment_id).strip("/"))
+                        result = app.admin_set_comment_status(
+                            context,
+                            comment_id=comment_id,
+                            status=safe_text(payload.get("status")),
+                            reason=safe_text(payload.get("reason")),
+                        )
+                        self.send_json(HTTPStatus.OK, result)
+                        return
+                    if path.startswith("/api/admin/reports/"):
+                        report_id = int(parse.unquote(path.removeprefix("/api/admin/reports/")).split("/", 1)[0])
+                        result = app.admin_update_report(
+                            context,
+                            report_id=report_id,
+                            status=safe_text(payload.get("status")),
+                            action=safe_text(payload.get("action")) or None,
+                            admin_comment=safe_text(payload.get("adminComment")),
+                        )
+                        self.send_json(HTTPStatus.OK, result)
+                        return
+                except ValueError:
+                    self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "INVALID_ID", "message": "Некорректный ID"})
+                    return
+                except MaxApiError as exc:
+                    self.send_max_api_error(exc)
                     return
                 self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
             def handle_admin_delete(self, path: str) -> None:
-                if not self.require_admin():
+                context = self.require_admin_context()
+                if context is None:
+                    return
+                if path.startswith("/api/admin/posts/"):
+                    post_reference = parse.unquote(path.removeprefix("/api/admin/posts/")).split("/", 1)[0]
+                    try:
+                        result = app.admin_delete_post(
+                            context,
+                            post_reference=post_reference,
+                            reason="Удалено администратором",
+                        )
+                    except MaxApiError as exc:
+                        self.send_max_api_error(exc)
+                        return
+                    self.send_json(HTTPStatus.OK, result)
                     return
                 prefix = "/api/admin/channels/"
                 if not path.startswith(prefix):
                     self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+                    return
+                if not context.is_super_admin:
+                    self.send_json(
+                        HTTPStatus.FORBIDDEN,
+                        {"ok": False, "error": "ACCESS_DENIED", "message": ACCESS_DENIED_MESSAGE},
+                    )
                     return
                 raw_channel_chat_id = parse.unquote(path.removeprefix(prefix)).split("/", 1)[0]
                 try:
@@ -4390,6 +5819,62 @@ class CommentWebServer:
                     self.send_json(HTTPStatus.NOT_FOUND, {"error": humanize_comment_error_message(str(exc))})
                     return
                 self.send_json(HTTPStatus.OK, result)
+
+            def handle_report_comment(self, path: str) -> None:
+                raw_comment_id = path.removeprefix("/api/comments/").removesuffix("/report").strip("/")
+                try:
+                    comment_id = int(parse.unquote(raw_comment_id))
+                except ValueError:
+                    self.send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"ok": False, "error": "INVALID_COMMENT_ID", "message": COMMENT_NOT_FOUND_MESSAGE},
+                    )
+                    return
+                payload = self.read_json_body()
+                if payload is None:
+                    return
+                try:
+                    result = app.report_comment_from_webapp(
+                        comment_id=comment_id,
+                        init_data=safe_text(payload.get("initData")) or self.read_init_data_header(),
+                        reason=safe_text(payload.get("reason")),
+                        details=safe_text(payload.get("details")),
+                    )
+                except WebAppAuthError as exc:
+                    self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "UNAUTHORIZED", "message": str(exc)})
+                    return
+                except MaxApiError as exc:
+                    error_code = safe_text(str(exc))
+                    if error_code == "Report already exists":
+                        self.send_json(
+                            HTTPStatus.CONFLICT,
+                            {
+                                "ok": False,
+                                "error": "REPORT_ALREADY_EXISTS",
+                                "message": REPORT_ALREADY_EXISTS_MESSAGE,
+                            },
+                        )
+                        return
+                    if error_code == "Comment not found":
+                        self.send_json(
+                            HTTPStatus.NOT_FOUND,
+                            {
+                                "ok": False,
+                                "error": "COMMENT_NOT_FOUND",
+                                "message": COMMENT_NOT_FOUND_MESSAGE,
+                            },
+                        )
+                        return
+                    self.send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "ok": False,
+                            "error": error_code or "REPORT_ERROR",
+                            "message": humanize_comment_error_message(error_code),
+                        },
+                    )
+                    return
+                self.send_json(HTTPStatus.CREATED, result)
 
             def handle_delete_comment(self, path: str) -> None:
                 reference, suffix = self.extract_post_reference(path)

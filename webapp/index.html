@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
     <title>Комментарии к посту</title>
-    <link rel="stylesheet" href="/webapp/app.css?v=20260430b">
+    <link rel="stylesheet" href="/webapp/app.css?v=20260501a">
     <script src="https://st.max.ru/js/max-web-app.js"></script>
   </head>
   <body>
@@ -105,7 +105,10 @@
       <article class="message">
         <div class="message__avatar"></div>
         <div class="message__content">
-          <div class="message__bubble">
+            <div class="message__bubble">
+            <button class="message__menu-button" type="button" aria-label="Действия с комментарием">
+              ⋯
+            </button>
             <div class="message__meta">
               <div class="message__author"></div>
             </div>
@@ -139,8 +142,51 @@
       <button type="button" id="comment-menu-delete" class="comment-menu__item comment-menu__item--danger">
         Удалить
       </button>
+      <button type="button" id="comment-menu-report" class="comment-menu__item">
+        Пожаловаться
+      </button>
     </div>
 
-    <script src="/webapp/app.js?v=20260430b"></script>
+    <div id="report-modal" class="modal-backdrop" hidden>
+      <section
+        class="modal-card report-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="report-title"
+        aria-describedby="report-text"
+      >
+        <h2 id="report-title" class="modal-card__title">Пожаловаться на комментарий</h2>
+        <p id="report-text" class="modal-card__text">
+          Выберите причину. Администратор канала проверит жалобу.
+        </p>
+        <form id="report-form" class="report-form">
+          <label class="report-field">
+            <span>Причина</span>
+            <select id="report-reason" required>
+              <option value="insult">Оскорбление</option>
+              <option value="profanity">Ненормативная лексика</option>
+              <option value="threat">Угроза</option>
+              <option value="spam">Спам</option>
+              <option value="hate">Дискриминация или ненависть</option>
+              <option value="other">Другое</option>
+            </select>
+          </label>
+          <label class="report-field">
+            <span>Комментарий к жалобе, необязательно</span>
+            <textarea id="report-details" rows="3" maxlength="1000"></textarea>
+          </label>
+          <div class="report-actions">
+            <button id="report-cancel" class="modal-card__button modal-card__button--ghost" type="button">
+              Отмена
+            </button>
+            <button id="report-submit" class="modal-card__button" type="submit">
+              Отправить жалобу
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <script src="/webapp/app.js?v=20260501a"></script>
   </body>
 </html>
