@@ -435,6 +435,16 @@ def chat_title_from_payload(payload: dict[str, Any]) -> str:
     return ""
 
 
+def chat_link_from_payload(payload: dict[str, Any]) -> str:
+    link = safe_text(payload.get("link") or payload.get("url") or payload.get("chat_link"))
+    if link:
+        return link
+    nested_chat = payload.get("chat")
+    if isinstance(nested_chat, dict):
+        return chat_link_from_payload(nested_chat)
+    return ""
+
+
 @dataclass
 class PendingComment:
     user_id: int
@@ -1383,7 +1393,7 @@ class MaxCommentsBot:
         self.bind_cleanup_thread: threading.Thread | None = None
         self.update_queue: queue.Queue = queue.Queue()
         self.update_worker_thread: threading.Thread | None = None
-        self.chat_title_cache: dict[int, tuple[str, float]] = {}
+        self.chat_info_cache: dict[int, tuple[dict[str, str], float]] = {}
 
     def run(self) -> None:
         logger.info("Starting MAX Comments bot version %s", APP_VERSION)
@@ -2145,35 +2155,45 @@ class MaxCommentsBot:
             lines.append(line)
         self.api.send_message(user_id=user_id, text="\n".join(lines))
 
-    def get_chat_title_cached(self, chat_id: int) -> str:
+    def get_chat_info_cached(self, chat_id: int) -> dict[str, str]:
         normalized_chat_id = int(chat_id)
-        cached = self.chat_title_cache.get(normalized_chat_id)
+        cached = self.chat_info_cache.get(normalized_chat_id)
         now = time.time()
         if cached is not None and now - cached[1] < 10 * 60:
             return cached[0]
         try:
             payload = self.api.get_chat(normalized_chat_id)
         except MaxApiError:
-            logger.exception("Failed to load chat title for %s", normalized_chat_id)
-            return cached[0] if cached is not None else ""
-        title = chat_title_from_payload(payload)
-        self.chat_title_cache[normalized_chat_id] = (title, now)
-        return title
+            logger.exception("Failed to load chat info for %s", normalized_chat_id)
+            return cached[0] if cached is not None else {"title": "", "link": ""}
+        info = {
+            "title": chat_title_from_payload(payload),
+            "link": chat_link_from_payload(payload),
+        }
+        self.chat_info_cache[normalized_chat_id] = (info, now)
+        return info
+
+    def get_chat_title_cached(self, chat_id: int) -> str:
+        return self.get_chat_info_cached(chat_id).get("title", "")
 
     def serialize_channel_binding(self, binding: sqlite3.Row) -> dict[str, Any]:
         channel_chat_id = int(binding["channel_chat_id"])
         comments_chat_id = int(binding["comments_chat_id"])
-        channel_title = self.get_chat_title_cached(channel_chat_id)
-        comments_chat_title = self.get_chat_title_cached(comments_chat_id)
+        channel_info = self.get_chat_info_cached(channel_chat_id)
+        comments_chat_info = self.get_chat_info_cached(comments_chat_id)
+        channel_title = channel_info.get("title", "")
+        comments_chat_title = comments_chat_info.get("title", "")
+        comments_chat_url = safe_text(binding["comments_chat_url"]) or comments_chat_info.get("link", "")
         same_chat = int(binding["channel_chat_id"]) == int(binding["comments_chat_id"])
         return {
             "channel_chat_id": channel_chat_id,
             "channel_title": channel_title,
             "channel_label": channel_title or str(channel_chat_id),
+            "channel_url": channel_info.get("link", ""),
             "comments_chat_id": comments_chat_id,
             "comments_chat_title": comments_chat_title,
             "comments_chat_label": comments_chat_title or str(comments_chat_id),
-            "comments_chat_url": safe_text(binding["comments_chat_url"]),
+            "comments_chat_url": comments_chat_url,
             "created_at": safe_text(binding["created_at"]),
             "updated_at": safe_text(binding["updated_at"]),
             "same_chat": same_chat,

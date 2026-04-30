@@ -119,6 +119,8 @@ function renderChannels(channels) {
   for (const channel of channels) {
     const item = document.createElement("article");
     item.className = "item";
+    const channelUrl = safeHttpUrl(channel.channel_url);
+    const commentsChatUrl = safeHttpUrl(channel.comments_chat_url);
     item.innerHTML = `
       <div class="item-row">
         <div>
@@ -126,13 +128,24 @@ function renderChannels(channels) {
           <div class="item-meta">Канал: ${escapeHtml(channel.channel_label || channel.channel_chat_id)}</div>
           <div class="item-meta">Чат комментариев: ${escapeHtml(channel.comments_chat_label || channel.comments_chat_id)}</div>
           <div class="item-meta">ID: ${channel.channel_chat_id} → ${channel.comments_chat_id}</div>
-          ${channel.comments_chat_url ? `<div class="item-meta">${escapeHtml(channel.comments_chat_url)}</div>` : ""}
         </div>
         <span class="pill">${channel.same_chat ? "один чат" : "отдельный чат"}</span>
       </div>
-      <div class="item-row">
+      <div class="item-row item-footer">
         <span class="item-meta">Обновлено: ${formatDate(channel.updated_at)}</span>
-        <button class="danger-button" type="button" data-remove-channel="${channel.channel_chat_id}">Удалить</button>
+        <div class="item-actions">
+          ${
+            channelUrl
+              ? `<a class="action-link" href="${escapeHtml(channelUrl)}" target="_blank" rel="noreferrer">Открыть канал</a>`
+              : '<span class="action-link disabled">Канал недоступен</span>'
+          }
+          ${
+            commentsChatUrl
+              ? `<a class="action-link" href="${escapeHtml(commentsChatUrl)}" target="_blank" rel="noreferrer">Открыть чат</a>`
+              : '<span class="action-link disabled">Чат недоступен</span>'
+          }
+          <button class="danger-button" type="button" data-remove-channel="${channel.channel_chat_id}">Удалить</button>
+        </div>
       </div>
     `;
     list.append(item);
