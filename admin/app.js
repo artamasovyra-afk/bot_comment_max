@@ -593,6 +593,7 @@
 
   async function handleChannelSubmit(event) {
     event.preventDefault();
+    const form = event.currentTarget;
     setNotice("");
     try {
       const result = await requestJson(`${state.apiBase}/channels`, {
@@ -604,7 +605,9 @@
           sync_now: true,
         }),
       });
-      event.currentTarget.reset();
+      if (form instanceof HTMLFormElement) {
+        form.reset();
+      }
       await loadAll();
       setNotice(`Канал подключён. Подцеплено постов: ${result.attached_count}`);
     } catch (error) {
@@ -629,6 +632,7 @@
 
   async function handleAdminUserSubmit(event) {
     event.preventDefault();
+    const form = event.currentTarget;
     setNotice("");
     try {
       await requestJson(`${state.apiBase}/users`, {
@@ -640,7 +644,9 @@
           is_active: true,
         }),
       });
-      event.currentTarget.reset();
+      if (form instanceof HTMLFormElement) {
+        form.reset();
+      }
       await loadAll();
       setNotice("Администратор сохранён. Пароль по умолчанию равен MAX user id.");
     } catch (error) {

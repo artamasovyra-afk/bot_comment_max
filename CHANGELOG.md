@@ -4,6 +4,12 @@ All notable changes to this project will be tracked here.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-05-01
+
+### Fixed
+
+- Исправлено падение формы добавления администратора канала в WebView/Safari, когда `event.currentTarget` становился `null` после асинхронного запроса.
+
 ## [0.1.3] - 2026-05-01
 
 ### Added
