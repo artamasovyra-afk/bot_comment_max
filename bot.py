@@ -6444,12 +6444,13 @@ class CommentWebServer:
                     return context
                 if context is not None:
                     self.send_json(
-                        HTTPStatus.FORBIDDEN,
+                        HTTPStatus.UNAUTHORIZED,
                         {
                             "ok": False,
-                            "error": "FORBIDDEN",
-                            "message": FORBIDDEN_MESSAGE,
+                            "error": "WRONG_ADMIN_PANEL",
+                            "message": "Войдите как администратор канала.",
                         },
+                        headers={"Set-Cookie": self.admin_session_cookie("", max_age=0)},
                     )
                     return None
                 self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "Unauthorized"})

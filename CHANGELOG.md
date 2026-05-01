@@ -4,6 +4,12 @@ All notable changes to this project will be tracked here.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-05-01
+
+### Fixed
+
+- `/admin` теперь очищает неподходящую старую super-admin cookie и показывает форму входа администратора канала вместо экрана `Доступ запрещён`.
+
 ## [0.1.4] - 2026-05-01
 
 ### Fixed
