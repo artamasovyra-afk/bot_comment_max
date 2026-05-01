@@ -4,6 +4,22 @@ All notable changes to this project will be tracked here.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-05-01
+
+### Added
+
+- Отдельная панель супер-администратора по адресу `/super-admin`.
+- Отдельный вход супер-админа через `SUPER_ADMIN_LOGIN` и `SUPER_ADMIN_PASSWORD`.
+- Отдельные super-admin API `/api/super-admin/*`.
+
+### Changed
+
+- `/admin` оставлен только для администраторов каналов с входом по MAX user id.
+- Глобальные функции админки перенесены в панель супер-админа.
+- Backend-проверки разделяют `/api/admin/*` и `/api/super-admin/*`.
+- `MAX_ADMIN_PANEL_TOKEN` остаётся устаревшим и не используется для входа.
+- Документация обновлена под две административные панели.
+
 ## [0.1.2] - 2026-05-01
 
 ### Added

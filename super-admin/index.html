@@ -3,9 +3,8 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Админка канала</title>
+    <title>Супер-админ MAX Comments</title>
     <link rel="stylesheet" href="/admin/app.css?v=20260501c" />
-    <script src="https://st.max.ru/js/max-web-app.js"></script>
   </head>
   <body>
     <main class="shell">
@@ -13,14 +12,14 @@
         <form id="login-form" class="login-panel">
           <div>
             <p class="eyebrow">MAX Comments</p>
-            <h1>Вход администратора канала</h1>
+            <h1>Вход супер-админа</h1>
           </div>
           <label class="field">
-            <span>Логин, MAX user id</span>
-            <input id="login-user-id" inputmode="numeric" autocomplete="username" required />
+            <span>Логин супер-админа</span>
+            <input id="login-user-id" autocomplete="username" required />
           </label>
           <label class="field">
-            <span>Пароль</span>
+            <span>Пароль супер-админа</span>
             <input id="login-password" type="password" autocomplete="current-password" required />
           </label>
           <button class="primary-button" type="submit">Войти</button>
@@ -32,7 +31,7 @@
         <article class="login-panel">
           <p class="eyebrow">MAX Comments</p>
           <h1>Доступ запрещён</h1>
-          <p class="muted">У вас нет прав для управления этим каналом.</p>
+          <p class="muted">У вас нет прав для управления ботом.</p>
         </article>
       </section>
 
@@ -40,7 +39,7 @@
         <header class="topbar">
           <div>
             <p class="eyebrow">MAX Comments</p>
-            <h1>Админка канала</h1>
+            <h1>Супер-админ бота</h1>
             <p id="admin-role" class="muted"></p>
           </div>
           <div class="topbar-actions">
@@ -57,29 +56,19 @@
 
         <div id="notice" class="notice hidden" aria-live="polite"></div>
 
-        <section id="password-warning" class="notice warning hidden">
-          <div>
-            <strong>Вы используете пароль по умолчанию.</strong>
-            <span>Рекомендуется сменить пароль.</span>
-          </div>
-          <form id="change-password-form" class="inline-form">
-            <input id="old-password" type="password" placeholder="Старый пароль" autocomplete="current-password" required />
-            <input id="new-password" type="password" placeholder="Новый пароль" autocomplete="new-password" minlength="6" required />
-            <button class="ghost-button" type="submit">Сменить пароль</button>
-          </form>
-        </section>
-
-        <nav class="tabs" aria-label="Разделы админки">
-          <button class="tab is-active" type="button" data-tab="dashboard">Дашборд</button>
-          <button class="tab" type="button" data-tab="channels">Мои каналы</button>
-          <button class="tab" type="button" data-tab="posts">Посты</button>
-          <button class="tab" type="button" data-tab="comments">Комментарии</button>
-          <button class="tab" type="button" data-tab="reports">Жалобы</button>
+        <nav class="tabs" aria-label="Разделы супер-админки">
+          <button class="tab is-active" type="button" data-tab="dashboard">Обзор системы</button>
+          <button class="tab" type="button" data-tab="channels">Все каналы</button>
+          <button class="tab" type="button" data-tab="posts">Все посты</button>
+          <button class="tab" type="button" data-tab="comments">Все комментарии</button>
+          <button class="tab" type="button" data-tab="reports">Все жалобы</button>
+          <button class="tab" type="button" data-tab="admins">Администраторы каналов</button>
+          <button class="tab" type="button" data-tab="settings">Система</button>
         </nav>
 
         <section id="dashboard-tab" class="tab-panel">
           <section class="status-grid" aria-label="Статистика">
-            <article class="status-tile"><span>Пользователи канала</span><strong id="stat-users">0</strong></article>
+            <article class="status-tile"><span>Пользователи</span><strong id="stat-users">0</strong></article>
             <article class="status-tile"><span>Посты</span><strong id="stat-posts">0</strong></article>
             <article class="status-tile"><span>Комментарии</span><strong id="stat-comments">0</strong></article>
             <article class="status-tile"><span>Жалобы</span><strong id="stat-reports">0</strong></article>
@@ -105,7 +94,25 @@
 
         <section id="channels-tab" class="tab-panel hidden">
           <section class="panel">
-            <div class="panel-header"><h2>Мои каналы</h2></div>
+            <div class="panel-header">
+              <h2>Привязки каналов и чатов</h2>
+              <button id="sync-button" class="ghost-button" type="button">Синхронизировать</button>
+            </div>
+            <form id="channel-form" class="form-grid compact">
+              <label class="field">
+                <span>ID канала</span>
+                <input id="channel-id" inputmode="numeric" required />
+              </label>
+              <label class="field">
+                <span>ID чата комментариев</span>
+                <input id="comments-chat-id" inputmode="numeric" required />
+              </label>
+              <label class="field">
+                <span>Ссылка на чат</span>
+                <input id="comments-chat-url" type="url" />
+              </label>
+              <button class="primary-button" type="submit">Добавить</button>
+            </form>
             <div id="channels-list" class="list"></div>
           </section>
         </section>
@@ -172,13 +179,43 @@
           </section>
         </section>
 
+        <section id="admins-tab" class="tab-panel hidden">
+          <section class="panel">
+            <div class="panel-header"><h2>Администраторы каналов</h2></div>
+            <form id="admin-user-form" class="form-grid compact">
+              <label class="field">
+                <span>MAX user id</span>
+                <input id="admin-user-id" inputmode="numeric" required />
+              </label>
+              <label class="field">
+                <span>Роль</span>
+                <select id="admin-user-role">
+                  <option value="channel_admin">channel_admin</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Каналы</span>
+                <select id="admin-user-channels" multiple></select>
+              </label>
+              <button class="primary-button" type="submit">Сохранить</button>
+            </form>
+            <div id="admins-list" class="list"></div>
+          </section>
+        </section>
+
+        <section id="settings-tab" class="tab-panel hidden">
+          <section class="panel">
+            <div class="panel-header"><h2>Webhook/Polling и системная информация</h2></div>
+            <div id="settings-list" class="list"></div>
+          </section>
+        </section>
       </section>
     </main>
 
     <script>
       window.ADMIN_PANEL_CONFIG = {
-        mode: "channel",
-        apiBase: "/api/admin"
+        mode: "super",
+        apiBase: "/api/super-admin"
       };
     </script>
     <script src="/admin/app.js?v=20260501c"></script>

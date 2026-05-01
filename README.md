@@ -51,12 +51,15 @@
 
 ```bash
 export MAX_BOT_TOKEN="..."
-export MAX_SUPER_ADMIN_IDS="11111111,22222222"
+export SUPER_ADMIN_LOGIN="bot_owner"
+export SUPER_ADMIN_PASSWORD="VeryStrongPassword123"
 export ADMIN_SESSION_SECRET="long-random-session-secret"
 ```
 
-`MAX_ADMIN_USER_IDS` остаётся legacy-настройкой: если `MAX_SUPER_ADMIN_IDS` не задан, она используется для первичного создания `super_admin`.
-`MAX_ADMIN_PANEL_TOKEN` устарел и не используется для входа в новую ролевую админку.
+`SUPER_ADMIN_LOGIN` и `SUPER_ADMIN_PASSWORD` используются только для панели владельца бота `/super-admin`.
+Пароль не должен совпадать с логином.
+`MAX_SUPER_ADMIN_IDS` и `MAX_ADMIN_USER_IDS` остаются legacy-настройками для MAX-команд и совместимости, но не являются основным входом в `/super-admin`.
+`MAX_ADMIN_PANEL_TOKEN` устарел и не используется для входа в новые панели.
 
 Переменные ниже остаются как legacy-bootstrap и могут автоматически создать первую привязку канала при пустой базе:
 
@@ -139,9 +142,13 @@ MAX_WEB_APP_PUBLIC_URL + MAX_WEBHOOK_PATH
 
 При старте в режиме `polling` бот пытается отключить webhook на своём текущем URL, чтобы long polling снова работал.
 
-## Админка и роли
+## Административные панели
 
-Браузерная админка доступна на:
+В проекте две разные панели с отдельными адресами и отдельными backend-проверками прав.
+
+### Панель администратора канала
+
+Адрес:
 
 ```text
 https://your-domain.example/admin
@@ -152,50 +159,71 @@ https://your-domain.example/admin
 - логин — MAX user id администратора
 - пароль по умолчанию — тот же MAX user id
 - после входа с паролем по умолчанию админка показывает предупреждение и форму смены пароля
+- доступ только к назначенным каналам
 - сессия хранится в HttpOnly cookie, пароль в браузере не сохраняется
 
-Первый `super_admin` создаётся автоматически при старте из:
+Назначение панели:
 
-```bash
-export MAX_SUPER_ADMIN_IDS="123456789"
+- управление своими каналами
+- публикация постов
+- просмотр комментариев
+- обработка жалоб
+- статистика по своим каналам
+
+### Панель супер-администратора бота
+
+Адрес:
+
+```text
+https://your-domain.example/super-admin
 ```
 
-Если переменная не задана, проект для обратной совместимости возьмёт значения из `MAX_ADMIN_USER_IDS`.
+Вход выполняется через отдельные переменные окружения:
 
-Роли:
+```bash
+export SUPER_ADMIN_LOGIN="bot_owner"
+export SUPER_ADMIN_PASSWORD="VeryStrongPassword123"
+```
 
-| Возможность | super_admin | channel_admin |
+Супер-админ не входит по MAX user id и не использует пароль по умолчанию.
+Пароль задаётся через env, не хранится в базе в открытом виде и не логируется.
+
+Назначение панели:
+
+- глобальное управление ботом
+- все каналы и все привязки каналов/чатов комментариев
+- все посты, комментарии и жалобы
+- назначение администраторов каналов
+- ручная синхронизация
+- webhook/polling
+- системная информация и версия проекта
+
+Таблица возможностей:
+
+| Возможность | /admin channel_admin | /super-admin super_admin |
 |---|---|---|
-| Видеть все каналы | Да | Нет |
-| Управлять своими каналами | Да | Да |
-| Публиковать посты | Да | Только свои каналы |
-| Смотреть комментарии | Да | Только свои каналы |
-| Обрабатывать жалобы | Да | Только свои каналы |
-| Назначать администраторов | Да | Нет |
-| Настройки webhook/polling | Да | Нет |
-| Глобальные настройки бота | Да | Нет |
-
-Через админку можно:
-
-- смотреть состояние бота, версию и режим доставки событий
-- добавлять и удалять привязки каналов, если вошёл `super_admin`
-- назначать `channel_admin` на один или несколько каналов, если вошёл `super_admin`
-- публиковать посты в доступные каналы
-- прикреплять комментарии к уже существующим постам
-- запускать ручную синхронизацию последних постов, если вошёл `super_admin`
-- смотреть посты, комментарии и жалобы с backend-проверкой прав
+| Вход по MAX user id | Да | Нет |
+| Вход по отдельному логину/паролю | Нет | Да |
+| Видит свои каналы | Да | Да |
+| Видит все каналы | Нет | Да |
+| Публикует посты | Только свои каналы | Все каналы |
+| Модерирует комментарии | Только свои каналы | Все каналы |
+| Обрабатывает жалобы | Только свои каналы | Все каналы |
+| Управляет администраторами каналов | Нет | Да |
+| Настройки webhook/polling | Нет | Да |
+| Системная информация | Нет | Да |
 
 Команды в MAX остаются как запасной способ управления.
 
 Чтобы назначить администратора канала:
 
-1. Войдите в `/admin` как `super_admin`.
-2. Откройте раздел `Администраторы`.
+1. Войдите в `/super-admin`.
+2. Откройте раздел `Администраторы каналов`.
 3. Укажите MAX user id, роль `channel_admin` и выберите доступные каналы.
 4. Сохраните. Новый администратор входит с логином MAX user id и паролем по умолчанию MAX user id.
 
-Чтобы сменить пароль, войдите в `/admin` и используйте форму в предупреждении `Вы используете пароль по умолчанию`.
-Выход выполняется кнопкой `Выйти`, backend очищает cookie-сессию.
+Чтобы администратор канала сменил пароль, он входит в `/admin` и использует форму в предупреждении `Вы используете пароль по умолчанию`.
+Выход выполняется кнопкой `Выйти`, backend очищает cookie-сессию соответствующей панели.
 
 ## Инструкция для администратора канала
 
@@ -379,7 +407,7 @@ ssh root@188.225.58.60 'install -m 700 -d /root/.ssh && cat >> /root/.ssh/author
 - `POST /api/admin/auth/login` — вход по MAX user id и паролю
 - `POST /api/admin/auth/logout` — выход из админки
 - `POST /api/admin/auth/change-password` — смена пароля
-- `GET /api/admin/dashboard` — дашборд с учётом роли администратора
+- `GET /api/admin/dashboard` — дашборд администратора канала
 - `GET /api/admin/posts`
 - `POST /api/admin/posts`
 - `DELETE /api/admin/posts/<post_id>`
@@ -387,16 +415,26 @@ ssh root@188.225.58.60 'install -m 700 -d /root/.ssh && cat >> /root/.ssh/author
 - `PATCH /api/admin/comments/<comment_id>/status`
 - `GET /api/admin/reports`
 - `PATCH /api/admin/reports/<report_id>`
-- `GET /api/admin/users` — только `super_admin`
-- `POST /api/admin/users` — только `super_admin`
-- `PATCH /api/admin/users/<admin_user_id>` — только `super_admin`
-- `POST /api/admin/users/<admin_user_id>/reset-password` — только `super_admin`
-- `DELETE /api/admin/users/<admin_user_id>/channels/<channel_id>` — только `super_admin`
-- `POST /api/admin/channels` — только `super_admin`
-- `DELETE /api/admin/channels/<channel_id>` — только `super_admin`
-- `POST /api/admin/publish`
-- `POST /api/admin/attach` — только `super_admin`
-- `POST /api/admin/sync` — только `super_admin`
+- `POST /api/super-admin/auth/login` — вход владельца бота через `SUPER_ADMIN_LOGIN`
+- `POST /api/super-admin/auth/logout` — выход из супер-админки
+- `GET /api/super-admin/dashboard` — глобальный дашборд
+- `GET /api/super-admin/posts`
+- `POST /api/super-admin/posts`
+- `DELETE /api/super-admin/posts/<post_id>`
+- `GET /api/super-admin/comments`
+- `PATCH /api/super-admin/comments/<comment_id>/status`
+- `GET /api/super-admin/reports`
+- `PATCH /api/super-admin/reports/<report_id>`
+- `GET /api/super-admin/users`
+- `POST /api/super-admin/users`
+- `PATCH /api/super-admin/users/<admin_user_id>`
+- `POST /api/super-admin/users/<admin_user_id>/reset-password`
+- `DELETE /api/super-admin/users/<admin_user_id>/channels/<channel_id>`
+- `POST /api/super-admin/channels`
+- `DELETE /api/super-admin/channels/<channel_id>`
+- `POST /api/super-admin/publish`
+- `POST /api/super-admin/attach`
+- `POST /api/super-admin/sync`
 - `GET /api/posts/<post_ref>`
 - `GET /api/posts/<post_ref>/comments`
 - `POST /api/posts/<post_ref>/comments`
@@ -404,7 +442,7 @@ ssh root@188.225.58.60 'install -m 700 -d /root/.ssh && cat >> /root/.ssh/author
 - `DELETE /api/posts/<post_ref>/comments/<comment_id>`
 - `POST /api/comments/<comment_id>/report`
 
-Админские API проверяют права на backend: `super_admin` получает глобальный доступ, `channel_admin` — только к назначенным каналам. `channel_id` из frontend не считается источником истины.
+Админские API проверяют права на backend: `/api/admin/*` работает только для `channel_admin`, `/api/super-admin/*` работает только для супер-админки. `channel_id` из frontend не считается источником истины.
 
 Для `GET /api/posts/<post_ref>/comments` можно передавать:
 

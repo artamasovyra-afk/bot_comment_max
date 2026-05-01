@@ -1,4 +1,5 @@
 (function () {
+  const panelConfig = window.ADMIN_PANEL_CONFIG || {};
   const state = {
     dashboard: null,
     posts: [],
@@ -10,6 +11,8 @@
     activeTab: "dashboard",
     initData: "",
     insideMax: false,
+    apiBase: panelConfig.apiBase || "/api/admin",
+    mode: panelConfig.mode || "channel",
   };
 
   const $ = (selector) => document.querySelector(selector);
@@ -131,7 +134,11 @@
   }
 
   function isSuperAdmin() {
-    return state.dashboard?.admin?.role === "super_admin";
+    return state.mode === "super" && state.dashboard?.admin?.role === "super_admin";
+  }
+
+  function isSuperPanel() {
+    return state.mode === "super";
   }
 
   function statusPill(status) {
@@ -142,6 +149,12 @@
   function renderChannelSelect() {
     const select = $("#channel-select");
     select.innerHTML = "";
+    if (isSuperPanel()) {
+      const allOption = document.createElement("option");
+      allOption.value = "";
+      allOption.textContent = "Все каналы";
+      select.append(allOption);
+    }
     for (const channel of state.channels) {
       const option = document.createElement("option");
       option.value = channel.channel_chat_id;
@@ -151,7 +164,7 @@
     if (state.selectedChannelId) {
       select.value = state.selectedChannelId;
     }
-    select.disabled = state.channels.length <= 1;
+    select.disabled = !isSuperPanel() && state.channels.length <= 1;
   }
 
   function renderRoleVisibility() {
@@ -161,7 +174,7 @@
     });
     const channelTab = document.querySelector('[data-tab="channels"]');
     if (channelTab) {
-      channelTab.textContent = superAdmin ? "Каналы" : "Мои каналы";
+      channelTab.textContent = superAdmin ? "Все каналы" : "Мои каналы";
     }
     if (!superAdmin && ["admins", "settings"].includes(state.activeTab)) {
       setActiveTab("dashboard");
@@ -170,6 +183,7 @@
 
   function renderPasswordWarning(admin) {
     const warning = $("#password-warning");
+    if (!warning) return;
     warning.classList.toggle("hidden", !admin?.must_change_password);
   }
 
@@ -204,6 +218,7 @@
 
   function renderSettings() {
     const list = $("#settings-list");
+    if (!list) return;
     const app = state.dashboard?.app || {};
     const rows = [
       ["Версия", app.version || "-"],
@@ -229,7 +244,7 @@
     state.channels = Array.isArray(payload.channels) ? payload.channels : [];
     const stats = payload.stats || {};
     $("#admin-role").textContent = payload.admin?.role === "super_admin"
-      ? "Роль: super-admin"
+      ? "Панель супер-администратора"
       : "Роль: администратор канала";
     $("#stat-users").textContent = String(stats.usersCount || 0);
     $("#stat-posts").textContent = String(stats.postsCount || 0);
@@ -418,21 +433,23 @@
   }
 
   async function loadDashboard() {
-    const payload = await requestJson(`/api/admin/dashboard${channelQuery()}`);
+    const payload = await requestJson(`${state.apiBase}/dashboard${channelQuery()}`);
     const channels = Array.isArray(payload.channels) ? payload.channels : [];
-    const nextSelected = channels.some((channel) => String(channel.channel_chat_id) === String(state.selectedChannelId))
-      ? state.selectedChannelId
-      : String(channels[0]?.channel_chat_id || "");
-    if (nextSelected && nextSelected !== state.selectedChannelId) {
-      state.selectedChannelId = nextSelected;
-      return loadDashboard();
+    if (!isSuperPanel()) {
+      const nextSelected = channels.some((channel) => String(channel.channel_chat_id) === String(state.selectedChannelId))
+        ? state.selectedChannelId
+        : String(channels[0]?.channel_chat_id || "");
+      if (nextSelected && nextSelected !== state.selectedChannelId) {
+        state.selectedChannelId = nextSelected;
+        return loadDashboard();
+      }
     }
     renderDashboard(payload);
     showAdmin();
   }
 
   async function loadPosts() {
-    const payload = await requestJson(`/api/admin/posts${channelQuery()}`);
+    const payload = await requestJson(`${state.apiBase}/posts${channelQuery()}`);
     state.posts = Array.isArray(payload.posts) ? payload.posts : [];
     renderPosts();
     renderPostFilter();
@@ -443,7 +460,7 @@
     if (state.selectedChannelId) params.set("channel_id", state.selectedChannelId);
     if ($("#comments-status").value) params.set("status", $("#comments-status").value);
     if ($("#comments-post").value) params.set("post_id", $("#comments-post").value);
-    const payload = await requestJson(`/api/admin/comments?${params.toString()}`);
+    const payload = await requestJson(`${state.apiBase}/comments?${params.toString()}`);
     state.comments = Array.isArray(payload.comments) ? payload.comments : [];
     renderComments();
   }
@@ -452,7 +469,7 @@
     const params = new URLSearchParams();
     if (state.selectedChannelId) params.set("channel_id", state.selectedChannelId);
     if ($("#reports-status").value) params.set("status", $("#reports-status").value);
-    const payload = await requestJson(`/api/admin/reports?${params.toString()}`);
+    const payload = await requestJson(`${state.apiBase}/reports?${params.toString()}`);
     state.reports = Array.isArray(payload.reports) ? payload.reports : [];
     renderReports();
   }
@@ -463,7 +480,7 @@
       renderAdmins();
       return;
     }
-    const payload = await requestJson("/api/admin/users");
+    const payload = await requestJson(`${state.apiBase}/users`);
     state.admins = Array.isArray(payload.users) ? payload.users : [];
     renderAdmins();
   }
@@ -506,7 +523,7 @@
     event.preventDefault();
     $("#login-error").textContent = "";
     try {
-      await requestJson("/api/admin/auth/login", {
+      await requestJson(`${state.apiBase}/auth/login`, {
         method: "POST",
         body: JSON.stringify({
           login: $("#login-user-id").value.trim(),
@@ -522,7 +539,7 @@
   }
 
   async function handleLogout() {
-    await requestJson("/api/admin/auth/logout", { method: "POST", body: "{}" }).catch(() => null);
+    await requestJson(`${state.apiBase}/auth/logout`, { method: "POST", body: "{}" }).catch(() => null);
     state.dashboard = null;
     if (state.insideMax) {
       await loadAll();
@@ -540,7 +557,7 @@
         title: $("#post-title").value.trim(),
         content: $("#post-content").value.trim(),
       };
-      const result = await requestJson("/api/admin/posts", {
+      const result = await requestJson(`${state.apiBase}/posts`, {
         method: "POST",
         body: JSON.stringify(payload),
       });
@@ -558,7 +575,7 @@
     event.preventDefault();
     setNotice("");
     try {
-      await requestJson("/api/admin/auth/change-password", {
+      await requestJson(`${state.apiBase}/auth/change-password`, {
         method: "POST",
         body: JSON.stringify({
           oldPassword: $("#old-password").value,
@@ -578,7 +595,7 @@
     event.preventDefault();
     setNotice("");
     try {
-      const result = await requestJson("/api/admin/channels", {
+      const result = await requestJson(`${state.apiBase}/channels`, {
         method: "POST",
         body: JSON.stringify({
           channel_chat_id: $("#channel-id").value.trim(),
@@ -598,7 +615,7 @@
   async function handleSync() {
     setNotice("");
     try {
-      const result = await requestJson("/api/admin/sync", { method: "POST", body: "{}" });
+      const result = await requestJson(`${state.apiBase}/sync`, { method: "POST", body: "{}" });
       await loadAll();
       setNotice(`Синхронизация завершена. Подцеплено постов: ${result.attached_count}`);
     } catch (error) {
@@ -614,7 +631,7 @@
     event.preventDefault();
     setNotice("");
     try {
-      await requestJson("/api/admin/users", {
+      await requestJson(`${state.apiBase}/users`, {
         method: "POST",
         body: JSON.stringify({
           max_user_id: $("#admin-user-id").value.trim(),
@@ -632,7 +649,7 @@
   }
 
   async function setCommentStatus(commentId, status, reason) {
-    await requestJson(`/api/admin/comments/${encodeURIComponent(commentId)}/status`, {
+    await requestJson(`${state.apiBase}/comments/${encodeURIComponent(commentId)}/status`, {
       method: "PATCH",
       body: JSON.stringify({ status, reason }),
     });
@@ -640,7 +657,7 @@
   }
 
   async function updateReport(reportId, payload) {
-    await requestJson(`/api/admin/reports/${encodeURIComponent(reportId)}`, {
+    await requestJson(`${state.apiBase}/reports/${encodeURIComponent(reportId)}`, {
       method: "PATCH",
       body: JSON.stringify(payload),
     });
@@ -661,7 +678,7 @@
     try {
       if (removeChannel) {
         if (!window.confirm(`Удалить привязку канала ${removeChannel.dataset.removeChannel}?`)) return;
-        await requestJson(`/api/admin/channels/${encodeURIComponent(removeChannel.dataset.removeChannel)}`, {
+        await requestJson(`${state.apiBase}/channels/${encodeURIComponent(removeChannel.dataset.removeChannel)}`, {
           method: "DELETE",
         });
         await loadAll();
@@ -682,7 +699,7 @@
       }
       if (resetAdminPassword) {
         if (!window.confirm("Сбросить пароль администратора к MAX user id?")) return;
-        await requestJson(`/api/admin/users/${encodeURIComponent(resetAdminPassword.dataset.resetAdminPassword)}/reset-password`, {
+        await requestJson(`${state.apiBase}/users/${encodeURIComponent(resetAdminPassword.dataset.resetAdminPassword)}/reset-password`, {
           method: "POST",
           body: "{}",
         });
@@ -691,7 +708,7 @@
         return;
       }
       if (toggleAdmin) {
-        await requestJson(`/api/admin/users/${encodeURIComponent(toggleAdmin.dataset.toggleAdmin)}`, {
+        await requestJson(`${state.apiBase}/users/${encodeURIComponent(toggleAdmin.dataset.toggleAdmin)}`, {
           method: "PATCH",
           body: JSON.stringify({
             is_active: toggleAdmin.dataset.nextActive === "1",
@@ -703,7 +720,7 @@
       }
       if (deletePost) {
         if (!window.confirm("Удалить пост из админки? Комментарии к нему перестанут открываться.")) return;
-        await requestJson(`/api/admin/posts/${encodeURIComponent(deletePost.dataset.deletePost)}`, { method: "DELETE" });
+        await requestJson(`${state.apiBase}/posts/${encodeURIComponent(deletePost.dataset.deletePost)}`, { method: "DELETE" });
         await loadAll();
         setNotice("Пост удалён.");
         return;
@@ -752,10 +769,14 @@
     $("#logout-button").addEventListener("click", handleLogout);
     $("#refresh-button").addEventListener("click", loadAll);
     $("#post-form").addEventListener("submit", handleCreatePost);
-    $("#change-password-form").addEventListener("submit", handleChangePassword);
-    $("#channel-form").addEventListener("submit", handleChannelSubmit);
-    $("#sync-button").addEventListener("click", handleSync);
-    $("#admin-user-form").addEventListener("submit", handleAdminUserSubmit);
+    const changePasswordForm = $("#change-password-form");
+    if (changePasswordForm) changePasswordForm.addEventListener("submit", handleChangePassword);
+    const channelForm = $("#channel-form");
+    if (channelForm) channelForm.addEventListener("submit", handleChannelSubmit);
+    const syncButton = $("#sync-button");
+    if (syncButton) syncButton.addEventListener("click", handleSync);
+    const adminUserForm = $("#admin-user-form");
+    if (adminUserForm) adminUserForm.addEventListener("submit", handleAdminUserSubmit);
     $("#channel-select").addEventListener("change", async (event) => {
       state.selectedChannelId = event.target.value;
       await loadAll();

@@ -33,6 +33,8 @@ from config import (
     POLL_LIMIT,
     POLL_TIMEOUT_SECONDS,
     SUPER_ADMIN_IDS,
+    SUPER_ADMIN_LOGIN,
+    SUPER_ADMIN_PASSWORD,
     TARGET_CHANNEL_CHAT_ID,
     WEB_APP_AUTH_MAX_AGE_SECONDS,
     WEB_APP_PUBLIC_URL,
@@ -57,6 +59,7 @@ DATA_DIR = APP_ROOT_DIR / "data"
 TABOO_WORDS_FILE = DATA_DIR / "taboo_words_ru_en_uk.json"
 WEBAPP_DIR = APP_ROOT_DIR / "webapp"
 ADMIN_DIR = APP_ROOT_DIR / "admin"
+SUPER_ADMIN_DIR = APP_ROOT_DIR / "super-admin"
 COMMENT_MEDIA_DIR = Path(DATABASE_PATH).resolve().parent / "comment_media"
 COMMENT_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 COMMENT_IMAGE_DATA_URL_MAX_LENGTH = 16 * 1024 * 1024
@@ -68,6 +71,7 @@ BIND_CHANNEL_CLEANUP_INTERVAL_SECONDS = 10 * 60
 SUPPORTED_DELIVERY_MODES = {"polling", "webhook"}
 WEBHOOK_UPDATE_TYPES = ["message_created"]
 ADMIN_SESSION_COOKIE = "max_comments_admin"
+SUPER_ADMIN_SESSION_COOKIE = "max_comments_super_admin"
 ADMIN_SESSION_MAX_AGE_SECONDS = 24 * 60 * 60
 PASSWORD_HASH_ITERATIONS = 260_000
 COMMENT_BLOCKED_CODE = "COMMENT_BLOCKED"
@@ -79,6 +83,7 @@ ACCESS_DENIED_MESSAGE = "У вас нет прав для управления �
 ADMIN_LOGIN_ACCESS_DENIED_MESSAGE = "У вас нет прав для входа в админку."
 INVALID_CREDENTIALS_MESSAGE = "Неверный логин или пароль."
 FORBIDDEN_MESSAGE = "Недостаточно прав для выполнения действия."
+SUPER_ADMIN_NOT_CONFIGURED_MESSAGE = "Панель супер-администратора не настроена."
 ROLE_USER = "user"
 ROLE_CHANNEL_ADMIN = "channel_admin"
 ROLE_SUPER_ADMIN = "super_admin"
@@ -664,6 +669,7 @@ class AdminContext:
     channel_ids: set[int]
     admin_user_id: int | None = None
     must_change_password: bool = False
+    login: str = ""
 
     @property
     def is_super_admin(self) -> bool:
@@ -4696,6 +4702,7 @@ class MaxCommentsBot:
         return {
             "id": context.admin_user_id,
             "user_id": context.user_id,
+            "login": context.login or safe_text(context.user_id),
             "role": context.role,
             "is_super_admin": context.is_super_admin,
             "must_change_password": context.must_change_password,
@@ -4722,6 +4729,21 @@ class MaxCommentsBot:
     def require_super_admin(self, context: AdminContext) -> None:
         if not context.is_super_admin:
             raise MaxApiError("FORBIDDEN")
+
+    def super_admin_panel_is_configured(self) -> bool:
+        login = safe_text(SUPER_ADMIN_LOGIN)
+        password = safe_text(SUPER_ADMIN_PASSWORD)
+        return bool(login and password and ":" not in login and not hmac.compare_digest(login, password))
+
+    def super_admin_panel_context(self) -> AdminContext:
+        return AdminContext(
+            user_id=0,
+            role=ROLE_SUPER_ADMIN,
+            channel_ids=set(),
+            admin_user_id=0,
+            must_change_password=False,
+            login=safe_text(SUPER_ADMIN_LOGIN),
+        )
 
     def sign_admin_session(self, max_user_id: str, expires_at: int) -> str:
         payload = f"{safe_text(max_user_id)}:{int(expires_at)}"
@@ -4754,10 +4776,46 @@ class MaxCommentsBot:
             return None
         return self.admin_context_for_user(user_id)
 
+    def sign_super_admin_session(self, login: str, expires_at: int) -> str:
+        payload = f"super:{safe_text(login)}:{int(expires_at)}"
+        return hmac.new(
+            safe_text(ADMIN_SESSION_SECRET).encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def create_super_admin_session_token(self) -> str:
+        login = safe_text(SUPER_ADMIN_LOGIN)
+        expires_at = int(time.time()) + ADMIN_SESSION_MAX_AGE_SECONDS
+        signature = self.sign_super_admin_session(login, expires_at)
+        return f"v1:{login}:{expires_at}:{signature}"
+
+    def super_admin_context_from_session_token(self, token: str) -> AdminContext | None:
+        if not self.super_admin_panel_is_configured():
+            return None
+        parts = safe_text(token).split(":")
+        if len(parts) != 4 or parts[0] != "v1":
+            return None
+        _version, login, raw_expires_at, signature = parts
+        try:
+            expires_at = int(raw_expires_at)
+        except ValueError:
+            return None
+        if expires_at < int(time.time()):
+            return None
+        if not hmac.compare_digest(login, safe_text(SUPER_ADMIN_LOGIN)):
+            return None
+        expected_signature = self.sign_super_admin_session(login, expires_at)
+        if not hmac.compare_digest(signature, expected_signature):
+            return None
+        return self.super_admin_panel_context()
+
     def authenticate_admin_credentials(self, *, login: str, password: str) -> AdminContext:
         normalized_login = safe_text(login)
         admin_user = self.store.get_admin_user_by_max_user_id(normalized_login)
         if admin_user is None or int(admin_user["is_active"]) != 1:
+            raise MaxApiError("ACCESS_DENIED")
+        if safe_text(admin_user["role"]) != ROLE_CHANNEL_ADMIN:
             raise MaxApiError("ACCESS_DENIED")
         if not verify_admin_password(password, safe_text(admin_user["password_hash"])):
             raise MaxApiError("INVALID_CREDENTIALS")
@@ -4769,6 +4827,15 @@ class MaxCommentsBot:
         if context is None:
             raise MaxApiError("ACCESS_DENIED")
         return context
+
+    def authenticate_super_admin_credentials(self, *, login: str, password: str) -> AdminContext:
+        if not self.super_admin_panel_is_configured():
+            raise MaxApiError("SUPER_ADMIN_NOT_CONFIGURED")
+        login_matches = hmac.compare_digest(safe_text(login), safe_text(SUPER_ADMIN_LOGIN))
+        password_matches = hmac.compare_digest(safe_text(password), safe_text(SUPER_ADMIN_PASSWORD))
+        if not login_matches or not password_matches:
+            raise MaxApiError("INVALID_CREDENTIALS")
+        return self.super_admin_panel_context()
 
     def change_admin_password(
         self,
@@ -4932,7 +4999,11 @@ class MaxCommentsBot:
         self.require_super_admin(context)
         return {
             "ok": True,
-            "users": [self.serialize_admin_user(row) for row in self.store.list_admin_users()],
+            "users": [
+                self.serialize_admin_user(row)
+                for row in self.store.list_admin_users()
+                if safe_text(row["role"]) == ROLE_CHANNEL_ADMIN
+            ],
         }
 
     def normalize_admin_channel_ids(self, raw_channel_ids: Any) -> set[int]:
@@ -4964,10 +5035,10 @@ class MaxCommentsBot:
         clean_user_id = safe_text(max_user_id)
         if not clean_user_id.isdigit():
             raise MaxApiError("MAX user id должен быть числом.")
-        normalized_role = safe_text(role)
-        if normalized_role not in ADMIN_ROLES:
-            raise MaxApiError("Invalid admin role")
-        if normalized_role == ROLE_CHANNEL_ADMIN and not channel_ids:
+        normalized_role = safe_text(role) or ROLE_CHANNEL_ADMIN
+        if normalized_role != ROLE_CHANNEL_ADMIN:
+            raise MaxApiError("FORBIDDEN")
+        if not channel_ids:
             raise MaxApiError("Для channel_admin выберите хотя бы один канал.")
         row = self.store.ensure_admin_user(
             max_user_id=clean_user_id,
@@ -4976,10 +5047,7 @@ class MaxCommentsBot:
             must_change_password=True,
             is_active=is_active,
         )
-        if normalized_role == ROLE_SUPER_ADMIN:
-            self.store.replace_admin_channels(max_user_id=clean_user_id, channel_ids=set())
-        else:
-            self.store.replace_admin_channels(max_user_id=clean_user_id, channel_ids=channel_ids)
+        self.store.replace_admin_channels(max_user_id=clean_user_id, channel_ids=channel_ids)
         refreshed = self.store.get_admin_user_by_id(int(row["id"]))
         self.store.add_admin_audit_log(
             admin_user_id=context.user_id,
@@ -5018,10 +5086,12 @@ class MaxCommentsBot:
         existing = self.store.get_admin_user_by_id(admin_user_id)
         if existing is None:
             raise MaxApiError("Admin user not found")
-        normalized_role = safe_text(role) or safe_text(existing["role"])
-        if normalized_role not in ADMIN_ROLES:
-            raise MaxApiError("Invalid admin role")
-        if normalized_role == ROLE_CHANNEL_ADMIN and channel_ids is not None and not channel_ids:
+        if safe_text(existing["role"]) != ROLE_CHANNEL_ADMIN:
+            raise MaxApiError("FORBIDDEN")
+        normalized_role = safe_text(role) or ROLE_CHANNEL_ADMIN
+        if normalized_role != ROLE_CHANNEL_ADMIN:
+            raise MaxApiError("FORBIDDEN")
+        if channel_ids is not None and not channel_ids:
             raise MaxApiError("Для channel_admin выберите хотя бы один канал.")
         updated = self.store.update_admin_user(
             admin_user_id=admin_user_id,
@@ -5030,9 +5100,7 @@ class MaxCommentsBot:
         )
         if updated is None:
             raise MaxApiError("Admin user not found")
-        if normalized_role == ROLE_SUPER_ADMIN:
-            self.store.replace_admin_channels(max_user_id=updated["max_user_id"], channel_ids=set())
-        elif channel_ids is not None:
+        if channel_ids is not None:
             self.store.replace_admin_channels(max_user_id=updated["max_user_id"], channel_ids=channel_ids)
         self.store.add_admin_audit_log(
             admin_user_id=context.user_id,
@@ -5063,6 +5131,8 @@ class MaxCommentsBot:
         row = self.store.get_admin_user_by_id(admin_user_id)
         if row is None:
             raise MaxApiError("Admin user not found")
+        if safe_text(row["role"]) != ROLE_CHANNEL_ADMIN:
+            raise MaxApiError("FORBIDDEN")
         updated = self.store.set_admin_password(
             admin_user_id=admin_user_id,
             password=safe_text(row["max_user_id"]),
@@ -5091,6 +5161,8 @@ class MaxCommentsBot:
         row = self.store.get_admin_user_by_id(admin_user_id)
         if row is None:
             raise MaxApiError("Admin user not found")
+        if safe_text(row["role"]) != ROLE_CHANNEL_ADMIN:
+            raise MaxApiError("FORBIDDEN")
         deleted = self.store.delete_admin_channel(
             max_user_id=safe_text(row["max_user_id"]),
             channel_id=int(channel_id),
@@ -5812,6 +5884,15 @@ class CommentWebServer:
             def do_GET(self) -> None:
                 parsed = parse.urlparse(self.path)
                 path = parsed.path
+                if path in {
+                    "/super-admin",
+                    "/super-admin/",
+                    "/super-admin/index.html",
+                    "/super-admin/login",
+                    "/super-admin/dashboard",
+                }:
+                    self.serve_super_admin_static("index.html", "text/html; charset=utf-8")
+                    return
                 if path in {"/admin", "/admin/", "/admin/index.html"}:
                     self.serve_admin_static("index.html", "text/html; charset=utf-8")
                     return
@@ -5848,13 +5929,19 @@ class CommentWebServer:
                     context = self.require_admin_context()
                     if context is None:
                         return
-                    if not context.is_super_admin:
-                        try:
-                            self.send_json(HTTPStatus.OK, app.admin_dashboard(context))
-                        except MaxApiError as exc:
-                            self.send_max_api_error(exc)
+                    try:
+                        self.send_json(HTTPStatus.OK, app.admin_dashboard(context))
+                    except MaxApiError as exc:
+                        self.send_max_api_error(exc)
+                    return
+                if path == "/api/super-admin/state":
+                    context = self.require_super_admin_context()
+                    if context is None:
                         return
                     self.send_json(HTTPStatus.OK, app.get_admin_state())
+                    return
+                if path.startswith("/api/super-admin/"):
+                    self.handle_super_admin_get(path, parse.parse_qs(parsed.query, keep_blank_values=True))
                     return
                 if path.startswith("/api/admin/"):
                     self.handle_admin_get(path, parse.parse_qs(parsed.query, keep_blank_values=True))
@@ -5867,6 +5954,15 @@ class CommentWebServer:
             def do_HEAD(self) -> None:
                 parsed = parse.urlparse(self.path)
                 path = parsed.path
+                if path in {
+                    "/super-admin",
+                    "/super-admin/",
+                    "/super-admin/index.html",
+                    "/super-admin/login",
+                    "/super-admin/dashboard",
+                }:
+                    self.send_super_admin_static_headers("index.html", "text/html; charset=utf-8")
+                    return
                 if path in {"/admin", "/admin/", "/admin/index.html"}:
                     self.send_admin_static_headers("index.html", "text/html; charset=utf-8")
                     return
@@ -5906,6 +6002,15 @@ class CommentWebServer:
                 if path == WEBHOOK_PATH:
                     self.handle_webhook()
                     return
+                if path == "/api/super-admin/auth/login":
+                    self.handle_super_admin_login()
+                    return
+                if path == "/api/super-admin/auth/logout":
+                    self.handle_super_admin_logout()
+                    return
+                if path.startswith("/api/super-admin/"):
+                    self.handle_super_admin_post(path)
+                    return
                 if path == "/admin/login":
                     self.handle_admin_login()
                     return
@@ -5935,6 +6040,9 @@ class CommentWebServer:
             def do_PATCH(self) -> None:
                 parsed = parse.urlparse(self.path)
                 path = parsed.path
+                if path.startswith("/api/super-admin/"):
+                    self.handle_super_admin_patch(path)
+                    return
                 if path.startswith("/api/admin/"):
                     self.handle_admin_patch(path)
                     return
@@ -5946,6 +6054,9 @@ class CommentWebServer:
             def do_DELETE(self) -> None:
                 parsed = parse.urlparse(self.path)
                 path = parsed.path
+                if path.startswith("/api/super-admin/"):
+                    self.handle_super_admin_delete(path)
+                    return
                 if path.startswith("/api/admin/"):
                     self.handle_admin_delete(path)
                     return
@@ -5972,6 +6083,20 @@ class CommentWebServer:
                 file_path = ADMIN_DIR / file_name
                 if not file_path.exists():
                     self.send_json(HTTPStatus.NOT_FOUND, {"error": "Admin file not found"})
+                    return
+                payload = file_path.read_bytes()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def serve_super_admin_static(self, file_name: str, content_type: str) -> None:
+                file_path = SUPER_ADMIN_DIR / file_name
+                if not file_path.exists():
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": "Super admin file not found"})
                     return
                 payload = file_path.read_bytes()
                 self.send_response(HTTPStatus.OK)
@@ -6041,6 +6166,21 @@ class CommentWebServer:
 
             def send_admin_static_headers(self, file_name: str, content_type: str) -> None:
                 file_path = ADMIN_DIR / file_name
+                if not file_path.exists():
+                    self.send_response(HTTPStatus.NOT_FOUND)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                size = file_path.stat().st_size
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(size))
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.end_headers()
+
+            def send_super_admin_static_headers(self, file_name: str, content_type: str) -> None:
+                file_path = SUPER_ADMIN_DIR / file_name
                 if not file_path.exists():
                     self.send_response(HTTPStatus.NOT_FOUND)
                     self.send_header("Content-Length", "0")
@@ -6197,11 +6337,58 @@ class CommentWebServer:
                     headers={"Set-Cookie": self.admin_session_cookie(session_token)},
                 )
 
+            def handle_super_admin_login(self) -> None:
+                payload = self.read_json_body()
+                if payload is None:
+                    return
+                try:
+                    context = app.authenticate_super_admin_credentials(
+                        login=safe_text(payload.get("login")),
+                        password=safe_text(payload.get("password")),
+                    )
+                except MaxApiError as exc:
+                    code = safe_text(str(exc))
+                    if code == "SUPER_ADMIN_NOT_CONFIGURED":
+                        self.send_json(
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                            {
+                                "ok": False,
+                                "error": "SUPER_ADMIN_NOT_CONFIGURED",
+                                "message": SUPER_ADMIN_NOT_CONFIGURED_MESSAGE,
+                            },
+                        )
+                        return
+                    self.send_json(
+                        HTTPStatus.UNAUTHORIZED,
+                        {
+                            "ok": False,
+                            "error": "INVALID_CREDENTIALS",
+                            "message": INVALID_CREDENTIALS_MESSAGE,
+                        },
+                    )
+                    return
+                session_token = app.create_super_admin_session_token()
+                self.send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "admin": app.serialize_admin_identity(context),
+                    },
+                    headers={"Set-Cookie": self.super_admin_session_cookie(session_token)},
+                )
+
             def handle_admin_logout(self) -> None:
                 self.send_json(
                     HTTPStatus.OK,
                     {"ok": True},
                     headers={"Set-Cookie": self.admin_session_cookie("", max_age=0)},
+                )
+
+            def handle_super_admin_logout(self) -> None:
+                self.send_json(
+                    HTTPStatus.OK,
+                    {"ok": True},
+                    headers={"Set-Cookie": self.super_admin_session_cookie("", max_age=0)},
                 )
 
             def handle_admin_change_password(self) -> None:
@@ -6248,9 +6435,29 @@ class CommentWebServer:
             def admin_context_from_session(self) -> AdminContext | None:
                 return app.admin_context_from_session_token(self.admin_auth_token())
 
+            def super_admin_context_from_session(self) -> AdminContext | None:
+                return app.super_admin_context_from_session_token(self.super_admin_auth_token())
+
             def require_admin_context(self) -> AdminContext | None:
                 context = self.admin_context_from_session()
+                if context is not None and context.role == ROLE_CHANNEL_ADMIN:
+                    return context
                 if context is not None:
+                    self.send_json(
+                        HTTPStatus.FORBIDDEN,
+                        {
+                            "ok": False,
+                            "error": "FORBIDDEN",
+                            "message": FORBIDDEN_MESSAGE,
+                        },
+                    )
+                    return None
+                self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "Unauthorized"})
+                return None
+
+            def require_super_admin_context(self) -> AdminContext | None:
+                context = self.super_admin_context_from_session()
+                if context is not None and context.is_super_admin:
                     return context
                 self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "Unauthorized"})
                 return None
@@ -6280,8 +6487,43 @@ class CommentWebServer:
                     },
                 )
 
-            def handle_admin_get(self, path: str, query: dict[str, list[str]]) -> None:
-                context = self.require_admin_context()
+            def super_admin_legacy_path(self, path: str) -> str:
+                return path.replace("/api/super-admin", "/api/admin", 1)
+
+            def handle_super_admin_get(self, path: str, query: dict[str, list[str]]) -> None:
+                context = self.require_super_admin_context()
+                if context is None:
+                    return
+                if path == "/api/super-admin/state":
+                    self.send_json(HTTPStatus.OK, app.get_admin_state())
+                    return
+                self.handle_admin_get(self.super_admin_legacy_path(path), query, context=context)
+
+            def handle_super_admin_post(self, path: str) -> None:
+                context = self.require_super_admin_context()
+                if context is None:
+                    return
+                self.handle_admin_post(self.super_admin_legacy_path(path), context=context)
+
+            def handle_super_admin_patch(self, path: str) -> None:
+                context = self.require_super_admin_context()
+                if context is None:
+                    return
+                self.handle_admin_patch(self.super_admin_legacy_path(path), context=context)
+
+            def handle_super_admin_delete(self, path: str) -> None:
+                context = self.require_super_admin_context()
+                if context is None:
+                    return
+                self.handle_admin_delete(self.super_admin_legacy_path(path), context=context)
+
+            def handle_admin_get(
+                self,
+                path: str,
+                query: dict[str, list[str]],
+                context: AdminContext | None = None,
+            ) -> None:
+                context = context or self.require_admin_context()
                 if context is None:
                     return
                 try:
@@ -6347,8 +6589,8 @@ class CommentWebServer:
                     return
                 self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
-            def handle_admin_post(self, path: str) -> None:
-                context = self.require_admin_context()
+            def handle_admin_post(self, path: str, context: AdminContext | None = None) -> None:
+                context = context or self.require_admin_context()
                 if context is None:
                     return
                 payload = self.read_json_body()
@@ -6433,8 +6675,8 @@ class CommentWebServer:
                     return
                 self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
-            def handle_admin_patch(self, path: str) -> None:
-                context = self.require_admin_context()
+            def handle_admin_patch(self, path: str, context: AdminContext | None = None) -> None:
+                context = context or self.require_admin_context()
                 if context is None:
                     return
                 payload = self.read_json_body()
@@ -6491,8 +6733,8 @@ class CommentWebServer:
                     return
                 self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
-            def handle_admin_delete(self, path: str) -> None:
-                context = self.require_admin_context()
+            def handle_admin_delete(self, path: str, context: AdminContext | None = None) -> None:
+                context = context or self.require_admin_context()
                 if context is None:
                     return
                 if path.startswith("/api/admin/posts/"):
@@ -6735,24 +6977,42 @@ class CommentWebServer:
                 )
                 return hmac.compare_digest(provided, expected)
 
-            def admin_session_cookie(self, value: str, *, max_age: int = ADMIN_SESSION_MAX_AGE_SECONDS) -> str:
+            def session_cookie(
+                self,
+                name: str,
+                value: str,
+                *,
+                max_age: int = ADMIN_SESSION_MAX_AGE_SECONDS,
+            ) -> str:
                 encoded_value = parse.quote(value, safe="")
                 secure = "; Secure" if WEB_APP_PUBLIC_URL.startswith("https://") else ""
                 return (
-                    f"{ADMIN_SESSION_COOKIE}={encoded_value}; Path=/; Max-Age={int(max_age)}; "
+                    f"{name}={encoded_value}; Path=/; Max-Age={int(max_age)}; "
                     f"HttpOnly; SameSite=Lax{secure}"
                 )
 
-            def admin_auth_token(self) -> str:
+            def admin_session_cookie(self, value: str, *, max_age: int = ADMIN_SESSION_MAX_AGE_SECONDS) -> str:
+                return self.session_cookie(ADMIN_SESSION_COOKIE, value, max_age=max_age)
+
+            def super_admin_session_cookie(self, value: str, *, max_age: int = ADMIN_SESSION_MAX_AGE_SECONDS) -> str:
+                return self.session_cookie(SUPER_ADMIN_SESSION_COOKIE, value, max_age=max_age)
+
+            def auth_token(self, cookie_name: str) -> str:
                 auth_header = safe_text(self.headers.get("Authorization") or self.headers.get("authorization"))
                 if auth_header.lower().startswith("bearer "):
                     return auth_header[7:].strip()
                 cookie_header = safe_text(self.headers.get("Cookie") or self.headers.get("cookie"))
                 for raw_item in cookie_header.split(";"):
                     name, separator, value = raw_item.strip().partition("=")
-                    if separator and name == ADMIN_SESSION_COOKIE:
+                    if separator and name == cookie_name:
                         return parse.unquote(value)
                 return ""
+
+            def admin_auth_token(self) -> str:
+                return self.auth_token(ADMIN_SESSION_COOKIE)
+
+            def super_admin_auth_token(self) -> str:
+                return self.auth_token(SUPER_ADMIN_SESSION_COOKIE)
 
             def is_admin_authenticated(self) -> bool:
                 return app.admin_context_from_session_token(self.admin_auth_token()) is not None

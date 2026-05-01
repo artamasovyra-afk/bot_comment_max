@@ -39,16 +39,21 @@ ADMIN_FILES=(
   "$ROOT_DIR/admin/app.js"
 )
 
+SUPER_ADMIN_FILES=(
+  "$ROOT_DIR/super-admin/index.html"
+)
+
 DATA_FILES=(
   "$ROOT_DIR/data/taboo_words_ru_en_uk.json"
 )
 
 ssh "${SSH_OPTS[@]}" "$DEPLOY_USER@$DEPLOY_HOST" \
-  "mkdir -p '$DEPLOY_PATH/webapp' '$DEPLOY_PATH/admin' '$DEPLOY_PATH/data'"
+  "mkdir -p '$DEPLOY_PATH/webapp' '$DEPLOY_PATH/admin' '$DEPLOY_PATH/super-admin' '$DEPLOY_PATH/data'"
 
 scp "${SCP_OPTS[@]}" "${APP_FILES[@]}" "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/"
 scp "${SCP_OPTS[@]}" "${WEBAPP_FILES[@]}" "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/webapp/"
 scp "${SCP_OPTS[@]}" "${ADMIN_FILES[@]}" "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/admin/"
+scp "${SCP_OPTS[@]}" "${SUPER_ADMIN_FILES[@]}" "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/super-admin/"
 scp "${SCP_OPTS[@]}" "${DATA_FILES[@]}" "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/data/"
 
 ssh "${SSH_OPTS[@]}" "$DEPLOY_USER@$DEPLOY_HOST" \
