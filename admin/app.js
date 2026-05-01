@@ -648,7 +648,7 @@
         form.reset();
       }
       await loadAll();
-      setNotice("Администратор сохранён. Пароль по умолчанию равен MAX user id.");
+      setNotice("Администратор сохранён, выбранные каналы добавлены. Пароль по умолчанию равен MAX user id.");
     } catch (error) {
       setNotice(error.message, "error");
     }

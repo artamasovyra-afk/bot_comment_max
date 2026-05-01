@@ -5047,7 +5047,9 @@ class MaxCommentsBot:
             must_change_password=True,
             is_active=is_active,
         )
-        self.store.replace_admin_channels(max_user_id=clean_user_id, channel_ids=channel_ids)
+        existing_channel_ids = self.store.list_channel_admin_channel_ids(int(clean_user_id))
+        merged_channel_ids = existing_channel_ids.union(channel_ids)
+        self.store.replace_admin_channels(max_user_id=clean_user_id, channel_ids=merged_channel_ids)
         refreshed = self.store.get_admin_user_by_id(int(row["id"]))
         self.store.add_admin_audit_log(
             admin_user_id=context.user_id,
@@ -5058,7 +5060,8 @@ class MaxCommentsBot:
             payload={
                 "max_user_id": clean_user_id,
                 "role": normalized_role,
-                "channel_ids": sorted(channel_ids),
+                "added_channel_ids": sorted(channel_ids),
+                "channel_ids": sorted(merged_channel_ids),
                 "is_active": is_active,
             },
         )
