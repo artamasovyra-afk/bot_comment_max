@@ -9,7 +9,7 @@
 - бот автоматически добавляет под пост кнопку с количеством комментариев, например `0 комментариев`
 - кнопка открывает мини-приложение MAX по диплинку `?startapp=...`
 - мини-приложение загружает только один конкретный пост и только его комментарии
-- мини-приложение показывает ленту в формате чата, автоматически подтягивает новые комментарии, умеет подгружать ранние сообщения, отвечать на комментарии, прикладывать фото, позволяет пользователю удалить или отредактировать свой комментарий и для админа даёт удаление любых комментариев
+- мини-приложение показывает ленту в формате чата, автоматически подтягивает новые комментарии, умеет подгружать ранние сообщения, отвечать на комментарии, прикладывать фото, позволяет пользователю удалить или отредактировать свой комментарий и даёт администраторам модерировать комментарии только в доступных им каналах
 - комментарии сохраняются в SQLite и дублируются в отдельный чат обсуждения
 
 ## Что есть в проекте
@@ -51,9 +51,12 @@
 
 ```bash
 export MAX_BOT_TOKEN="..."
-export MAX_ADMIN_USER_IDS="11111111,22222222"
-export MAX_ADMIN_PANEL_TOKEN="long-random-token"
+export MAX_SUPER_ADMIN_IDS="11111111,22222222"
+export ADMIN_SESSION_SECRET="long-random-session-secret"
 ```
+
+`MAX_ADMIN_USER_IDS` остаётся legacy-настройкой: если `MAX_SUPER_ADMIN_IDS` не задан, она используется для первичного создания `super_admin`.
+`MAX_ADMIN_PANEL_TOKEN` устарел и не используется для входа в новую ролевую админку.
 
 Переменные ниже остаются как legacy-bootstrap и могут автоматически создать первую привязку канала при пустой базе:
 
@@ -136,7 +139,7 @@ MAX_WEB_APP_PUBLIC_URL + MAX_WEBHOOK_PATH
 
 При старте в режиме `polling` бот пытается отключить webhook на своём текущем URL, чтобы long polling снова работал.
 
-## Админка
+## Админка и роли
 
 Браузерная админка доступна на:
 
@@ -144,18 +147,55 @@ MAX_WEB_APP_PUBLIC_URL + MAX_WEBHOOK_PATH
 https://your-domain.example/admin
 ```
 
-Вход выполняется по значению `MAX_ADMIN_PANEL_TOKEN`.
+Вход выполняется по логину и паролю:
+
+- логин — MAX user id администратора
+- пароль по умолчанию — тот же MAX user id
+- после входа с паролем по умолчанию админка показывает предупреждение и форму смены пароля
+- сессия хранится в HttpOnly cookie, пароль в браузере не сохраняется
+
+Первый `super_admin` создаётся автоматически при старте из:
+
+```bash
+export MAX_SUPER_ADMIN_IDS="123456789"
+```
+
+Если переменная не задана, проект для обратной совместимости возьмёт значения из `MAX_ADMIN_USER_IDS`.
+
+Роли:
+
+| Возможность | super_admin | channel_admin |
+|---|---|---|
+| Видеть все каналы | Да | Нет |
+| Управлять своими каналами | Да | Да |
+| Публиковать посты | Да | Только свои каналы |
+| Смотреть комментарии | Да | Только свои каналы |
+| Обрабатывать жалобы | Да | Только свои каналы |
+| Назначать администраторов | Да | Нет |
+| Настройки webhook/polling | Да | Нет |
+| Глобальные настройки бота | Да | Нет |
 
 Через админку можно:
 
 - смотреть состояние бота, версию и режим доставки событий
-- добавлять и удалять привязки каналов
-- публиковать посты в подключённые каналы
+- добавлять и удалять привязки каналов, если вошёл `super_admin`
+- назначать `channel_admin` на один или несколько каналов, если вошёл `super_admin`
+- публиковать посты в доступные каналы
 - прикреплять комментарии к уже существующим постам
-- запускать ручную синхронизацию последних постов
-- смотреть последние посты и активные коды привязки
+- запускать ручную синхронизацию последних постов, если вошёл `super_admin`
+- смотреть посты, комментарии и жалобы с backend-проверкой прав
 
 Команды в MAX остаются как запасной способ управления.
+
+Чтобы назначить администратора канала:
+
+1. Войдите в `/admin` как `super_admin`.
+2. Откройте раздел `Администраторы`.
+3. Укажите MAX user id, роль `channel_admin` и выберите доступные каналы.
+4. Сохраните. Новый администратор входит с логином MAX user id и паролем по умолчанию MAX user id.
+
+Чтобы сменить пароль, войдите в `/admin` и используйте форму в предупреждении `Вы используете пароль по умолчанию`.
+Выход выполняется кнопкой `Выйти`, backend очищает cookie-сессию.
 
 ## Инструкция для администратора канала
 
@@ -336,17 +376,35 @@ ssh root@188.225.58.60 'install -m 700 -d /root/.ssh && cat >> /root/.ssh/author
 ## API мини-приложения
 
 - `GET /api/healthz` — возвращает `ok`, текущую `version` и `delivery_mode`
-- `GET /api/admin/state`
-- `POST /api/admin/channels`
-- `DELETE /api/admin/channels/<channel_id>`
+- `POST /api/admin/auth/login` — вход по MAX user id и паролю
+- `POST /api/admin/auth/logout` — выход из админки
+- `POST /api/admin/auth/change-password` — смена пароля
+- `GET /api/admin/dashboard` — дашборд с учётом роли администратора
+- `GET /api/admin/posts`
+- `POST /api/admin/posts`
+- `DELETE /api/admin/posts/<post_id>`
+- `GET /api/admin/comments`
+- `PATCH /api/admin/comments/<comment_id>/status`
+- `GET /api/admin/reports`
+- `PATCH /api/admin/reports/<report_id>`
+- `GET /api/admin/users` — только `super_admin`
+- `POST /api/admin/users` — только `super_admin`
+- `PATCH /api/admin/users/<admin_user_id>` — только `super_admin`
+- `POST /api/admin/users/<admin_user_id>/reset-password` — только `super_admin`
+- `DELETE /api/admin/users/<admin_user_id>/channels/<channel_id>` — только `super_admin`
+- `POST /api/admin/channels` — только `super_admin`
+- `DELETE /api/admin/channels/<channel_id>` — только `super_admin`
 - `POST /api/admin/publish`
-- `POST /api/admin/attach`
-- `POST /api/admin/sync`
+- `POST /api/admin/attach` — только `super_admin`
+- `POST /api/admin/sync` — только `super_admin`
 - `GET /api/posts/<post_ref>`
 - `GET /api/posts/<post_ref>/comments`
 - `POST /api/posts/<post_ref>/comments`
 - `PATCH /api/posts/<post_ref>/comments/<comment_id>`
 - `DELETE /api/posts/<post_ref>/comments/<comment_id>`
+- `POST /api/comments/<comment_id>/report`
+
+Админские API проверяют права на backend: `super_admin` получает глобальный доступ, `channel_admin` — только к назначенным каналам. `channel_id` из frontend не считается источником истины.
 
 Для `GET /api/posts/<post_ref>/comments` можно передавать:
 
@@ -367,11 +425,11 @@ ssh root@188.225.58.60 'install -m 700 -d /root/.ssh && cat >> /root/.ssh/author
 }
 ```
 
-Для удаления комментария WebApp отправляет `DELETE` с заголовком `X-Max-Init-Data`; удаление доступно только пользователям из `MAX_ADMIN_USER_IDS`.
+Для удаления комментария WebApp отправляет `DELETE` с заголовком `X-Max-Init-Data`; обычный пользователь может удалить только свой комментарий, администратор — только комментарии в каналах, к которым у него есть backend-доступ.
 
 ## Как получить ID
 
-- Откройте личный чат с ботом и отправьте `/me`, чтобы узнать `MAX_ADMIN_USER_IDS`
+- Откройте личный чат с ботом и отправьте `/me`, чтобы узнать свой MAX user id для `MAX_SUPER_ADMIN_IDS` или назначения `channel_admin`
 - Отправьте `/chatinfo` в канале и в чате обсуждения, чтобы узнать `chat_id`
 
 ## Важные замечания

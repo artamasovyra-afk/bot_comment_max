@@ -8,6 +8,7 @@ import logging
 import mimetypes
 import queue
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -21,8 +22,7 @@ from typing import Any
 from urllib import error, parse, request
 
 from config import (
-    ADMIN_PANEL_TOKEN,
-    ADMIN_USER_IDS,
+    ADMIN_SESSION_SECRET,
     BOT_TOKEN,
     CHANNEL_SYNC_INTERVAL_SECONDS,
     COMMENTS_CHAT_ID,
@@ -32,6 +32,7 @@ from config import (
     MAX_API_BASE_URL,
     POLL_LIMIT,
     POLL_TIMEOUT_SECONDS,
+    SUPER_ADMIN_IDS,
     TARGET_CHANNEL_CHAT_ID,
     WEB_APP_AUTH_MAX_AGE_SECONDS,
     WEB_APP_PUBLIC_URL,
@@ -68,15 +69,20 @@ SUPPORTED_DELIVERY_MODES = {"polling", "webhook"}
 WEBHOOK_UPDATE_TYPES = ["message_created"]
 ADMIN_SESSION_COOKIE = "max_comments_admin"
 ADMIN_SESSION_MAX_AGE_SECONDS = 24 * 60 * 60
+PASSWORD_HASH_ITERATIONS = 260_000
 COMMENT_BLOCKED_CODE = "COMMENT_BLOCKED"
 COMMENT_BLOCKED_MESSAGE = "Комментарий содержит запрещённые выражения. Исправьте текст и попробуйте снова."
 REPORT_CREATED_MESSAGE = "Жалоба отправлена. Администратор канала проверит комментарий."
 REPORT_ALREADY_EXISTS_MESSAGE = "Вы уже отправляли жалобу на этот комментарий."
 COMMENT_NOT_FOUND_MESSAGE = "Комментарий не найден."
 ACCESS_DENIED_MESSAGE = "У вас нет прав для управления этим каналом."
+ADMIN_LOGIN_ACCESS_DENIED_MESSAGE = "У вас нет прав для входа в админку."
+INVALID_CREDENTIALS_MESSAGE = "Неверный логин или пароль."
+FORBIDDEN_MESSAGE = "Недостаточно прав для выполнения действия."
 ROLE_USER = "user"
 ROLE_CHANNEL_ADMIN = "channel_admin"
 ROLE_SUPER_ADMIN = "super_admin"
+ADMIN_ROLES = {ROLE_SUPER_ADMIN, ROLE_CHANNEL_ADMIN}
 COMMENT_STATUS_ACTIVE = "active"
 COMMENT_STATUS_DELETED = "deleted"
 COMMENT_STATUS_HIDDEN = "hidden"
@@ -104,7 +110,7 @@ def is_configured_for_publishing() -> bool:
     return (
         TARGET_CHANNEL_CHAT_ID is not None
         and COMMENTS_CHAT_ID is not None
-        and bool(ADMIN_USER_IDS)
+        and bool(SUPER_ADMIN_IDS)
     )
 
 
@@ -124,6 +130,36 @@ def safe_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def hash_admin_password(password: str, *, salt: str | None = None) -> str:
+    normalized_password = safe_text(password)
+    salt_value = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        normalized_password.encode("utf-8"),
+        salt_value.encode("utf-8"),
+        PASSWORD_HASH_ITERATIONS,
+    ).hex()
+    return f"pbkdf2_sha256${PASSWORD_HASH_ITERATIONS}${salt_value}${digest}"
+
+
+def verify_admin_password(password: str, stored_hash: str) -> bool:
+    parts = safe_text(stored_hash).split("$")
+    if len(parts) != 4 or parts[0] != "pbkdf2_sha256":
+        return False
+    _algorithm, raw_iterations, salt, expected_digest = parts
+    try:
+        iterations = int(raw_iterations)
+    except ValueError:
+        return False
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        safe_text(password).encode("utf-8"),
+        salt.encode("utf-8"),
+        iterations,
+    ).hex()
+    return hmac.compare_digest(digest, expected_digest)
 
 
 def snippet(text: str, limit: int = 120) -> str:
@@ -303,6 +339,9 @@ def humanize_comment_error_message(message: str) -> str:
         "You can edit only your own comments": "Можно редактировать только свои комментарии.",
         "You can delete only your own comments": "Можно удалять только свои комментарии.",
         "Access denied": ACCESS_DENIED_MESSAGE,
+        "ACCESS_DENIED": ADMIN_LOGIN_ACCESS_DENIED_MESSAGE,
+        "INVALID_CREDENTIALS": INVALID_CREDENTIALS_MESSAGE,
+        "FORBIDDEN": FORBIDDEN_MESSAGE,
         "Report already exists": REPORT_ALREADY_EXISTS_MESSAGE,
         "Invalid report reason": "Выберите причину жалобы.",
     }.get(normalized, normalized)
@@ -623,6 +662,8 @@ class AdminContext:
     user_id: int
     role: str
     channel_ids: set[int]
+    admin_user_id: int | None = None
+    must_change_password: bool = False
 
     @property
     def is_super_admin(self) -> bool:
@@ -922,6 +963,17 @@ class CommentStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS admin_users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    max_user_id TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    must_change_password INTEGER NOT NULL DEFAULT 1,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS channel_admins (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
@@ -1040,6 +1092,8 @@ class CommentStore:
             )
         self.conn.executescript(
             """
+            CREATE INDEX IF NOT EXISTS idx_admin_users_role
+                ON admin_users(role, is_active);
             CREATE INDEX IF NOT EXISTS idx_channel_admins_user_id
                 ON channel_admins(user_id);
             CREATE INDEX IF NOT EXISTS idx_channel_admins_channel_id
@@ -1163,6 +1217,219 @@ class CommentStore:
                 tuple(normalized_ids),
             ).fetchall()
         return list(rows)
+
+    def get_admin_user_by_max_user_id(self, max_user_id: str | int) -> sqlite3.Row | None:
+        with self.lock:
+            return self.conn.execute(
+                """
+                SELECT *
+                FROM admin_users
+                WHERE max_user_id = ?
+                """,
+                (safe_text(max_user_id),),
+            ).fetchone()
+
+    def get_admin_user_by_id(self, admin_user_id: int) -> sqlite3.Row | None:
+        with self.lock:
+            return self.conn.execute(
+                """
+                SELECT *
+                FROM admin_users
+                WHERE id = ?
+                """,
+                (int(admin_user_id),),
+            ).fetchone()
+
+    def ensure_admin_user(
+        self,
+        *,
+        max_user_id: str | int,
+        role: str,
+        password: str | None = None,
+        must_change_password: bool = True,
+        is_active: bool = True,
+    ) -> sqlite3.Row:
+        normalized_user_id = safe_text(max_user_id)
+        normalized_role = safe_text(role)
+        if normalized_role not in ADMIN_ROLES:
+            raise ValueError("Invalid admin role")
+        if not normalized_user_id:
+            raise ValueError("max_user_id is required")
+        existing = self.get_admin_user_by_max_user_id(normalized_user_id)
+        now = utc_now()
+        with self.lock:
+            if existing is None:
+                self.conn.execute(
+                    """
+                    INSERT INTO admin_users (
+                        max_user_id,
+                        password_hash,
+                        role,
+                        must_change_password,
+                        is_active,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        normalized_user_id,
+                        hash_admin_password(password or normalized_user_id),
+                        normalized_role,
+                        1 if must_change_password else 0,
+                        1 if is_active else 0,
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                self.conn.execute(
+                    """
+                    UPDATE admin_users
+                    SET role = ?,
+                        is_active = ?,
+                        updated_at = ?
+                    WHERE max_user_id = ?
+                    """,
+                    (
+                        normalized_role,
+                        1 if is_active else 0,
+                        now,
+                        normalized_user_id,
+                    ),
+                )
+            self.conn.commit()
+        row = self.get_admin_user_by_max_user_id(normalized_user_id)
+        if row is None:
+            raise RuntimeError("admin user was not saved")
+        return row
+
+    def list_admin_users(self) -> list[sqlite3.Row]:
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT
+                    admin_users.*,
+                    GROUP_CONCAT(channel_admins.channel_id) AS channel_ids
+                FROM admin_users
+                LEFT JOIN channel_admins
+                    ON channel_admins.user_id = CAST(admin_users.max_user_id AS INTEGER)
+                GROUP BY admin_users.id
+                ORDER BY admin_users.role DESC, admin_users.max_user_id ASC
+                """
+            ).fetchall()
+        return list(rows)
+
+    def replace_admin_channels(self, *, max_user_id: str | int, channel_ids: set[int]) -> None:
+        normalized_user_id = int(safe_text(max_user_id))
+        now = utc_now()
+        with self.lock:
+            self.conn.execute(
+                "DELETE FROM channel_admins WHERE user_id = ?",
+                (normalized_user_id,),
+            )
+            for channel_id in sorted({int(channel_id) for channel_id in channel_ids}):
+                self.conn.execute(
+                    """
+                    INSERT INTO channel_admins (user_id, channel_id, created_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(user_id, channel_id) DO NOTHING
+                    """,
+                    (normalized_user_id, int(channel_id), now),
+                )
+            self.conn.commit()
+
+    def delete_admin_channel(self, *, max_user_id: str | int, channel_id: int) -> bool:
+        with self.lock:
+            cursor = self.conn.execute(
+                """
+                DELETE FROM channel_admins
+                WHERE user_id = ? AND channel_id = ?
+                """,
+                (int(safe_text(max_user_id)), int(channel_id)),
+            )
+            self.conn.commit()
+        return cursor.rowcount > 0
+
+    def update_admin_user(
+        self,
+        *,
+        admin_user_id: int,
+        role: str | None = None,
+        is_active: bool | None = None,
+    ) -> sqlite3.Row | None:
+        row = self.get_admin_user_by_id(admin_user_id)
+        if row is None:
+            return None
+        normalized_role = safe_text(role) or safe_text(row["role"])
+        if normalized_role not in ADMIN_ROLES:
+            raise ValueError("Invalid admin role")
+        active_value = int(row["is_active"]) if is_active is None else (1 if is_active else 0)
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE admin_users
+                SET role = ?,
+                    is_active = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (normalized_role, active_value, utc_now(), int(admin_user_id)),
+            )
+            self.conn.commit()
+        return self.get_admin_user_by_id(admin_user_id)
+
+    def set_admin_password(
+        self,
+        *,
+        admin_user_id: int,
+        password: str,
+        must_change_password: bool,
+    ) -> sqlite3.Row | None:
+        if self.get_admin_user_by_id(admin_user_id) is None:
+            return None
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE admin_users
+                SET password_hash = ?,
+                    must_change_password = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    hash_admin_password(password),
+                    1 if must_change_password else 0,
+                    utc_now(),
+                    int(admin_user_id),
+                ),
+            )
+            self.conn.commit()
+        return self.get_admin_user_by_id(admin_user_id)
+
+    def migrate_channel_admins_to_admin_users(self) -> int:
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT DISTINCT user_id
+                FROM channel_admins
+                """
+            ).fetchall()
+        created = 0
+        for row in rows:
+            max_user_id = safe_text(row["user_id"])
+            if not max_user_id:
+                continue
+            if self.get_admin_user_by_max_user_id(max_user_id) is None:
+                self.ensure_admin_user(
+                    max_user_id=max_user_id,
+                    role=ROLE_CHANNEL_ADMIN,
+                    password=max_user_id,
+                    must_change_password=True,
+                    is_active=True,
+                )
+                created += 1
+        return created
 
     def upsert_post(
         self,
@@ -2171,6 +2438,7 @@ class MaxCommentsBot:
     def __init__(self) -> None:
         self.api = MaxApiClient(BOT_TOKEN, MAX_API_BASE_URL)
         self.store = CommentStore(DATABASE_PATH)
+        self.bootstrap_admin_users()
         self.bootstrap_legacy_channel_binding()
         self.delivery_mode = self.resolve_delivery_mode()
         self.marker: int | None = None
@@ -2367,6 +2635,37 @@ class MaxCommentsBot:
             TARGET_CHANNEL_CHAT_ID,
             COMMENTS_CHAT_ID,
         )
+
+    def bootstrap_admin_users(self) -> None:
+        created_super_admins = 0
+        for user_id in sorted({int(user_id) for user_id in SUPER_ADMIN_IDS}):
+            existing = self.store.get_admin_user_by_max_user_id(user_id)
+            self.store.ensure_admin_user(
+                max_user_id=user_id,
+                role=ROLE_SUPER_ADMIN,
+                password=str(user_id),
+                must_change_password=True,
+                is_active=True,
+            )
+            if existing is None:
+                created_super_admins += 1
+        migrated_channel_admins = self.store.migrate_channel_admins_to_admin_users()
+        if created_super_admins:
+            logger.info("Created %s bootstrap super admin account(s)", created_super_admins)
+        if migrated_channel_admins:
+            logger.info("Created %s channel admin account(s) from channel bindings", migrated_channel_admins)
+
+    def admin_notice_user_ids(self) -> list[int]:
+        user_ids: list[int] = []
+        for row in self.store.list_admin_users():
+            if int(row["is_active"]) != 1:
+                continue
+            if safe_text(row["role"]) == ROLE_SUPER_ADMIN:
+                try:
+                    user_ids.append(int(row["max_user_id"]))
+                except ValueError:
+                    continue
+        return sorted(set(user_ids))
 
     def has_channel_bindings(self) -> bool:
         return bool(self.store.list_channel_bindings())
@@ -2750,7 +3049,7 @@ class MaxCommentsBot:
             self.send_pending_channel_bindings_status(user_id)
             return
 
-        if user_id not in ADMIN_USER_IDS:
+        if not self.is_super_admin_user(user_id):
             self.api.send_message(
                 user_id=user_id,
                 text=(
@@ -2816,7 +3115,7 @@ class MaxCommentsBot:
         self.api.send_message(user_id=user_id, text="Неизвестная команда. Используйте `/help`.")
 
     def ensure_publish_ready(self, user_id: int) -> bool:
-        if self.has_channel_bindings() and ADMIN_USER_IDS:
+        if self.has_channel_bindings() and self.is_super_admin_user(user_id):
             return True
         self.api.send_message(
             user_id=user_id,
@@ -2832,8 +3131,8 @@ class MaxCommentsBot:
         missing: list[str] = []
         if not bindings:
             missing.append("хотя бы одну привязку канала через `/channel_add CHANNEL_ID COMMENTS_CHAT_ID`")
-        if not ADMIN_USER_IDS:
-            missing.append("`MAX_ADMIN_USER_IDS`")
+        if not SUPER_ADMIN_IDS:
+            missing.append("`MAX_SUPER_ADMIN_IDS`")
 
         if missing:
             return (
@@ -2918,7 +3217,7 @@ class MaxCommentsBot:
 
     def send_pending_channel_bindings_status(self, user_id: int) -> None:
         self.purge_expired_bind_codes()
-        show_all = user_id in ADMIN_USER_IDS
+        show_all = self.is_super_admin_user(user_id)
         pendings = self.store.list_pending_channel_bindings(
             requested_by_user_id=None if show_all else user_id
         )
@@ -3054,7 +3353,7 @@ class MaxCommentsBot:
                 "webhook_path": WEBHOOK_PATH,
                 "bot_username": self.get_bot_username(),
                 "channel_sync_interval_seconds": CHANNEL_SYNC_INTERVAL_SECONDS,
-                "admin_count": len(ADMIN_USER_IDS),
+                "admin_count": len(self.store.list_admin_users()),
             },
             "channels": [
                 self.serialize_channel_binding(binding)
@@ -3455,7 +3754,14 @@ class MaxCommentsBot:
 
         sender = message.get("sender") or {}
         sender_user_id = sender.get("user_id")
-        if not sender_user_id or int(sender_user_id) not in ADMIN_USER_IDS:
+        if not sender_user_id:
+            return False
+        sender_context = self.admin_context_for_user(int(sender_user_id))
+        if sender_context is None:
+            return False
+        try:
+            self.require_admin_access_to_channel(sender_context, int(binding["channel_chat_id"]))
+        except MaxApiError:
             return False
 
         body = message.get("body") or {}
@@ -4049,7 +4355,7 @@ class MaxCommentsBot:
                 text or "Текст очищен",
             ]
         )
-        for admin_id in ADMIN_USER_IDS:
+        for admin_id in self.admin_notice_user_ids():
             self.api.send_message(
                 user_id=admin_id,
                 text=admin_notice,
@@ -4232,7 +4538,7 @@ class MaxCommentsBot:
                 discussion_copy_message_id=discussion_copy_message_id,
             )
 
-        for admin_id in ADMIN_USER_IDS:
+        for admin_id in self.admin_notice_user_ids():
             self.api.send_message(
                 user_id=admin_id,
                 text=self.build_admin_comment_notice(
@@ -4316,34 +4622,39 @@ class MaxCommentsBot:
         )
 
     def is_admin_user(self, user_id: int) -> bool:
-        return int(user_id) in ADMIN_USER_IDS
+        return self.admin_context_for_user(user_id) is not None
+
+    def is_super_admin_user(self, user_id: int) -> bool:
+        context = self.admin_context_for_user(user_id)
+        return bool(context and context.is_super_admin)
 
     def admin_context_for_user(self, user_id: int) -> AdminContext | None:
         normalized_user_id = int(user_id)
-        if self.is_admin_user(normalized_user_id):
+        admin_user = self.store.get_admin_user_by_max_user_id(normalized_user_id)
+        if admin_user is None or int(admin_user["is_active"]) != 1:
+            return None
+        role = safe_text(admin_user["role"])
+        if role == ROLE_SUPER_ADMIN:
             return AdminContext(
                 user_id=normalized_user_id,
                 role=ROLE_SUPER_ADMIN,
                 channel_ids=set(),
+                admin_user_id=int(admin_user["id"]),
+                must_change_password=bool(int(admin_user["must_change_password"])),
             )
+        if role != ROLE_CHANNEL_ADMIN:
+            return None
         channel_ids = self.store.list_channel_admin_channel_ids(normalized_user_id)
-        if channel_ids:
-            return AdminContext(
-                user_id=normalized_user_id,
-                role=ROLE_CHANNEL_ADMIN,
-                channel_ids=channel_ids,
-            )
-        return None
+        return AdminContext(
+            user_id=normalized_user_id,
+            role=ROLE_CHANNEL_ADMIN,
+            channel_ids=channel_ids,
+            admin_user_id=int(admin_user["id"]),
+            must_change_password=bool(int(admin_user["must_change_password"])),
+        )
 
     def token_super_admin_context(self) -> AdminContext | None:
-        if not ADMIN_PANEL_TOKEN:
-            return None
-        fallback_user_id = min(ADMIN_USER_IDS) if ADMIN_USER_IDS else 0
-        return AdminContext(
-            user_id=int(fallback_user_id),
-            role=ROLE_SUPER_ADMIN,
-            channel_ids=set(),
-        )
+        return None
 
     def bound_channel_ids(self) -> set[int]:
         return {int(binding["channel_chat_id"]) for binding in self.list_channel_bindings()}
@@ -4383,10 +4694,105 @@ class MaxCommentsBot:
 
     def serialize_admin_identity(self, context: AdminContext) -> dict[str, Any]:
         return {
+            "id": context.admin_user_id,
             "user_id": context.user_id,
             "role": context.role,
             "is_super_admin": context.is_super_admin,
+            "must_change_password": context.must_change_password,
         }
+
+    def serialize_admin_user(self, admin_user: sqlite3.Row) -> dict[str, Any]:
+        raw_channel_ids = safe_text(admin_user["channel_ids"] if "channel_ids" in admin_user.keys() else "")
+        channel_ids = [
+            int(item)
+            for item in raw_channel_ids.split(",")
+            if safe_text(item)
+        ]
+        return {
+            "id": int(admin_user["id"]),
+            "max_user_id": safe_text(admin_user["max_user_id"]),
+            "role": safe_text(admin_user["role"]),
+            "must_change_password": bool(int(admin_user["must_change_password"])),
+            "is_active": bool(int(admin_user["is_active"])),
+            "channel_ids": channel_ids,
+            "created_at": safe_text(admin_user["created_at"]),
+            "updated_at": safe_text(admin_user["updated_at"]),
+        }
+
+    def require_super_admin(self, context: AdminContext) -> None:
+        if not context.is_super_admin:
+            raise MaxApiError("FORBIDDEN")
+
+    def sign_admin_session(self, max_user_id: str, expires_at: int) -> str:
+        payload = f"{safe_text(max_user_id)}:{int(expires_at)}"
+        return hmac.new(
+            safe_text(ADMIN_SESSION_SECRET).encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def create_admin_session_token(self, max_user_id: str | int) -> str:
+        normalized_user_id = safe_text(max_user_id)
+        expires_at = int(time.time()) + ADMIN_SESSION_MAX_AGE_SECONDS
+        signature = self.sign_admin_session(normalized_user_id, expires_at)
+        return f"v1:{normalized_user_id}:{expires_at}:{signature}"
+
+    def admin_context_from_session_token(self, token: str) -> AdminContext | None:
+        parts = safe_text(token).split(":")
+        if len(parts) != 4 or parts[0] != "v1":
+            return None
+        _version, max_user_id, raw_expires_at, signature = parts
+        try:
+            expires_at = int(raw_expires_at)
+            user_id = int(max_user_id)
+        except ValueError:
+            return None
+        if expires_at < int(time.time()):
+            return None
+        expected_signature = self.sign_admin_session(max_user_id, expires_at)
+        if not hmac.compare_digest(signature, expected_signature):
+            return None
+        return self.admin_context_for_user(user_id)
+
+    def authenticate_admin_credentials(self, *, login: str, password: str) -> AdminContext:
+        normalized_login = safe_text(login)
+        admin_user = self.store.get_admin_user_by_max_user_id(normalized_login)
+        if admin_user is None or int(admin_user["is_active"]) != 1:
+            raise MaxApiError("ACCESS_DENIED")
+        if not verify_admin_password(password, safe_text(admin_user["password_hash"])):
+            raise MaxApiError("INVALID_CREDENTIALS")
+        try:
+            user_id = int(admin_user["max_user_id"])
+        except ValueError as exc:
+            raise MaxApiError("ACCESS_DENIED") from exc
+        context = self.admin_context_for_user(user_id)
+        if context is None:
+            raise MaxApiError("ACCESS_DENIED")
+        return context
+
+    def change_admin_password(
+        self,
+        context: AdminContext,
+        *,
+        old_password: str,
+        new_password: str,
+    ) -> dict[str, Any]:
+        if context.admin_user_id is None:
+            raise MaxApiError("ACCESS_DENIED")
+        admin_user = self.store.get_admin_user_by_id(context.admin_user_id)
+        if admin_user is None or int(admin_user["is_active"]) != 1:
+            raise MaxApiError("ACCESS_DENIED")
+        if not verify_admin_password(old_password, safe_text(admin_user["password_hash"])):
+            raise MaxApiError("INVALID_CREDENTIALS")
+        clean_new_password = safe_text(new_password)
+        if len(clean_new_password) < 6:
+            raise MaxApiError("Новый пароль должен быть не короче 6 символов.")
+        self.store.set_admin_password(
+            admin_user_id=int(admin_user["id"]),
+            password=clean_new_password,
+            must_change_password=False,
+        )
+        return {"ok": True}
 
     def primary_channel_payload(self, bindings: list[sqlite3.Row]) -> dict[str, Any] | None:
         if not bindings:
@@ -4488,6 +4894,16 @@ class MaxCommentsBot:
         return {
             "ok": True,
             "admin": self.serialize_admin_identity(context),
+            "app": {
+                "version": APP_VERSION,
+                "delivery_mode": self.delivery_mode,
+                "web_app_public_url": WEB_APP_PUBLIC_URL,
+                "webhook_public_url": self.webhook_url(),
+                "webhook_path": WEBHOOK_PATH,
+                "bot_username": self.get_bot_username(),
+                "channel_sync_interval_seconds": CHANNEL_SYNC_INTERVAL_SECONDS,
+                "admin_count": len(self.store.list_admin_users()),
+            },
             "channel": self.primary_channel_payload(bindings),
             "channels": [self.serialize_channel_binding(binding) for binding in bindings],
             "stats": self.store.dashboard_stats(channel_ids=channel_ids),
@@ -4511,6 +4927,185 @@ class MaxCommentsBot:
             "ok": True,
             "posts": [self.serialize_admin_post(post) for post in posts],
         }
+
+    def admin_list_users(self, context: AdminContext) -> dict[str, Any]:
+        self.require_super_admin(context)
+        return {
+            "ok": True,
+            "users": [self.serialize_admin_user(row) for row in self.store.list_admin_users()],
+        }
+
+    def normalize_admin_channel_ids(self, raw_channel_ids: Any) -> set[int]:
+        if raw_channel_ids is None:
+            return set()
+        if not isinstance(raw_channel_ids, list):
+            raise MaxApiError("Список каналов должен быть массивом.")
+        normalized_ids: set[int] = set()
+        bound_ids = self.bound_channel_ids()
+        for item in raw_channel_ids:
+            channel_id = validate_positive_int(item, minimum=-10**18, maximum=10**18)
+            if channel_id is None:
+                raise MaxApiError("Некорректный ID канала.")
+            if int(channel_id) not in bound_ids:
+                raise MaxApiError("Channel is not connected")
+            normalized_ids.add(int(channel_id))
+        return normalized_ids
+
+    def admin_save_user(
+        self,
+        context: AdminContext,
+        *,
+        max_user_id: str,
+        role: str,
+        channel_ids: set[int],
+        is_active: bool = True,
+    ) -> dict[str, Any]:
+        self.require_super_admin(context)
+        clean_user_id = safe_text(max_user_id)
+        if not clean_user_id.isdigit():
+            raise MaxApiError("MAX user id должен быть числом.")
+        normalized_role = safe_text(role)
+        if normalized_role not in ADMIN_ROLES:
+            raise MaxApiError("Invalid admin role")
+        if normalized_role == ROLE_CHANNEL_ADMIN and not channel_ids:
+            raise MaxApiError("Для channel_admin выберите хотя бы один канал.")
+        row = self.store.ensure_admin_user(
+            max_user_id=clean_user_id,
+            role=normalized_role,
+            password=clean_user_id,
+            must_change_password=True,
+            is_active=is_active,
+        )
+        if normalized_role == ROLE_SUPER_ADMIN:
+            self.store.replace_admin_channels(max_user_id=clean_user_id, channel_ids=set())
+        else:
+            self.store.replace_admin_channels(max_user_id=clean_user_id, channel_ids=channel_ids)
+        refreshed = self.store.get_admin_user_by_id(int(row["id"]))
+        self.store.add_admin_audit_log(
+            admin_user_id=context.user_id,
+            channel_id=0,
+            action="save_admin_user",
+            entity_type="admin_user",
+            entity_id=int(row["id"]),
+            payload={
+                "max_user_id": clean_user_id,
+                "role": normalized_role,
+                "channel_ids": sorted(channel_ids),
+                "is_active": is_active,
+            },
+        )
+        return {
+            "ok": True,
+            "user": self.serialize_admin_user(
+                next(
+                    item
+                    for item in self.store.list_admin_users()
+                    if int(item["id"]) == int(refreshed["id"])
+                )
+            ),
+        }
+
+    def admin_update_user(
+        self,
+        context: AdminContext,
+        *,
+        admin_user_id: int,
+        role: str | None,
+        channel_ids: set[int] | None,
+        is_active: bool | None,
+    ) -> dict[str, Any]:
+        self.require_super_admin(context)
+        existing = self.store.get_admin_user_by_id(admin_user_id)
+        if existing is None:
+            raise MaxApiError("Admin user not found")
+        normalized_role = safe_text(role) or safe_text(existing["role"])
+        if normalized_role not in ADMIN_ROLES:
+            raise MaxApiError("Invalid admin role")
+        if normalized_role == ROLE_CHANNEL_ADMIN and channel_ids is not None and not channel_ids:
+            raise MaxApiError("Для channel_admin выберите хотя бы один канал.")
+        updated = self.store.update_admin_user(
+            admin_user_id=admin_user_id,
+            role=normalized_role,
+            is_active=is_active,
+        )
+        if updated is None:
+            raise MaxApiError("Admin user not found")
+        if normalized_role == ROLE_SUPER_ADMIN:
+            self.store.replace_admin_channels(max_user_id=updated["max_user_id"], channel_ids=set())
+        elif channel_ids is not None:
+            self.store.replace_admin_channels(max_user_id=updated["max_user_id"], channel_ids=channel_ids)
+        self.store.add_admin_audit_log(
+            admin_user_id=context.user_id,
+            channel_id=0,
+            action="update_admin_user",
+            entity_type="admin_user",
+            entity_id=admin_user_id,
+            payload={
+                "role": normalized_role,
+                "channel_ids": sorted(channel_ids) if channel_ids is not None else None,
+                "is_active": is_active,
+            },
+        )
+        refreshed = next(
+            item
+            for item in self.store.list_admin_users()
+            if int(item["id"]) == int(admin_user_id)
+        )
+        return {"ok": True, "user": self.serialize_admin_user(refreshed)}
+
+    def admin_reset_user_password(
+        self,
+        context: AdminContext,
+        *,
+        admin_user_id: int,
+    ) -> dict[str, Any]:
+        self.require_super_admin(context)
+        row = self.store.get_admin_user_by_id(admin_user_id)
+        if row is None:
+            raise MaxApiError("Admin user not found")
+        updated = self.store.set_admin_password(
+            admin_user_id=admin_user_id,
+            password=safe_text(row["max_user_id"]),
+            must_change_password=True,
+        )
+        if updated is None:
+            raise MaxApiError("Admin user not found")
+        self.store.add_admin_audit_log(
+            admin_user_id=context.user_id,
+            channel_id=0,
+            action="reset_admin_password",
+            entity_type="admin_user",
+            entity_id=admin_user_id,
+            payload={"max_user_id": safe_text(row["max_user_id"])},
+        )
+        return {"ok": True}
+
+    def admin_delete_user_channel(
+        self,
+        context: AdminContext,
+        *,
+        admin_user_id: int,
+        channel_id: int,
+    ) -> dict[str, Any]:
+        self.require_super_admin(context)
+        row = self.store.get_admin_user_by_id(admin_user_id)
+        if row is None:
+            raise MaxApiError("Admin user not found")
+        deleted = self.store.delete_admin_channel(
+            max_user_id=safe_text(row["max_user_id"]),
+            channel_id=int(channel_id),
+        )
+        if not deleted:
+            raise MaxApiError("Channel is not connected")
+        self.store.add_admin_audit_log(
+            admin_user_id=context.user_id,
+            channel_id=int(channel_id),
+            action="delete_admin_channel",
+            entity_type="admin_user",
+            entity_id=admin_user_id,
+            payload={"max_user_id": safe_text(row["max_user_id"])},
+        )
+        return {"ok": True}
 
     def admin_create_post(
         self,
@@ -4850,6 +5445,7 @@ class MaxCommentsBot:
     def build_viewer_payload(
         self,
         init_data: str,
+        post: sqlite3.Row | None = None,
     ) -> dict[str, Any] | None:
         clean_init_data = safe_text(init_data)
         if not clean_init_data:
@@ -4859,11 +5455,21 @@ class MaxCommentsBot:
         except WebAppAuthError:
             return None
         admin_context = self.admin_context_for_user(viewer.user_id)
+        can_admin_current_post = False
+        if admin_context is not None:
+            if post is None or admin_context.is_super_admin:
+                can_admin_current_post = True
+            else:
+                try:
+                    self.require_admin_access_to_channel(admin_context, int(post["channel_chat_id"]))
+                    can_admin_current_post = True
+                except MaxApiError:
+                    can_admin_current_post = False
         return {
             "user_id": viewer.user_id,
             "display_name": viewer.display_name,
             "username": viewer.username,
-            "is_admin": self.is_admin_user(viewer.user_id),
+            "is_admin": can_admin_current_post,
             "role": admin_context.role if admin_context else ROLE_USER,
         }
 
@@ -4921,7 +5527,7 @@ class MaxCommentsBot:
                 "oldest_comment_id": oldest_comment_id,
                 "before_comment_id": before_comment_id,
             },
-            "viewer": self.build_viewer_payload(viewer_init_data),
+            "viewer": self.build_viewer_payload(viewer_init_data, post=post),
         }
 
     def create_comment_from_webapp(
@@ -4983,7 +5589,14 @@ class MaxCommentsBot:
             raise MaxApiError("Comment not found")
         if safe_text(comment["status"] if "status" in comment.keys() else COMMENT_STATUS_ACTIVE) != COMMENT_STATUS_ACTIVE:
             raise MaxApiError("Comment not found")
-        is_admin = self.is_admin_user(auth_user.user_id)
+        admin_context = self.admin_context_for_user(auth_user.user_id)
+        is_admin = False
+        if admin_context is not None:
+            try:
+                self.require_admin_access_to_channel(admin_context, int(post["channel_chat_id"]))
+                is_admin = True
+            except MaxApiError:
+                is_admin = False
         is_author = int(comment["user_id"]) == int(auth_user.user_id)
         if not is_admin and not is_author:
             raise MaxApiError("You can delete only your own comments")
@@ -5299,6 +5912,15 @@ class CommentWebServer:
                 if path == "/admin/logout":
                     self.handle_admin_logout()
                     return
+                if path == "/api/admin/auth/login":
+                    self.handle_admin_login()
+                    return
+                if path == "/api/admin/auth/logout":
+                    self.handle_admin_logout()
+                    return
+                if path == "/api/admin/auth/change-password":
+                    self.handle_admin_change_password()
+                    return
                 if path.startswith("/api/admin/"):
                     self.handle_admin_post(path)
                     return
@@ -5536,20 +6158,43 @@ class CommentWebServer:
                 self.send_json(HTTPStatus.OK, {"ok": True, "accepted": accepted})
 
             def handle_admin_login(self) -> None:
-                if not ADMIN_PANEL_TOKEN:
-                    self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Admin panel is not configured"})
-                    return
                 payload = self.read_json_body()
                 if payload is None:
                     return
-                provided = safe_text(payload.get("token"))
-                if not hmac.compare_digest(provided, safe_text(ADMIN_PANEL_TOKEN)):
-                    self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "Неверный токен доступа"})
+                try:
+                    context = app.authenticate_admin_credentials(
+                        login=safe_text(payload.get("login")),
+                        password=safe_text(payload.get("password")),
+                    )
+                except MaxApiError as exc:
+                    code = safe_text(str(exc))
+                    if code == "ACCESS_DENIED":
+                        self.send_json(
+                            HTTPStatus.FORBIDDEN,
+                            {
+                                "ok": False,
+                                "error": "ACCESS_DENIED",
+                                "message": ADMIN_LOGIN_ACCESS_DENIED_MESSAGE,
+                            },
+                        )
+                        return
+                    self.send_json(
+                        HTTPStatus.UNAUTHORIZED,
+                        {
+                            "ok": False,
+                            "error": "INVALID_CREDENTIALS",
+                            "message": INVALID_CREDENTIALS_MESSAGE,
+                        },
+                    )
                     return
+                session_token = app.create_admin_session_token(context.user_id)
                 self.send_json(
                     HTTPStatus.OK,
-                    {"ok": True},
-                    headers={"Set-Cookie": self.admin_session_cookie(safe_text(ADMIN_PANEL_TOKEN))},
+                    {
+                        "ok": True,
+                        "admin": app.serialize_admin_identity(context),
+                    },
+                    headers={"Set-Cookie": self.admin_session_cookie(session_token)},
                 )
 
             def handle_admin_logout(self) -> None:
@@ -5558,6 +6203,37 @@ class CommentWebServer:
                     {"ok": True},
                     headers={"Set-Cookie": self.admin_session_cookie("", max_age=0)},
                 )
+
+            def handle_admin_change_password(self) -> None:
+                context = self.require_admin_context()
+                if context is None:
+                    return
+                payload = self.read_json_body()
+                if payload is None:
+                    return
+                try:
+                    result = app.change_admin_password(
+                        context,
+                        old_password=safe_text(payload.get("oldPassword")),
+                        new_password=safe_text(payload.get("newPassword")),
+                    )
+                except MaxApiError as exc:
+                    code = safe_text(str(exc))
+                    status = HTTPStatus.BAD_REQUEST
+                    if code == "ACCESS_DENIED":
+                        status = HTTPStatus.FORBIDDEN
+                    elif code == "INVALID_CREDENTIALS":
+                        status = HTTPStatus.UNAUTHORIZED
+                    self.send_json(
+                        status,
+                        {
+                            "ok": False,
+                            "error": code or "CHANGE_PASSWORD_FAILED",
+                            "message": humanize_comment_error_message(code),
+                        },
+                    )
+                    return
+                self.send_json(HTTPStatus.OK, result)
 
             def admin_context_from_init_data(self) -> AdminContext | None:
                 init_data = self.read_init_data_header()
@@ -5569,22 +6245,13 @@ class CommentWebServer:
                     return None
                 return app.admin_context_for_user(user.user_id)
 
+            def admin_context_from_session(self) -> AdminContext | None:
+                return app.admin_context_from_session_token(self.admin_auth_token())
+
             def require_admin_context(self) -> AdminContext | None:
-                context = self.admin_context_from_init_data()
+                context = self.admin_context_from_session()
                 if context is not None:
                     return context
-                if self.is_admin_authenticated():
-                    return app.token_super_admin_context()
-                if self.read_init_data_header():
-                    self.send_json(
-                        HTTPStatus.FORBIDDEN,
-                        {
-                            "ok": False,
-                            "error": "ACCESS_DENIED",
-                            "message": ACCESS_DENIED_MESSAGE,
-                        },
-                    )
-                    return None
                 self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "Unauthorized"})
                 return None
 
@@ -5595,8 +6262,9 @@ class CommentWebServer:
                 return int(values[0])
 
             def admin_error_status(self, exc: MaxApiError) -> HTTPStatus:
-                message = str(exc).lower()
-                if "access denied" in message:
+                raw_message = safe_text(str(exc))
+                message = raw_message.lower()
+                if raw_message in {"FORBIDDEN", "ACCESS_DENIED"} or "access denied" in message:
                     return HTTPStatus.FORBIDDEN
                 if "not found" in message or "not connected" in message:
                     return HTTPStatus.NOT_FOUND
@@ -5668,6 +6336,9 @@ class CommentWebServer:
                         report_id = int(parse.unquote(path.removeprefix("/api/admin/reports/")).split("/", 1)[0])
                         self.send_json(HTTPStatus.OK, app.admin_get_report(context, report_id=report_id))
                         return
+                    if path == "/api/admin/users":
+                        self.send_json(HTTPStatus.OK, app.admin_list_users(context))
+                        return
                 except ValueError:
                     self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "INVALID_ID", "message": "Некорректный ID"})
                     return
@@ -5685,7 +6356,7 @@ class CommentWebServer:
                     return
                 try:
                     if path == "/api/admin/posts":
-                        channel_id = validate_positive_int(payload.get("channel_id"), minimum=1, maximum=10**18)
+                        channel_id = int(payload.get("channel_id")) if safe_text(payload.get("channel_id")) else None
                         result = app.admin_create_post(
                             context,
                             requested_channel_id=channel_id,
@@ -5693,6 +6364,25 @@ class CommentWebServer:
                             content=safe_text(payload.get("content")),
                         )
                         self.send_json(HTTPStatus.CREATED, result)
+                        return
+                    if path == "/api/admin/users":
+                        channel_ids = app.normalize_admin_channel_ids(payload.get("channel_ids"))
+                        result = app.admin_save_user(
+                            context,
+                            max_user_id=safe_text(payload.get("max_user_id")),
+                            role=safe_text(payload.get("role")),
+                            channel_ids=channel_ids,
+                            is_active=bool(payload.get("is_active", True)),
+                        )
+                        self.send_json(HTTPStatus.CREATED, result)
+                        return
+                    if path.startswith("/api/admin/users/") and path.endswith("/reset-password"):
+                        raw_admin_user_id = path.removeprefix("/api/admin/users/").removesuffix("/reset-password").strip("/")
+                        admin_user_id = int(parse.unquote(raw_admin_user_id))
+                        self.send_json(
+                            HTTPStatus.OK,
+                            app.admin_reset_user_password(context, admin_user_id=admin_user_id),
+                        )
                         return
                     if path == "/api/admin/channels":
                         if not context.is_super_admin:
@@ -5708,7 +6398,7 @@ class CommentWebServer:
                         self.send_json(HTTPStatus.OK, result)
                         return
                     if path == "/api/admin/publish":
-                        channel_chat_id = validate_positive_int(payload.get("channel_chat_id"), minimum=1, maximum=10**18)
+                        channel_chat_id = int(payload.get("channel_chat_id")) if safe_text(payload.get("channel_chat_id")) else None
                         text = safe_text(payload.get("text"))
                         if not text:
                             raise MaxApiError("Post text is empty")
@@ -5751,6 +6441,26 @@ class CommentWebServer:
                 if payload is None:
                     return
                 try:
+                    if path.startswith("/api/admin/users/"):
+                        raw_admin_user_id = path.removeprefix("/api/admin/users/").strip("/")
+                        if "/" in raw_admin_user_id:
+                            self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+                            return
+                        admin_user_id = int(parse.unquote(raw_admin_user_id))
+                        channel_ids = (
+                            app.normalize_admin_channel_ids(payload.get("channel_ids"))
+                            if "channel_ids" in payload
+                            else None
+                        )
+                        result = app.admin_update_user(
+                            context,
+                            admin_user_id=admin_user_id,
+                            role=safe_text(payload.get("role")) or None,
+                            channel_ids=channel_ids,
+                            is_active=bool(payload.get("is_active")) if "is_active" in payload else None,
+                        )
+                        self.send_json(HTTPStatus.OK, result)
+                        return
                     if path.startswith("/api/admin/comments/") and path.endswith("/status"):
                         raw_comment_id = path.removeprefix("/api/admin/comments/").removesuffix("/status")
                         comment_id = int(parse.unquote(raw_comment_id).strip("/"))
@@ -5793,6 +6503,25 @@ class CommentWebServer:
                             post_reference=post_reference,
                             reason="Удалено администратором",
                         )
+                    except MaxApiError as exc:
+                        self.send_max_api_error(exc)
+                        return
+                    self.send_json(HTTPStatus.OK, result)
+                    return
+                if path.startswith("/api/admin/users/") and "/channels/" in path:
+                    try:
+                        tail = path.removeprefix("/api/admin/users/")
+                        raw_admin_user_id, raw_channel_tail = tail.split("/channels/", 1)
+                        admin_user_id = int(parse.unquote(raw_admin_user_id))
+                        channel_id = int(parse.unquote(raw_channel_tail).split("/", 1)[0])
+                        result = app.admin_delete_user_channel(
+                            context,
+                            admin_user_id=admin_user_id,
+                            channel_id=channel_id,
+                        )
+                    except ValueError:
+                        self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "INVALID_ID", "message": "Некорректный ID"})
+                        return
                     except MaxApiError as exc:
                         self.send_max_api_error(exc)
                         return
@@ -6026,19 +6755,10 @@ class CommentWebServer:
                 return ""
 
             def is_admin_authenticated(self) -> bool:
-                expected = safe_text(ADMIN_PANEL_TOKEN)
-                if not expected:
-                    return False
-                return hmac.compare_digest(self.admin_auth_token(), expected)
+                return app.admin_context_from_session_token(self.admin_auth_token()) is not None
 
             def require_admin(self) -> bool:
-                if not ADMIN_PANEL_TOKEN:
-                    self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Admin panel is not configured"})
-                    return False
-                if not self.is_admin_authenticated():
-                    self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "Unauthorized"})
-                    return False
-                return True
+                return self.require_admin_context() is not None
 
             def send_json(
                 self,

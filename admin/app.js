@@ -4,6 +4,7 @@
     posts: [],
     comments: [],
     reports: [],
+    admins: [],
     channels: [],
     selectedChannelId: "",
     activeTab: "dashboard",
@@ -129,6 +130,10 @@
       : "";
   }
 
+  function isSuperAdmin() {
+    return state.dashboard?.admin?.role === "super_admin";
+  }
+
   function statusPill(status) {
     const tone = status === "active" || status === "published" ? "success" : status === "new" ? "danger" : "";
     return `<span class="pill ${tone}">${escapeHtml(statusLabels[status] || status || "-")}</span>`;
@@ -149,6 +154,76 @@
     select.disabled = state.channels.length <= 1;
   }
 
+  function renderRoleVisibility() {
+    const superAdmin = isSuperAdmin();
+    document.querySelectorAll(".super-only").forEach((node) => {
+      node.hidden = !superAdmin;
+    });
+    const channelTab = document.querySelector('[data-tab="channels"]');
+    if (channelTab) {
+      channelTab.textContent = superAdmin ? "Каналы" : "Мои каналы";
+    }
+    if (!superAdmin && ["admins", "settings"].includes(state.activeTab)) {
+      setActiveTab("dashboard");
+    }
+  }
+
+  function renderPasswordWarning(admin) {
+    const warning = $("#password-warning");
+    warning.classList.toggle("hidden", !admin?.must_change_password);
+  }
+
+  function renderChannelsList() {
+    const list = $("#channels-list");
+    list.innerHTML = "";
+    if (!state.channels.length) {
+      list.innerHTML = '<div class="empty">Каналы не найдены.</div>';
+      return;
+    }
+    for (const channel of state.channels) {
+      const item = document.createElement("article");
+      item.className = "item";
+      item.innerHTML = `
+        <div class="item-row">
+          <div>
+            <div class="item-title">${escapeHtml(channel.channel_label || channel.channel_chat_id)}</div>
+            <div class="item-meta">Канал: ${escapeHtml(channel.channel_chat_id)}</div>
+            <div class="item-meta">Чат комментариев: ${escapeHtml(channel.comments_chat_label || channel.comments_chat_id)}</div>
+          </div>
+          <span class="pill">${channel.same_chat ? "один чат" : "отдельный чат"}</span>
+        </div>
+        <div class="item-actions">
+          ${channel.channel_url ? `<a class="action-link" href="${escapeHtml(channel.channel_url)}" target="_blank" rel="noreferrer">Открыть канал</a>` : ""}
+          ${channel.comments_chat_url ? `<a class="action-link" href="${escapeHtml(channel.comments_chat_url)}" target="_blank" rel="noreferrer">Открыть чат</a>` : ""}
+          ${isSuperAdmin() ? `<button class="danger-button" type="button" data-remove-channel="${channel.channel_chat_id}">Удалить привязку</button>` : ""}
+        </div>
+      `;
+      list.append(item);
+    }
+  }
+
+  function renderSettings() {
+    const list = $("#settings-list");
+    const app = state.dashboard?.app || {};
+    const rows = [
+      ["Версия", app.version || "-"],
+      ["Режим доставки", app.delivery_mode || "-"],
+      ["Webhook URL", app.webhook_public_url || "-"],
+      ["Webhook path", app.webhook_path || "-"],
+      ["WebApp URL", app.web_app_public_url || "-"],
+      ["Бот", app.bot_username ? `@${app.bot_username}` : "-"],
+      ["Администраторов", app.admin_count || 0],
+    ];
+    list.innerHTML = rows.map(([title, value]) => `
+      <article class="item">
+        <div class="item-row">
+          <div class="item-title">${escapeHtml(title)}</div>
+          <div class="item-meta">${escapeHtml(value)}</div>
+        </div>
+      </article>
+    `).join("");
+  }
+
   function renderDashboard(payload) {
     state.dashboard = payload;
     state.channels = Array.isArray(payload.channels) ? payload.channels : [];
@@ -163,6 +238,10 @@
     $("#stat-new-reports").textContent = String(stats.newReportsCount || 0);
     $("#stat-deleted-comments").textContent = String(stats.deletedCommentsCount || 0);
     renderChannelSelect();
+    renderRoleVisibility();
+    renderPasswordWarning(payload.admin);
+    renderChannelsList();
+    renderSettings();
     renderMiniList("#latest-posts", payload.latestPosts || [], renderPostItem);
     renderMiniList("#latest-comments", payload.latestComments || [], renderCommentItem);
     renderMiniList("#latest-reports", payload.latestReports || [], renderReportItem);
@@ -276,6 +355,55 @@
     state.reports.forEach((report) => list.append(renderReportItem(report)));
   }
 
+  function renderAdminUserChannelOptions() {
+    const select = $("#admin-user-channels");
+    if (!select) return;
+    select.innerHTML = "";
+    for (const channel of state.channels) {
+      const option = document.createElement("option");
+      option.value = channel.channel_chat_id;
+      option.textContent = channel.channel_label || String(channel.channel_chat_id);
+      select.append(option);
+    }
+  }
+
+  function renderAdmins() {
+    const list = $("#admins-list");
+    if (!list) return;
+    renderAdminUserChannelOptions();
+    list.innerHTML = "";
+    if (!state.admins.length) {
+      list.innerHTML = '<div class="empty">Администраторы ещё не добавлены.</div>';
+      return;
+    }
+    for (const admin of state.admins) {
+      const channelText = admin.role === "super_admin"
+        ? "Все каналы"
+        : (admin.channel_ids || []).join(", ") || "Каналы не назначены";
+      const item = document.createElement("article");
+      item.className = "item";
+      item.innerHTML = `
+        <div class="item-row">
+          <div>
+            <div class="item-title">${escapeHtml(admin.max_user_id)}</div>
+            <div class="item-meta">Роль: ${escapeHtml(admin.role)} · ${admin.is_active ? "активен" : "отключён"}</div>
+            <div class="item-meta">Каналы: ${escapeHtml(channelText)}</div>
+            ${admin.must_change_password ? '<div class="item-meta">Пароль по умолчанию, нужна смена</div>' : ""}
+          </div>
+          ${statusPill(admin.is_active ? "active" : "deleted")}
+        </div>
+        <div class="item-actions">
+          <button class="ghost-button" type="button" data-edit-admin="${admin.id}">Редактировать</button>
+          <button class="ghost-button" type="button" data-reset-admin-password="${admin.id}">Сбросить пароль</button>
+          <button class="danger-button" type="button" data-toggle-admin="${admin.id}" data-next-active="${admin.is_active ? "0" : "1"}">
+            ${admin.is_active ? "Отключить" : "Включить"}
+          </button>
+        </div>
+      `;
+      list.append(item);
+    }
+  }
+
   function renderPostFilter() {
     const select = $("#comments-post");
     const currentValue = select.value;
@@ -329,20 +457,28 @@
     renderReports();
   }
 
+  async function loadAdmins() {
+    if (!isSuperAdmin()) {
+      state.admins = [];
+      renderAdmins();
+      return;
+    }
+    const payload = await requestJson("/api/admin/users");
+    state.admins = Array.isArray(payload.users) ? payload.users : [];
+    renderAdmins();
+  }
+
   async function loadAll() {
     try {
       await loadDashboard();
       await loadPosts();
       await loadComments();
       await loadReports();
+      await loadAdmins();
       setNotice("");
     } catch (error) {
       if (error.status === 401) {
-        if (state.insideMax) {
-          showDenied();
-        } else {
-          showLogin("");
-        }
+        showLogin("");
         return;
       }
       if (error.status === 403) {
@@ -370,11 +506,15 @@
     event.preventDefault();
     $("#login-error").textContent = "";
     try {
-      await requestJson("/admin/login", {
+      await requestJson("/api/admin/auth/login", {
         method: "POST",
-        body: JSON.stringify({ token: $("#login-token").value }),
+        body: JSON.stringify({
+          login: $("#login-user-id").value.trim(),
+          password: $("#login-password").value,
+        }),
       });
-      $("#login-token").value = "";
+      $("#login-user-id").value = "";
+      $("#login-password").value = "";
       await loadAll();
     } catch (error) {
       showLogin(error.message);
@@ -382,7 +522,7 @@
   }
 
   async function handleLogout() {
-    await requestJson("/admin/logout", { method: "POST", body: "{}" }).catch(() => null);
+    await requestJson("/api/admin/auth/logout", { method: "POST", body: "{}" }).catch(() => null);
     state.dashboard = null;
     if (state.insideMax) {
       await loadAll();
@@ -414,6 +554,83 @@
     }
   }
 
+  async function handleChangePassword(event) {
+    event.preventDefault();
+    setNotice("");
+    try {
+      await requestJson("/api/admin/auth/change-password", {
+        method: "POST",
+        body: JSON.stringify({
+          oldPassword: $("#old-password").value,
+          newPassword: $("#new-password").value,
+        }),
+      });
+      $("#old-password").value = "";
+      $("#new-password").value = "";
+      await loadAll();
+      setNotice("Пароль изменён.");
+    } catch (error) {
+      setNotice(error.message, "error");
+    }
+  }
+
+  async function handleChannelSubmit(event) {
+    event.preventDefault();
+    setNotice("");
+    try {
+      const result = await requestJson("/api/admin/channels", {
+        method: "POST",
+        body: JSON.stringify({
+          channel_chat_id: $("#channel-id").value.trim(),
+          comments_chat_id: $("#comments-chat-id").value.trim(),
+          comments_chat_url: $("#comments-chat-url").value.trim(),
+          sync_now: true,
+        }),
+      });
+      event.currentTarget.reset();
+      await loadAll();
+      setNotice(`Канал подключён. Подцеплено постов: ${result.attached_count}`);
+    } catch (error) {
+      setNotice(error.message, "error");
+    }
+  }
+
+  async function handleSync() {
+    setNotice("");
+    try {
+      const result = await requestJson("/api/admin/sync", { method: "POST", body: "{}" });
+      await loadAll();
+      setNotice(`Синхронизация завершена. Подцеплено постов: ${result.attached_count}`);
+    } catch (error) {
+      setNotice(error.message, "error");
+    }
+  }
+
+  function selectedAdminChannelIds() {
+    return Array.from($("#admin-user-channels").selectedOptions).map((option) => option.value);
+  }
+
+  async function handleAdminUserSubmit(event) {
+    event.preventDefault();
+    setNotice("");
+    try {
+      await requestJson("/api/admin/users", {
+        method: "POST",
+        body: JSON.stringify({
+          max_user_id: $("#admin-user-id").value.trim(),
+          role: $("#admin-user-role").value,
+          channel_ids: selectedAdminChannelIds(),
+          is_active: true,
+        }),
+      });
+      event.currentTarget.reset();
+      await loadAll();
+      setNotice("Администратор сохранён. Пароль по умолчанию равен MAX user id.");
+    } catch (error) {
+      setNotice(error.message, "error");
+    }
+  }
+
   async function setCommentStatus(commentId, status, reason) {
     await requestJson(`/api/admin/comments/${encodeURIComponent(commentId)}/status`, {
       method: "PATCH",
@@ -437,7 +654,53 @@
     const reviewReport = event.target.closest("[data-review-report]");
     const acceptReport = event.target.closest("[data-accept-report]");
     const rejectReport = event.target.closest("[data-reject-report]");
+    const removeChannel = event.target.closest("[data-remove-channel]");
+    const editAdmin = event.target.closest("[data-edit-admin]");
+    const resetAdminPassword = event.target.closest("[data-reset-admin-password]");
+    const toggleAdmin = event.target.closest("[data-toggle-admin]");
     try {
+      if (removeChannel) {
+        if (!window.confirm(`Удалить привязку канала ${removeChannel.dataset.removeChannel}?`)) return;
+        await requestJson(`/api/admin/channels/${encodeURIComponent(removeChannel.dataset.removeChannel)}`, {
+          method: "DELETE",
+        });
+        await loadAll();
+        setNotice("Привязка канала удалена.");
+        return;
+      }
+      if (editAdmin) {
+        const admin = state.admins.find((item) => String(item.id) === String(editAdmin.dataset.editAdmin));
+        if (!admin) return;
+        $("#admin-user-id").value = admin.max_user_id;
+        $("#admin-user-role").value = admin.role;
+        renderAdminUserChannelOptions();
+        Array.from($("#admin-user-channels").options).forEach((option) => {
+          option.selected = (admin.channel_ids || []).map(String).includes(String(option.value));
+        });
+        setActiveTab("admins");
+        return;
+      }
+      if (resetAdminPassword) {
+        if (!window.confirm("Сбросить пароль администратора к MAX user id?")) return;
+        await requestJson(`/api/admin/users/${encodeURIComponent(resetAdminPassword.dataset.resetAdminPassword)}/reset-password`, {
+          method: "POST",
+          body: "{}",
+        });
+        await loadAll();
+        setNotice("Пароль сброшен к MAX user id.");
+        return;
+      }
+      if (toggleAdmin) {
+        await requestJson(`/api/admin/users/${encodeURIComponent(toggleAdmin.dataset.toggleAdmin)}`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            is_active: toggleAdmin.dataset.nextActive === "1",
+          }),
+        });
+        await loadAll();
+        setNotice("Статус администратора обновлён.");
+        return;
+      }
       if (deletePost) {
         if (!window.confirm("Удалить пост из админки? Комментарии к нему перестанут открываться.")) return;
         await requestJson(`/api/admin/posts/${encodeURIComponent(deletePost.dataset.deletePost)}`, { method: "DELETE" });
@@ -489,6 +752,10 @@
     $("#logout-button").addEventListener("click", handleLogout);
     $("#refresh-button").addEventListener("click", loadAll);
     $("#post-form").addEventListener("submit", handleCreatePost);
+    $("#change-password-form").addEventListener("submit", handleChangePassword);
+    $("#channel-form").addEventListener("submit", handleChannelSubmit);
+    $("#sync-button").addEventListener("click", handleSync);
+    $("#admin-user-form").addEventListener("submit", handleAdminUserSubmit);
     $("#channel-select").addEventListener("change", async (event) => {
       state.selectedChannelId = event.target.value;
       await loadAll();
