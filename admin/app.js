@@ -6,6 +6,7 @@
     comments: [],
     reports: [],
     admins: [],
+    channelRequests: [],
     channels: [],
     selectedChannelId: "",
     activeTab: "dashboard",
@@ -41,6 +42,10 @@
     in_review: "В работе",
     accepted: "Принята",
     rejected: "Отклонена",
+    pending: "Ожидает",
+    approved: "Одобрена",
+    cancelled: "Отменена",
+    duplicate: "Дубль",
     published: "Опубликован",
   };
 
@@ -142,7 +147,11 @@
   }
 
   function statusPill(status) {
-    const tone = status === "active" || status === "published" ? "success" : status === "new" ? "danger" : "";
+    const tone = status === "active" || status === "published" || status === "approved"
+      ? "success"
+      : status === "new" || status === "pending"
+        ? "danger"
+        : "";
     return `<span class="pill ${tone}">${escapeHtml(statusLabels[status] || status || "-")}</span>`;
   }
 
@@ -176,7 +185,7 @@
     if (channelTab) {
       channelTab.textContent = superAdmin ? "Все каналы" : "Мои каналы";
     }
-    if (!superAdmin && ["admins", "settings"].includes(state.activeTab)) {
+    if (!superAdmin && ["admins", "settings", "requests"].includes(state.activeTab)) {
       setActiveTab("dashboard");
     }
   }
@@ -252,6 +261,8 @@
     $("#stat-reports").textContent = String(stats.reportsCount || 0);
     $("#stat-new-reports").textContent = String(stats.newReportsCount || 0);
     $("#stat-deleted-comments").textContent = String(stats.deletedCommentsCount || 0);
+    const newRequests = $("#stat-new-requests");
+    if (newRequests) newRequests.textContent = String(stats.newRequestsCount || 0);
     renderChannelSelect();
     renderRoleVisibility();
     renderPasswordWarning(payload.admin);
@@ -260,10 +271,12 @@
     renderMiniList("#latest-posts", payload.latestPosts || [], renderPostItem);
     renderMiniList("#latest-comments", payload.latestComments || [], renderCommentItem);
     renderMiniList("#latest-reports", payload.latestReports || [], renderReportItem);
+    renderMiniList("#latest-requests", payload.latestRequests || [], renderChannelRequestItem);
   }
 
   function renderMiniList(selector, items, renderer) {
     const list = $(selector);
+    if (!list) return;
     list.innerHTML = "";
     if (!items.length) {
       list.innerHTML = '<div class="empty">Пока нет данных.</div>';
@@ -340,6 +353,49 @@
     return item;
   }
 
+  function requestCommentValue(requestId) {
+    const input = Array.from(document.querySelectorAll("[data-request-comment]"))
+      .find((node) => String(node.dataset.requestComment) === String(requestId));
+    return input ? input.value.trim() : "";
+  }
+
+  function renderChannelRequestItem(request) {
+    const item = document.createElement("article");
+    item.className = "item";
+    const channelTitle = request.channelTitle || request.channel_title || request.channelId || request.channel_id || "Канал";
+    const channelId = request.channelId || request.channel_id || "-";
+    const requester = request.requesterMaxUserId || request.requester_max_user_id || "-";
+    const forwardedPost = request.forwardedPostId || request.forwarded_post_id || "";
+    const isPending = request.status === "pending";
+    item.innerHTML = `
+      <div class="item-row">
+        <div>
+          <div class="item-title">${escapeHtml(channelTitle)}</div>
+          <div class="item-meta">ID канала: ${escapeHtml(channelId)} · заявитель: ${escapeHtml(requester)}</div>
+          <div class="item-meta">Дата: ${formatDate(request.createdAt || request.created_at)}</div>
+          ${forwardedPost ? `<div class="item-meta">Пост: ${escapeHtml(forwardedPost)}</div>` : ""}
+        </div>
+        ${statusPill(request.status)}
+      </div>
+      ${request.adminComment || request.admin_comment ? `<div class="item-meta">Комментарий: ${escapeHtml(request.adminComment || request.admin_comment)}</div>` : ""}
+      ${
+        isPending
+          ? `
+            <label class="field">
+              <span>Комментарий супер-админа</span>
+              <textarea rows="2" data-request-comment="${escapeHtml(request.id)}" placeholder="Необязательно"></textarea>
+            </label>
+            <div class="item-actions">
+              <button class="primary-button" type="button" data-approve-channel-request="${escapeHtml(request.id)}">Одобрить</button>
+              <button class="danger-button" type="button" data-reject-channel-request="${escapeHtml(request.id)}">Отклонить</button>
+            </div>
+          `
+          : ""
+      }
+    `;
+    return item;
+  }
+
   function renderPosts() {
     const list = $("#posts-list");
     list.innerHTML = "";
@@ -368,6 +424,17 @@
       return;
     }
     state.reports.forEach((report) => list.append(renderReportItem(report)));
+  }
+
+  function renderChannelRequests() {
+    const list = $("#channel-requests-list");
+    if (!list) return;
+    list.innerHTML = "";
+    if (!state.channelRequests.length) {
+      list.innerHTML = '<div class="empty">Заявок по выбранному фильтру нет.</div>';
+      return;
+    }
+    state.channelRequests.forEach((request) => list.append(renderChannelRequestItem(request)));
   }
 
   function renderAdminUserChannelOptions() {
@@ -485,6 +552,21 @@
     renderAdmins();
   }
 
+  async function loadChannelRequests() {
+    if (!isSuperAdmin()) {
+      state.channelRequests = [];
+      renderChannelRequests();
+      return;
+    }
+    const params = new URLSearchParams();
+    const statusSelect = $("#channel-requests-status");
+    if (statusSelect?.value) params.set("status", statusSelect.value);
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    const payload = await requestJson(`${state.apiBase}/channel-requests${suffix}`);
+    state.channelRequests = Array.isArray(payload.requests) ? payload.requests : [];
+    renderChannelRequests();
+  }
+
   async function loadAll() {
     try {
       await loadDashboard();
@@ -492,6 +574,7 @@
       await loadComments();
       await loadReports();
       await loadAdmins();
+      await loadChannelRequests();
       setNotice("");
     } catch (error) {
       if (error.status === 401) {
@@ -681,7 +764,31 @@
     const editAdmin = event.target.closest("[data-edit-admin]");
     const resetAdminPassword = event.target.closest("[data-reset-admin-password]");
     const toggleAdmin = event.target.closest("[data-toggle-admin]");
+    const approveChannelRequest = event.target.closest("[data-approve-channel-request]");
+    const rejectChannelRequest = event.target.closest("[data-reject-channel-request]");
     try {
+      if (approveChannelRequest) {
+        const requestId = approveChannelRequest.dataset.approveChannelRequest;
+        await requestJson(`${state.apiBase}/channel-requests/${encodeURIComponent(requestId)}/approve`, {
+          method: "POST",
+          body: JSON.stringify({ adminComment: requestCommentValue(requestId) }),
+        });
+        await loadAll();
+        setNotice("Заявка одобрена, канал подключён.");
+        setActiveTab("requests");
+        return;
+      }
+      if (rejectChannelRequest) {
+        const requestId = rejectChannelRequest.dataset.rejectChannelRequest;
+        await requestJson(`${state.apiBase}/channel-requests/${encodeURIComponent(requestId)}/reject`, {
+          method: "POST",
+          body: JSON.stringify({ adminComment: requestCommentValue(requestId) }),
+        });
+        await loadAll();
+        setNotice("Заявка отклонена.");
+        setActiveTab("requests");
+        return;
+      }
       if (removeChannel) {
         if (!window.confirm(`Удалить привязку канала ${removeChannel.dataset.removeChannel}?`)) return;
         await requestJson(`${state.apiBase}/channels/${encodeURIComponent(removeChannel.dataset.removeChannel)}`, {
@@ -790,6 +897,8 @@
     $("#comments-status").addEventListener("change", loadComments);
     $("#comments-post").addEventListener("change", loadComments);
     $("#reports-status").addEventListener("change", loadReports);
+    const channelRequestsStatus = $("#channel-requests-status");
+    if (channelRequestsStatus) channelRequestsStatus.addEventListener("change", loadChannelRequests);
     document.querySelector(".tabs").addEventListener("click", (event) => {
       const button = event.target.closest("[data-tab]");
       if (button) {
