@@ -9,6 +9,7 @@
   const LONG_PRESS_DELAY_MS = 500;
   const LONG_PRESS_MOVE_THRESHOLD_PX = 10;
   const TOUCH_CLICK_SUPPRESS_MS = 750;
+  const REACTION_EMOJIS = ["👍", "❤️", "😂", "🔥", "😮", "😢"];
   const LINKS_BLOCKED_MESSAGE = "Ссылки запрещены правилами сервиса.";
   const COMMENT_BLOCKED_CODE = "COMMENT_BLOCKED";
   const COMMENT_BLOCKED_TITLE = "Комментарий не опубликован";
@@ -53,6 +54,8 @@
     imageViewerIndex: 0,
     imagePress: null,
     commentPress: null,
+    reactionPickerCommentId: null,
+    reactionRequestCommentIds: new Set(),
     lastImageTouchOpenAt: 0,
     lastImageMenuOpenAt: 0,
   };
@@ -608,6 +611,233 @@
     });
   }
 
+  function canUseCommentReactions() {
+    return Boolean(state.currentUserId !== null && state.initData);
+  }
+
+  function isReactionRequestPending(commentId) {
+    return state.reactionRequestCommentIds.has(Number(commentId));
+  }
+
+  function normalizeCommentReactions(comment) {
+    const rawReactions = Array.isArray(comment && comment.reactions) ? comment.reactions : [];
+    const rawMyReaction = String((comment && (comment.myReaction || comment.my_reaction)) || "").trim();
+    const myReaction = REACTION_EMOJIS.indexOf(rawMyReaction) >= 0 ? rawMyReaction : null;
+    const reactions = [];
+    const seen = new Set();
+
+    rawReactions.forEach(function (item) {
+      const emoji = String((item && item.emoji) || "").trim();
+      const count = Number(item && item.count);
+      if (REACTION_EMOJIS.indexOf(emoji) < 0 || !(count > 0) || seen.has(emoji)) {
+        return;
+      }
+      seen.add(emoji);
+      reactions.push({
+        emoji: emoji,
+        count: Math.max(0, Math.floor(count)),
+        selected: myReaction ? emoji === myReaction : Boolean(item && item.selected),
+      });
+    });
+
+    reactions.sort(function (left, right) {
+      return REACTION_EMOJIS.indexOf(left.emoji) - REACTION_EMOJIS.indexOf(right.emoji);
+    });
+
+    return {
+      reactions: reactions,
+      myReaction: myReaction,
+    };
+  }
+
+  function renderCommentReactionBlock(commentId) {
+    const comment = getCommentById(commentId);
+    const node = getCommentNode(commentId);
+    if (!comment || !node) {
+      return;
+    }
+    renderCommentReactions(node.querySelector(".message__reactions"), comment);
+  }
+
+  function setReactionPickerComment(commentId) {
+    const normalizedCommentId = Number(commentId) || null;
+    const previousCommentId = state.reactionPickerCommentId;
+    if (previousCommentId === normalizedCommentId) {
+      return;
+    }
+    state.reactionPickerCommentId = normalizedCommentId;
+    if (previousCommentId !== null) {
+      renderCommentReactionBlock(previousCommentId);
+    }
+    if (normalizedCommentId !== null) {
+      renderCommentReactionBlock(normalizedCommentId);
+    }
+  }
+
+  function closeReactionPicker() {
+    if (state.reactionPickerCommentId === null) {
+      return;
+    }
+    setReactionPickerComment(null);
+  }
+
+  function applyCommentReactionUpdate(commentId, payload) {
+    const comment = getCommentById(commentId);
+    if (!comment) {
+      return;
+    }
+    comment.reactions = Array.isArray(payload && payload.reactions) ? payload.reactions : [];
+    const myReaction = String((payload && (payload.myReaction || payload.my_reaction)) || "").trim();
+    comment.myReaction = REACTION_EMOJIS.indexOf(myReaction) >= 0 ? myReaction : null;
+    comment.my_reaction = comment.myReaction;
+    renderCommentReactionBlock(commentId);
+  }
+
+  async function submitCommentReaction(commentId, emoji) {
+    const normalizedCommentId = Number(commentId);
+    if (!normalizedCommentId || REACTION_EMOJIS.indexOf(emoji) < 0) {
+      setBanner("Недопустимая реакция.", "error");
+      haptic("warning");
+      return;
+    }
+    if (!canUseCommentReactions()) {
+      setBanner("Откройте комментарии через MAX, чтобы ставить реакции.", "error");
+      haptic("warning");
+      return;
+    }
+    if (isReactionRequestPending(normalizedCommentId)) {
+      return;
+    }
+
+    state.reactionRequestCommentIds.add(normalizedCommentId);
+    renderCommentReactionBlock(normalizedCommentId);
+    try {
+      const result = await fetchJson(`/api/comments/${encodeURIComponent(normalizedCommentId)}/reaction`, {
+        method: "POST",
+        headers: buildApiHeaders({
+          "Content-Type": "application/json",
+        }),
+        body: JSON.stringify({
+          emoji: emoji,
+          initData: state.initData,
+        }),
+      });
+      applyCommentReactionUpdate(normalizedCommentId, result);
+      closeReactionPicker();
+      haptic("light");
+    } catch (error) {
+      setBanner(error.message || "Не удалось обновить реакцию.", "error");
+      haptic("warning");
+    } finally {
+      state.reactionRequestCommentIds.delete(normalizedCommentId);
+      renderCommentReactionBlock(normalizedCommentId);
+    }
+  }
+
+  function renderCommentReactions(container, comment) {
+    if (!container) {
+      return;
+    }
+
+    const normalizedCommentId = Number(comment && comment.id);
+    const reactionState = normalizeCommentReactions(comment);
+    const reactions = reactionState.reactions;
+    const myReaction = reactionState.myReaction;
+    const pickerOpen = state.reactionPickerCommentId === normalizedCommentId;
+    const canReact = canUseCommentReactions();
+    const reactionPending = isReactionRequestPending(normalizedCommentId);
+
+    container.innerHTML = "";
+
+    if (!normalizedCommentId || (!canReact && reactions.length === 0)) {
+      container.hidden = true;
+      return;
+    }
+
+    container.hidden = false;
+    const list = document.createElement("div");
+    list.className = "message__reaction-list";
+
+    reactions.forEach(function (item) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "message__reaction";
+      button.setAttribute("aria-pressed", item.selected ? "true" : "false");
+      button.disabled = !canReact || reactionPending;
+      if (item.selected) {
+        button.classList.add("message__reaction--selected");
+      }
+      button.setAttribute(
+        "aria-label",
+        item.selected
+          ? `Снять реакцию ${item.emoji}`
+          : `Поставить реакцию ${item.emoji}`
+      );
+      button.addEventListener("click", function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        submitCommentReaction(normalizedCommentId, item.emoji);
+      });
+
+      const emojiNode = document.createElement("span");
+      emojiNode.className = "message__reaction-emoji";
+      emojiNode.textContent = item.emoji;
+      const countNode = document.createElement("span");
+      countNode.className = "message__reaction-count";
+      countNode.textContent = String(item.count);
+      button.appendChild(emojiNode);
+      button.appendChild(countNode);
+      list.appendChild(button);
+    });
+
+    if (canReact) {
+      const addButton = document.createElement("button");
+      addButton.type = "button";
+      addButton.className = "message__reaction-add";
+      addButton.textContent = "＋";
+      addButton.disabled = reactionPending;
+      addButton.setAttribute("aria-label", "Выбрать реакцию");
+      addButton.setAttribute("aria-expanded", pickerOpen ? "true" : "false");
+      if (pickerOpen) {
+        addButton.classList.add("message__reaction-add--open");
+      }
+      addButton.addEventListener("click", function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (reactionPending) {
+          return;
+        }
+        setReactionPickerComment(pickerOpen ? null : normalizedCommentId);
+      });
+      list.appendChild(addButton);
+    }
+
+    container.appendChild(list);
+
+    if (pickerOpen && canReact) {
+      const picker = document.createElement("div");
+      picker.className = "message__reaction-picker";
+      REACTION_EMOJIS.forEach(function (emoji) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "message__reaction-picker-button";
+        button.textContent = emoji;
+        button.disabled = reactionPending;
+        button.setAttribute("aria-label", `Поставить реакцию ${emoji}`);
+        if (emoji === myReaction) {
+          button.classList.add("message__reaction-picker-button--selected");
+        }
+        button.addEventListener("click", function (event) {
+          event.preventDefault();
+          event.stopPropagation();
+          submitCommentReaction(normalizedCommentId, emoji);
+        });
+        picker.appendChild(button);
+      });
+      container.appendChild(picker);
+    }
+  }
+
   function isLongPressMovementExceeded(pressState, clientX, clientY) {
     if (!pressState) {
       return false;
@@ -1121,6 +1351,7 @@
     }
     node.querySelector(".message__author").textContent = "Лента комментариев";
     node.querySelector(".message__time").textContent = "Сейчас";
+    node.querySelector(".message__reactions").hidden = true;
     node.querySelector(".message__text").textContent =
       "Пока здесь тихо. Первое сообщение в этой ветке может быть вашим.";
     elements.list.appendChild(node);
@@ -1228,6 +1459,7 @@
       return;
     }
 
+    closeReactionPicker();
     state.contextMenuCommentId = Number(commentId);
     state.menuOpenedAt = Date.now();
     elements.commentMenuReply.hidden = !canReplyComment(comment);
@@ -1290,6 +1522,7 @@
     if (!canEditComment(comment)) {
       return;
     }
+    closeReactionPicker();
     cancelReplying();
     clearPhotoSelection();
     closeCommentMenu();
@@ -1307,6 +1540,7 @@
     if (!canReplyComment(comment)) {
       return;
     }
+    closeReactionPicker();
     if (state.editingCommentId !== null) {
       cancelEditing({ clearInput: false });
     }
@@ -1330,6 +1564,7 @@
     if (!canReportComment(comment)) {
       return;
     }
+    closeReactionPicker();
     closeCommentMenu();
     state.reportingCommentId = Number(commentId);
     elements.reportReason.value = "insult";
@@ -1469,7 +1704,7 @@
     }
 
     node.addEventListener("contextmenu", function (event) {
-      if (event.target.closest(".message__image-button")) {
+      if (event.target.closest(".message__image-button, .message__reactions")) {
         return;
       }
       event.preventDefault();
@@ -1517,6 +1752,15 @@
 
     clearBanner();
 
+    if (
+      state.reactionPickerCommentId !== null &&
+      !state.comments.some(function (comment) {
+        return Number(comment.id) === Number(state.reactionPickerCommentId);
+      })
+    ) {
+      state.reactionPickerCommentId = null;
+    }
+
     let currentDayKey = "";
     state.comments.forEach(function (comment) {
       const nextDayKey = getDateKey(comment.created_at);
@@ -1551,6 +1795,7 @@
       renderCommentMedia(mediaNode, comment.media, comment.id);
       textNode.textContent = comment.text || "";
       textNode.hidden = !comment.text;
+      renderCommentReactions(node.querySelector(".message__reactions"), comment);
       if (menuButton) {
         menuButton.hidden = true;
       }
@@ -1998,6 +2243,7 @@
     releaseImagePressState();
     releaseCommentPressState();
     state.stickToBottom = isListNearBottom();
+    closeReactionPicker();
     closeCommentMenu();
   }, { passive: true });
   elements.input.addEventListener("focus", function () {
@@ -2050,6 +2296,13 @@
     if (state.menuOpenedAt && Date.now() - state.menuOpenedAt < 250) {
       return;
     }
+    const clickTarget = event.target instanceof Element ? event.target : null;
+    if (
+      state.reactionPickerCommentId !== null &&
+      (!clickTarget || !clickTarget.closest(".message__reactions"))
+    ) {
+      closeReactionPicker();
+    }
     if (
       state.contextMenuCommentId !== null &&
       !elements.commentMenu.contains(event.target) &&
@@ -2071,6 +2324,10 @@
         showNextImage();
       }
       return;
+    }
+    if (event.key === "Escape" && state.reactionPickerCommentId !== null) {
+      event.preventDefault();
+      closeReactionPicker();
     }
   });
   elements.loadOlder.addEventListener("click", function () {

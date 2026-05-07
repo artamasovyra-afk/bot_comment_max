@@ -4,6 +4,15 @@ All notable changes to this project will be tracked here.
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-05-08
+
+### Added
+
+- Добавлены реакции эмодзи `👍 ❤️ 😂 🔥 😮 😢` на комментарии в WebApp.
+- Добавлена таблица `comment_reactions` с ограничением `UNIQUE(comment_id, user_id)`.
+- Добавлен endpoint `POST /api/comments/<comment_id>/reaction` для toggle/replace реакции текущего пользователя.
+- API комментариев теперь возвращает счётчики реакций и `myReaction` для текущего пользователя.
+
 ## [0.1.16] - 2026-05-08
 
 ### Fixed

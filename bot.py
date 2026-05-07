@@ -79,6 +79,7 @@ COMMENT_BLOCKED_MESSAGE = "Комментарий содержит запрещ�
 REPORT_CREATED_MESSAGE = "Жалоба отправлена. Администратор канала проверит комментарий."
 REPORT_ALREADY_EXISTS_MESSAGE = "Вы уже отправляли жалобу на этот комментарий."
 COMMENT_NOT_FOUND_MESSAGE = "Комментарий не найден."
+INVALID_REACTION_MESSAGE = "Недопустимая реакция."
 ACCESS_DENIED_MESSAGE = "У вас нет прав для управления этим каналом."
 ADMIN_LOGIN_ACCESS_DENIED_MESSAGE = "У вас нет прав для входа в админку."
 INVALID_CREDENTIALS_MESSAGE = "Неверный логин или пароль."
@@ -92,6 +93,8 @@ COMMENT_STATUS_ACTIVE = "active"
 COMMENT_STATUS_DELETED = "deleted"
 COMMENT_STATUS_HIDDEN = "hidden"
 COMMENT_STATUSES = {COMMENT_STATUS_ACTIVE, COMMENT_STATUS_DELETED, COMMENT_STATUS_HIDDEN}
+ALLOWED_COMMENT_REACTIONS = ["👍", "❤️", "😂", "🔥", "😮", "😢"]
+ALLOWED_COMMENT_REACTION_SET = frozenset(ALLOWED_COMMENT_REACTIONS)
 REPORT_REASONS = {"insult", "profanity", "threat", "spam", "hate", "other"}
 REPORT_STATUSES = {"new", "in_review", "accepted", "rejected"}
 CHANNEL_REQUEST_STATUS_PENDING = "pending"
@@ -353,6 +356,7 @@ def humanize_comment_error_message(message: str) -> str:
         "Comment is too long": "Комментарий слишком длинный. Максимум 4000 символов.",
         "Links are not allowed in comments": "Ссылки запрещены правилами сервиса.",
         COMMENT_BLOCKED_CODE: COMMENT_BLOCKED_MESSAGE,
+        "INVALID_REACTION": INVALID_REACTION_MESSAGE,
         "Channel is not connected": "Этот канал не подключён к боту. Добавьте его через `/channel_add CHANNEL_ID COMMENTS_CHAT_ID`.",
         "Comments chat is not configured for this post": "Для этого поста не найден чат комментариев.",
         "You can edit only your own comments": "Можно редактировать только свои комментарии.",
@@ -1021,6 +1025,17 @@ class CommentStore:
                     FOREIGN KEY(last_read_comment_id) REFERENCES comments(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS comment_reactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    comment_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    emoji TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(comment_id, user_id),
+                    FOREIGN KEY(comment_id) REFERENCES comments(id)
+                );
+
                 CREATE TABLE IF NOT EXISTS pending_channel_bindings (
                     bind_code TEXT PRIMARY KEY,
                     requested_by_user_id INTEGER NOT NULL,
@@ -1196,6 +1211,14 @@ class CommentStore:
                 ON comment_read_state(user_id, post_id);
             CREATE INDEX IF NOT EXISTS idx_comment_read_state_post
                 ON comment_read_state(post_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_comment_reactions_comment_user
+                ON comment_reactions(comment_id, user_id);
+            CREATE INDEX IF NOT EXISTS idx_comment_reactions_comment_id
+                ON comment_reactions(comment_id);
+            CREATE INDEX IF NOT EXISTS idx_comment_reactions_user_id
+                ON comment_reactions(user_id);
+            CREATE INDEX IF NOT EXISTS idx_comment_reactions_emoji
+                ON comment_reactions(emoji);
             CREATE INDEX IF NOT EXISTS idx_comment_reports_channel_status
                 ON comment_reports(channel_id, status, created_at);
             CREATE INDEX IF NOT EXISTS idx_comment_reports_comment_id
@@ -2209,6 +2232,154 @@ class CommentStore:
                 "SELECT * FROM comments WHERE id = ?",
                 (comment_id,),
             ).fetchone()
+
+    def build_comment_reaction_payload(
+        self,
+        *,
+        counts_by_emoji: dict[str, int] | None = None,
+        my_reaction: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_my_reaction = safe_text(my_reaction) or None
+        if normalized_my_reaction not in ALLOWED_COMMENT_REACTION_SET:
+            normalized_my_reaction = None
+        reaction_counts = counts_by_emoji or {}
+        reactions = []
+        for emoji in ALLOWED_COMMENT_REACTIONS:
+            count = int(reaction_counts.get(emoji) or 0)
+            if count <= 0:
+                continue
+            reactions.append(
+                {
+                    "emoji": emoji,
+                    "count": count,
+                    "selected": emoji == normalized_my_reaction,
+                }
+            )
+        return {
+            "myReaction": normalized_my_reaction,
+            "my_reaction": normalized_my_reaction,
+            "reactions": reactions,
+        }
+
+    def list_comment_reaction_summaries(
+        self,
+        comment_ids: list[int],
+        *,
+        viewer_user_id: int | None = None,
+    ) -> dict[int, dict[str, Any]]:
+        normalized_ids = sorted({int(comment_id) for comment_id in comment_ids if comment_id is not None})
+        if not normalized_ids:
+            return {}
+
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        with self.lock:
+            count_rows = self.conn.execute(
+                f"""
+                SELECT comment_id, emoji, COUNT(*) AS count
+                FROM comment_reactions
+                WHERE comment_id IN ({placeholders})
+                GROUP BY comment_id, emoji
+                """,
+                tuple(normalized_ids),
+            ).fetchall()
+
+            viewer_rows: list[sqlite3.Row] = []
+            if viewer_user_id is not None:
+                viewer_rows = self.conn.execute(
+                    f"""
+                    SELECT comment_id, emoji
+                    FROM comment_reactions
+                    WHERE user_id = ? AND comment_id IN ({placeholders})
+                    """,
+                    tuple([int(viewer_user_id)] + normalized_ids),
+                ).fetchall()
+
+        counts_map: dict[int, dict[str, int]] = {
+            int(comment_id): {} for comment_id in normalized_ids
+        }
+        for row in count_rows:
+            comment_id = int(row["comment_id"])
+            emoji = safe_text(row["emoji"])
+            if emoji not in ALLOWED_COMMENT_REACTION_SET:
+                continue
+            counts_map.setdefault(comment_id, {})[emoji] = int(row["count"] or 0)
+
+        my_reactions = {
+            int(row["comment_id"]): (
+                safe_text(row["emoji"]) if safe_text(row["emoji"]) in ALLOWED_COMMENT_REACTION_SET else None
+            )
+            for row in viewer_rows
+        }
+
+        return {
+            comment_id: self.build_comment_reaction_payload(
+                counts_by_emoji=counts_map.get(comment_id),
+                my_reaction=my_reactions.get(comment_id),
+            )
+            for comment_id in normalized_ids
+        }
+
+    def toggle_comment_reaction(
+        self,
+        *,
+        comment_id: int,
+        user_id: int,
+        emoji: str,
+    ) -> dict[str, Any]:
+        normalized_emoji = safe_text(emoji)
+        now = utc_now()
+        with self.lock:
+            existing = self.conn.execute(
+                """
+                SELECT id, emoji
+                FROM comment_reactions
+                WHERE comment_id = ? AND user_id = ?
+                """,
+                (int(comment_id), int(user_id)),
+            ).fetchone()
+            if existing is None:
+                self.conn.execute(
+                    """
+                    INSERT INTO comment_reactions (
+                        comment_id,
+                        user_id,
+                        emoji,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(comment_id),
+                        int(user_id),
+                        normalized_emoji,
+                        now,
+                        now,
+                    ),
+                )
+            elif safe_text(existing["emoji"]) == normalized_emoji:
+                self.conn.execute(
+                    "DELETE FROM comment_reactions WHERE id = ?",
+                    (int(existing["id"]),),
+                )
+            else:
+                self.conn.execute(
+                    """
+                    UPDATE comment_reactions
+                    SET emoji = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        normalized_emoji,
+                        now,
+                        int(existing["id"]),
+                    ),
+                )
+            self.conn.commit()
+        return self.list_comment_reaction_summaries(
+            [int(comment_id)],
+            viewer_user_id=int(user_id),
+        ).get(int(comment_id), self.build_comment_reaction_payload())
 
     def set_comment_discussion_copy_message_id(
         self,
@@ -6510,6 +6681,41 @@ class MaxCommentsBot:
             "message": REPORT_CREATED_MESSAGE,
         }
 
+    def set_comment_reaction_from_webapp(
+        self,
+        *,
+        comment_id: int,
+        init_data: str,
+        emoji: str,
+    ) -> dict[str, Any]:
+        auth_user = self.authenticate_webapp_user(init_data)
+        normalized_emoji = safe_text(emoji)
+        if normalized_emoji not in ALLOWED_COMMENT_REACTION_SET:
+            raise MaxApiError("INVALID_REACTION")
+
+        comment = self.store.get_comment(comment_id)
+        if comment is None:
+            raise MaxApiError("Comment not found")
+        if safe_text(comment["status"] if "status" in comment.keys() else COMMENT_STATUS_ACTIVE) != COMMENT_STATUS_ACTIVE:
+            raise MaxApiError("Comment not found")
+        post = self.store.get_post(comment["post_message_id"])
+        if post is None or safe_text(post["status"] if "status" in post.keys() else "published") != "published":
+            raise MaxApiError("Comment not found")
+
+        reaction_summary = self.store.toggle_comment_reaction(
+            comment_id=int(comment_id),
+            user_id=auth_user.user_id,
+            emoji=normalized_emoji,
+        )
+        return {
+            "ok": True,
+            "commentId": int(comment_id),
+            "comment_id": int(comment_id),
+            "myReaction": reaction_summary.get("myReaction"),
+            "my_reaction": reaction_summary.get("my_reaction"),
+            "reactions": reaction_summary.get("reactions") or [],
+        }
+
     def admin_list_reports(
         self,
         context: AdminContext,
@@ -6729,6 +6935,10 @@ class MaxCommentsBot:
             limit=normalized_limit,
             before_comment_id=before_comment_id,
         )
+        reaction_summaries = self.store.list_comment_reaction_summaries(
+            [int(row["id"]) for row in rows],
+            viewer_user_id=viewer.user_id if viewer is not None else None,
+        )
         parent_ids = [
             int(row["parent_comment_id"])
             for row in rows
@@ -6741,6 +6951,7 @@ class MaxCommentsBot:
                 parent_comment=parent_rows.get(int(row["parent_comment_id"]))
                 if row["parent_comment_id"] is not None
                 else None,
+                reaction_summary=reaction_summaries.get(int(row["id"])),
             )
             for row in rows
         ]
@@ -7041,7 +7252,25 @@ class MaxCommentsBot:
         *,
         comment_id_override: int | None = None,
         parent_comment: sqlite3.Row | None = None,
+        reaction_summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        reaction_payload = reaction_summary if isinstance(reaction_summary, dict) else {}
+        normalized_my_reaction = (
+            safe_text(reaction_payload.get("myReaction") or reaction_payload.get("my_reaction")) or None
+        )
+        if normalized_my_reaction not in ALLOWED_COMMENT_REACTION_SET:
+            normalized_my_reaction = None
+        reactions = [
+            {
+                "emoji": safe_text(item.get("emoji")),
+                "count": int(item.get("count") or 0),
+                "selected": bool(item.get("selected")),
+            }
+            for item in (reaction_payload.get("reactions") or [])
+            if isinstance(item, dict)
+            and safe_text(item.get("emoji")) in ALLOWED_COMMENT_REACTION_SET
+            and int(item.get("count") or 0) > 0
+        ]
         return {
             "id": comment_id_override or int(comment["id"]),
             "post_message_id": comment["post_message_id"],
@@ -7055,6 +7284,9 @@ class MaxCommentsBot:
             "parent_comment": self.serialize_parent_comment(parent_comment),
             "source_kind": comment["source_kind"],
             "status": safe_text(comment["status"] if "status" in comment.keys() else COMMENT_STATUS_ACTIVE),
+            "reactions": reactions,
+            "myReaction": normalized_my_reaction,
+            "my_reaction": normalized_my_reaction,
             "created_at": comment["created_at"],
         }
 
@@ -7255,6 +7487,9 @@ class CommentWebServer:
                     return
                 if path.startswith("/api/admin/"):
                     self.handle_admin_post(path)
+                    return
+                if path.startswith("/api/comments/") and path.endswith("/reaction"):
+                    self.handle_comment_reaction(path)
                     return
                 if path.startswith("/api/comments/") and path.endswith("/report"):
                     self.handle_report_comment(path)
@@ -8168,6 +8403,64 @@ class CommentWebServer:
                     )
                     return
                 self.send_json(HTTPStatus.CREATED, result)
+
+            def handle_comment_reaction(self, path: str) -> None:
+                raw_comment_id = path.removeprefix("/api/comments/").removesuffix("/reaction").strip("/")
+                try:
+                    comment_id = int(parse.unquote(raw_comment_id))
+                except ValueError:
+                    self.send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"ok": False, "error": "INVALID_COMMENT_ID", "message": COMMENT_NOT_FOUND_MESSAGE},
+                    )
+                    return
+                payload = self.read_json_body()
+                if payload is None:
+                    return
+                try:
+                    result = app.set_comment_reaction_from_webapp(
+                        comment_id=comment_id,
+                        init_data=safe_text(payload.get("initData")) or self.read_init_data_header(),
+                        emoji=safe_text(payload.get("emoji")),
+                    )
+                except WebAppAuthError as exc:
+                    self.send_json(
+                        HTTPStatus.UNAUTHORIZED,
+                        {"ok": False, "error": "UNAUTHORIZED", "message": str(exc)},
+                    )
+                    return
+                except MaxApiError as exc:
+                    error_code = safe_text(str(exc))
+                    if error_code == "INVALID_REACTION":
+                        self.send_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {
+                                "ok": False,
+                                "error": "INVALID_REACTION",
+                                "message": INVALID_REACTION_MESSAGE,
+                            },
+                        )
+                        return
+                    if error_code == "Comment not found":
+                        self.send_json(
+                            HTTPStatus.NOT_FOUND,
+                            {
+                                "ok": False,
+                                "error": "COMMENT_NOT_FOUND",
+                                "message": COMMENT_NOT_FOUND_MESSAGE,
+                            },
+                        )
+                        return
+                    self.send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "ok": False,
+                            "error": error_code or "REACTION_ERROR",
+                            "message": humanize_comment_error_message(error_code),
+                        },
+                    )
+                    return
+                self.send_json(HTTPStatus.OK, result)
 
             def handle_delete_comment(self, path: str) -> None:
                 reference, suffix = self.extract_post_reference(path)
