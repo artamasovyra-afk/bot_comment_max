@@ -2977,16 +2977,14 @@ class MaxCommentsBot:
         return safe_text(body.get("payload") or body.get("text"))
 
     def terms_links_text(self) -> str:
-        base_url = public_app_url()
-        if base_url != "/":
-            base_url = base_url.rstrip("/")
-        else:
-            base_url = ""
         return "\n".join(
             [
-                f"- Инструкция по подключению: {base_url}/#connect",
-                f"- Правила использования: {base_url}/#rules",
-                f"- Политика обработки данных: {base_url}/#privacy",
+                "1) Типовое пользовательское соглашение для приложений на платформе «МАКС» "
+                "https://dev.max.ru/docs/legal/agreement",
+                "2) Пользовательское соглашение и политика конфиденциальности сервиса «МАКС» "
+                "https://legal.max.ru/ps",
+                "3) Публичная оферта бота ЦИТ",
+                "4) Политика Конфиденциальности И Политика Cookie бота ЦИТ",
             ]
         )
 
@@ -2994,21 +2992,18 @@ class MaxCommentsBot:
         self.api.send_message(
             user_id=user_id,
             text=(
-                "Здравствуйте!\n\n"
-                "Этот бот позволяет подключить комментарии к постам вашего канала в MAX.\n\n"
-                "После подключения под постами канала будет появляться кнопка “Комментарии”. "
-                "Пользователи смогут открывать обсуждение поста, оставлять комментарии, "
-                "а администратор канала сможет модерировать комментарии и жалобы через панель управления.\n\n"
-                "Перед подключением ознакомьтесь с условиями использования и инструкцией.\n\n"
-                "Ссылки:\n"
+                "Это бот ЦИТ 😉\n"
+                "Он поможет вам сделать комментарии под постами!\n\n"
+                "Мы с уважением относимся к правилам МАКС. Перед использованием бота, пожалуйста, "
+                "ознакомьтесь с материалами ниже и нажмите \"Принять\" если согласны с ними:\n"
                 f"{self.terms_links_text()}\n\n"
-                "Нажмите кнопку ниже, чтобы продолжить."
+                "Большое спасибо ❤️"
             ),
             attachments=self.build_link_keyboard(
                 [
                     {
                         "type": "message",
-                        "text": "Принять и продолжить",
+                        "text": "Принять",
                         "payload": "/accept_terms",
                     }
                 ]
@@ -3032,21 +3027,12 @@ class MaxCommentsBot:
 
     def accept_terms_for_user(self, user_id: int) -> None:
         self.store.accept_terms(max_user_id=user_id, version=TERMS_VERSION)
-        self.api.send_message(
-            user_id=user_id,
-            text="Спасибо. Условия приняты.\n\n" + self.connection_instruction_text(),
-        )
+        self.api.send_message(user_id=user_id, text=self.connection_instruction_text())
 
     def ensure_user_accepted_terms(self, user_id: int) -> bool:
         if self.store.has_accepted_terms(max_user_id=user_id, version=TERMS_VERSION):
             return True
-        self.api.send_message(
-            user_id=user_id,
-            text=(
-                "Перед подключением канала необходимо принять условия использования. "
-                "Нажмите “Начать” и кнопку “Принять и продолжить”."
-            ),
-        )
+        self.send_terms_welcome(user_id)
         return False
 
     def nested_payload_value(self, payload: Any, *keys: str) -> Any:
@@ -3308,7 +3294,7 @@ class MaxCommentsBot:
             self.handle_command(message, text)
             return
 
-        if text in {"Принять и продолжить", "accept_terms", "/accept_terms"}:
+        if text in {"Принять", "Принять и продолжить", "accept_terms", "/accept_terms"}:
             self.accept_terms_for_user(int(user_id))
             return
 
