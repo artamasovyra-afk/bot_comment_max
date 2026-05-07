@@ -36,6 +36,12 @@
     stickToBottom: true,
     bottomScrollFrameId: 0,
     bottomScrollTimeoutIds: [],
+    initialTargetScrollDone: false,
+    targetHighlightTimeoutId: 0,
+    readState: null,
+    targetCommentId: null,
+    hasUnread: false,
+    markReadInFlight: false,
     contextMenuCommentId: null,
     menuOpenedAt: 0,
     reportingCommentId: null,
@@ -524,6 +530,118 @@
     return Number(comments[comments.length - 1].id) || null;
   }
 
+  function getCommentNode(commentId) {
+    const id = Number(commentId);
+    if (!id) {
+      return null;
+    }
+    return elements.list.querySelector(`[data-comment-id="${id}"]`);
+  }
+
+  function getLastCommentNode() {
+    const nodes = elements.list.querySelectorAll("[data-comment-id]");
+    return nodes.length ? nodes[nodes.length - 1] : null;
+  }
+
+  function highlightCommentNode(node) {
+    if (!node) {
+      return;
+    }
+    if (state.targetHighlightTimeoutId) {
+      window.clearTimeout(state.targetHighlightTimeoutId);
+      state.targetHighlightTimeoutId = 0;
+    }
+    node.classList.add("message--target-highlight");
+    state.targetHighlightTimeoutId = window.setTimeout(function () {
+      node.classList.remove("message--target-highlight");
+      state.targetHighlightTimeoutId = 0;
+    }, 1800);
+  }
+
+  function scrollToComment(commentId, options) {
+    const highlight = Boolean(options && options.highlight);
+    clearScheduledBottomScroll();
+    requestAnimationFrame(function () {
+      const targetNode = getCommentNode(commentId) || getLastCommentNode();
+      if (!targetNode) {
+        return;
+      }
+      targetNode.scrollIntoView({
+        block: "center",
+        behavior: "auto",
+      });
+      state.stickToBottom = isListNearBottom();
+      if (highlight) {
+        highlightCommentNode(targetNode);
+      }
+    });
+  }
+
+  function updateLocalReadState(commentId) {
+    const id = Number(commentId);
+    if (!id) {
+      return;
+    }
+    const currentReadId = state.readState && state.readState.lastReadCommentId
+      ? Number(state.readState.lastReadCommentId)
+      : null;
+    if (currentReadId !== null && currentReadId >= id) {
+      return;
+    }
+    state.readState = Object.assign({}, state.readState || {}, {
+      lastReadCommentId: id,
+      last_read_comment_id: id,
+    });
+    state.hasUnread = false;
+  }
+
+  async function markCommentsRead(commentId) {
+    const id = Number(commentId);
+    if (!id || !state.postRef || !state.initData || state.markReadInFlight) {
+      return;
+    }
+    const currentReadId = state.readState && state.readState.lastReadCommentId
+      ? Number(state.readState.lastReadCommentId)
+      : null;
+    if (currentReadId !== null && currentReadId >= id) {
+      return;
+    }
+
+    state.markReadInFlight = true;
+    try {
+      const payload = await fetchJson(`/api/posts/${encodeURIComponent(state.postRef)}/comments/read`, {
+        method: "POST",
+        headers: buildApiHeaders({
+          "Content-Type": "application/json",
+        }),
+        body: JSON.stringify({
+          lastReadCommentId: id,
+          initData: state.initData,
+        }),
+      });
+      const nextReadState = payload && payload.readState ? payload.readState : null;
+      if (nextReadState && nextReadState.lastReadCommentId) {
+        updateLocalReadState(nextReadState.lastReadCommentId);
+      } else {
+        updateLocalReadState(id);
+      }
+    } catch (error) {
+      console.warn("Failed to mark comments as read:", error);
+    } finally {
+      state.markReadInFlight = false;
+    }
+  }
+
+  function scheduleMarkCommentsRead(commentId) {
+    const id = Number(commentId);
+    if (!id) {
+      return;
+    }
+    window.setTimeout(function () {
+      markCommentsRead(id);
+    }, 280);
+  }
+
   function isListNearBottom() {
     const remaining = elements.list.scrollHeight - elements.list.scrollTop - elements.list.clientHeight;
     return remaining <= AUTO_REFRESH_NEAR_BOTTOM_PX;
@@ -564,6 +682,11 @@
       if (payload.viewer.user_id) {
         state.currentUserId = Number(payload.viewer.user_id);
       }
+    }
+    if (!loadOlder) {
+      state.readState = payload.readState || payload.read_state || state.readState;
+      state.targetCommentId = Number(payload.targetCommentId || payload.target_comment_id) || null;
+      state.hasUnread = Boolean(payload.hasUnread || payload.has_unread);
     }
 
     renderPost(payload.post);
@@ -905,6 +1028,8 @@
   function renderComments(options) {
     const preserveScroll = Boolean(options && options.preserveScroll);
     const preserveViewport = Boolean(options && options.preserveViewport);
+    const targetCommentId = Number(options && options.targetCommentId) || null;
+    const highlightTarget = Boolean(options && options.highlightTarget);
     const previousHeight = preserveScroll ? elements.list.scrollHeight : 0;
     const previousTop = preserveScroll ? elements.list.scrollTop : 0;
     const stableTop = preserveViewport ? elements.list.scrollTop : 0;
@@ -982,6 +1107,8 @@
       restoreScrollAfterPrepend(previousHeight, previousTop);
     } else if (preserveViewport) {
       restoreScrollPosition(stableTop);
+    } else if (targetCommentId !== null) {
+      scrollToComment(targetCommentId, { highlight: highlightTarget });
     } else {
       scrollCommentsToBottom();
     }
@@ -1037,6 +1164,13 @@
     const nextLastId = getLastCommentId(incomingComments);
     const previousUpdatedAt = state.post ? String(state.post.updated_at || "") : "";
     const nextUpdatedAt = payload.post ? String(payload.post.updated_at || "") : "";
+    const targetCommentId = Number(payload.targetCommentId || payload.target_comment_id) || null;
+    const shouldUseInitialTarget = Boolean(
+      targetCommentId &&
+      !loadOlder &&
+      !mergeLatest &&
+      !state.initialTargetScrollDone
+    );
 
     if (
       silent &&
@@ -1049,7 +1183,18 @@
     }
 
     applyThreadPayload(payload, { loadOlder, mergeLatest });
-    renderComments({ preserveScroll: loadOlder, preserveViewport });
+    renderComments({
+      preserveScroll: loadOlder,
+      preserveViewport,
+      targetCommentId: shouldUseInitialTarget ? targetCommentId : null,
+      highlightTarget: shouldUseInitialTarget && Boolean(payload.hasUnread || payload.has_unread),
+    });
+    if (shouldUseInitialTarget) {
+      state.initialTargetScrollDone = true;
+      scheduleMarkCommentsRead(getLastCommentId(state.comments));
+    } else if (!loadOlder && !preserveViewport && state.stickToBottom) {
+      scheduleMarkCommentsRead(getLastCommentId(state.comments));
+    }
     return true;
   }
 

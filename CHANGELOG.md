@@ -4,6 +4,18 @@ All notable changes to this project will be tracked here.
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-05-07
+
+### Added
+
+- Добавлена таблица `comment_read_state` для хранения состояния прочтения комментариев отдельно по пользователю и посту.
+- `GET /api/posts/<post_ref>/comments` теперь возвращает `readState`, `targetCommentId` и `hasUnread`.
+- Добавлен endpoint `POST /api/posts/<post_ref>/comments/read` для обновления статуса прочтения.
+
+### Changed
+
+- WebApp комментариев при первом открытии прокручивается к последнему непрочитанному комментарию, а если непрочитанных нет — к последнему комментарию.
+
 ## [0.1.11] - 2026-05-07
 
 ### Changed

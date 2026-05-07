@@ -1008,6 +1008,19 @@ class CommentStore:
                     FOREIGN KEY(post_message_id) REFERENCES posts(post_message_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS comment_read_state (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    post_id TEXT NOT NULL,
+                    last_read_comment_id INTEGER,
+                    last_read_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(user_id, post_id),
+                    FOREIGN KEY(post_id) REFERENCES posts(post_message_id),
+                    FOREIGN KEY(last_read_comment_id) REFERENCES comments(id)
+                );
+
                 CREATE TABLE IF NOT EXISTS pending_channel_bindings (
                     bind_code TEXT PRIMARY KEY,
                     requested_by_user_id INTEGER NOT NULL,
@@ -1179,6 +1192,10 @@ class CommentStore:
                 ON posts(channel_chat_id, status, created_at);
             CREATE INDEX IF NOT EXISTS idx_comments_post_status
                 ON comments(post_message_id, status, id);
+            CREATE INDEX IF NOT EXISTS idx_comment_read_state_user_post
+                ON comment_read_state(user_id, post_id);
+            CREATE INDEX IF NOT EXISTS idx_comment_read_state_post
+                ON comment_read_state(post_id);
             CREATE INDEX IF NOT EXISTS idx_comment_reports_channel_status
                 ON comment_reports(channel_id, status, created_at);
             CREATE INDEX IF NOT EXISTS idx_comment_reports_comment_id
@@ -2113,6 +2130,78 @@ class CommentStore:
             rows = rows[:limit]
         rows = list(reversed(rows))
         return rows, has_more
+
+    def get_latest_active_comment_id(self, post_message_id: str) -> int | None:
+        with self.lock:
+            row = self.conn.execute(
+                """
+                SELECT id
+                FROM comments
+                WHERE post_message_id = ? AND status = 'active'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (post_message_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return int(row["id"])
+
+    def get_comment_read_state(self, *, user_id: int, post_message_id: str) -> sqlite3.Row | None:
+        with self.lock:
+            return self.conn.execute(
+                """
+                SELECT *
+                FROM comment_read_state
+                WHERE user_id = ? AND post_id = ?
+                """,
+                (int(user_id), post_message_id),
+            ).fetchone()
+
+    def upsert_comment_read_state(
+        self,
+        *,
+        user_id: int,
+        post_message_id: str,
+        last_read_comment_id: int,
+    ) -> sqlite3.Row:
+        now = utc_now()
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO comment_read_state (
+                    user_id,
+                    post_id,
+                    last_read_comment_id,
+                    last_read_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, post_id) DO UPDATE SET
+                    last_read_comment_id = CASE
+                        WHEN comment_read_state.last_read_comment_id IS NULL
+                          OR excluded.last_read_comment_id > comment_read_state.last_read_comment_id
+                        THEN excluded.last_read_comment_id
+                        ELSE comment_read_state.last_read_comment_id
+                    END,
+                    last_read_at = excluded.last_read_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    int(user_id),
+                    post_message_id,
+                    int(last_read_comment_id),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            self.conn.commit()
+            row = self.get_comment_read_state(user_id=user_id, post_message_id=post_message_id)
+        if row is None:
+            raise RuntimeError("comment read state was not saved")
+        return row
 
     def get_comment(self, comment_id: int) -> sqlite3.Row | None:
         with self.lock:
@@ -6538,12 +6627,24 @@ class MaxCommentsBot:
         init_data: str,
         post: sqlite3.Row | None = None,
     ) -> dict[str, Any] | None:
+        viewer = self.authenticate_optional_webapp_user(init_data)
+        return self.build_viewer_payload_for_user(viewer, post=post)
+
+    def authenticate_optional_webapp_user(self, init_data: str) -> AuthenticatedWebAppUser | None:
         clean_init_data = safe_text(init_data)
         if not clean_init_data:
             return None
         try:
-            viewer = self.authenticate_webapp_user(clean_init_data)
+            return self.authenticate_webapp_user(clean_init_data)
         except WebAppAuthError:
+            return None
+
+    def build_viewer_payload_for_user(
+        self,
+        viewer: AuthenticatedWebAppUser | None,
+        post: sqlite3.Row | None = None,
+    ) -> dict[str, Any] | None:
+        if viewer is None:
             return None
         admin_context = self.admin_context_for_user(viewer.user_id)
         can_admin_current_post = False
@@ -6562,6 +6663,40 @@ class MaxCommentsBot:
             "username": viewer.username,
             "is_admin": can_admin_current_post,
             "role": admin_context.role if admin_context else ROLE_USER,
+        }
+
+    def comment_read_payload(
+        self,
+        *,
+        post_message_id: str,
+        viewer: AuthenticatedWebAppUser | None,
+    ) -> dict[str, Any]:
+        latest_comment_id = self.store.get_latest_active_comment_id(post_message_id)
+        last_read_comment_id = None
+        if viewer is not None:
+            read_state = self.store.get_comment_read_state(
+                user_id=viewer.user_id,
+                post_message_id=post_message_id,
+            )
+            if read_state is not None and read_state["last_read_comment_id"] is not None:
+                last_read_comment_id = int(read_state["last_read_comment_id"])
+        has_unread = bool(
+            viewer is not None
+            and latest_comment_id is not None
+            and (
+                last_read_comment_id is None
+                or int(last_read_comment_id) < int(latest_comment_id)
+            )
+        )
+        return {
+            "readState": {
+                "lastReadCommentId": last_read_comment_id,
+                "last_read_comment_id": last_read_comment_id,
+            },
+            "targetCommentId": latest_comment_id,
+            "target_comment_id": latest_comment_id,
+            "hasUnread": has_unread,
+            "has_unread": has_unread,
         }
 
     def get_post_payload(self, reference: str) -> dict[str, Any]:
@@ -6587,6 +6722,7 @@ class MaxCommentsBot:
             raise MaxApiError("Post not found")
         if safe_text(post["status"] if "status" in post.keys() else "published") != "published":
             raise MaxApiError("Post not found")
+        viewer = self.authenticate_optional_webapp_user(viewer_init_data)
         normalized_limit = normalize_comments_page_limit(limit)
         rows, has_more = self.store.list_comments_page(
             post["post_message_id"],
@@ -6609,7 +6745,7 @@ class MaxCommentsBot:
             for row in rows
         ]
         oldest_comment_id = comments[0]["id"] if comments else None
-        return {
+        payload = {
             "post": self.serialize_post(post),
             "comments": comments,
             "page": {
@@ -6618,8 +6754,15 @@ class MaxCommentsBot:
                 "oldest_comment_id": oldest_comment_id,
                 "before_comment_id": before_comment_id,
             },
-            "viewer": self.build_viewer_payload(viewer_init_data, post=post),
+            "viewer": self.build_viewer_payload_for_user(viewer, post=post),
         }
+        payload.update(
+            self.comment_read_payload(
+                post_message_id=post["post_message_id"],
+                viewer=viewer,
+            )
+        )
+        return payload
 
     def create_comment_from_webapp(
         self,
@@ -6656,10 +6799,62 @@ class MaxCommentsBot:
             source_kind="webapp",
             source_message_id=None,
         )
+        self.store.upsert_comment_read_state(
+            user_id=auth_user.user_id,
+            post_message_id=post["post_message_id"],
+            last_read_comment_id=int(comment["id"]),
+        )
         return {
             "ok": True,
             "comment": comment,
             "post": self.serialize_post(post),
+        }
+
+    def mark_comments_read_from_webapp(
+        self,
+        *,
+        reference: str,
+        last_read_comment_id: Any,
+        init_data: str,
+    ) -> dict[str, Any]:
+        auth_user = self.authenticate_webapp_user(init_data)
+        post = self.resolve_post_reference(reference)
+        if post is None:
+            raise MaxApiError("Post not found")
+        if safe_text(post["status"] if "status" in post.keys() else "published") != "published":
+            raise MaxApiError("Post not found")
+        normalized_comment_id = validate_positive_int(
+            last_read_comment_id,
+            minimum=1,
+            maximum=2_000_000_000,
+        )
+        if normalized_comment_id is None:
+            raise MaxApiError("Comment not found")
+
+        comment = self.store.get_comment(normalized_comment_id)
+        if (
+            comment is None
+            or safe_text(comment["post_message_id"]) != safe_text(post["post_message_id"])
+            or safe_text(comment["status"] if "status" in comment.keys() else COMMENT_STATUS_ACTIVE) != COMMENT_STATUS_ACTIVE
+        ):
+            raise MaxApiError("Comment not found")
+
+        read_state = self.store.upsert_comment_read_state(
+            user_id=auth_user.user_id,
+            post_message_id=post["post_message_id"],
+            last_read_comment_id=normalized_comment_id,
+        )
+        last_read_id = (
+            int(read_state["last_read_comment_id"])
+            if read_state["last_read_comment_id"] is not None
+            else None
+        )
+        return {
+            "ok": True,
+            "readState": {
+                "lastReadCommentId": last_read_id,
+                "last_read_comment_id": last_read_id,
+            },
         }
 
     def delete_comment_from_webapp(
@@ -7051,6 +7246,9 @@ class CommentWebServer:
                 if path.startswith("/api/comments/") and path.endswith("/report"):
                     self.handle_report_comment(path)
                     return
+                if path.startswith("/api/posts/") and path.endswith("/comments/read"):
+                    self.handle_mark_comments_read(path)
+                    return
                 if path.startswith("/api/posts/") and path.endswith("/comments"):
                     self.handle_create_comment(path)
                     return
@@ -7292,6 +7490,36 @@ class CommentWebServer:
                     return
 
                 self.send_json(HTTPStatus.CREATED, result)
+
+            def handle_mark_comments_read(self, path: str) -> None:
+                reference, suffix = self.extract_post_reference(path)
+                if reference is None or suffix != "/comments/read":
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+                    return
+
+                payload = self.read_json_body()
+                if payload is None:
+                    return
+
+                try:
+                    result = app.mark_comments_read_from_webapp(
+                        reference=reference,
+                        last_read_comment_id=payload.get("lastReadCommentId")
+                        if "lastReadCommentId" in payload
+                        else payload.get("last_read_comment_id"),
+                        init_data=safe_text(payload.get("initData")) or self.read_init_data_header(),
+                    )
+                except WebAppAuthError as exc:
+                    self.send_json(HTTPStatus.UNAUTHORIZED, {"error": str(exc)})
+                    return
+                except MaxApiError as exc:
+                    status = HTTPStatus.BAD_REQUEST
+                    if "not found" in str(exc).lower():
+                        status = HTTPStatus.NOT_FOUND
+                    self.send_json(status, {"error": humanize_comment_error_message(str(exc))})
+                    return
+
+                self.send_json(HTTPStatus.OK, result)
 
             def handle_webhook(self) -> None:
                 if app.delivery_mode != "webhook":

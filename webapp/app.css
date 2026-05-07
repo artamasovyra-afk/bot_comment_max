@@ -393,6 +393,12 @@ body {
   box-shadow: 0 12px 24px rgba(65, 109, 177, 0.08);
 }
 
+.message--target-highlight .message__bubble {
+  outline: 2px solid rgba(47, 128, 255, 0.72);
+  outline-offset: 3px;
+  transition: outline-color 180ms ease, outline-offset 180ms ease;
+}
+
 .message__menu-button {
   position: absolute;
   top: 7px;
