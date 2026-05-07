@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
     <title>Комментарии к посту</title>
-    <link rel="stylesheet" href="/webapp/app.css?v=20260507a">
+    <link rel="stylesheet" href="/webapp/app.css?v=20260507c">
     <script src="https://st.max.ru/js/max-web-app.js"></script>
   </head>
   <body>
@@ -187,6 +187,29 @@
       </section>
     </div>
 
-    <script src="/webapp/app.js?v=20260507a"></script>
+    <div
+      id="image-viewer"
+      class="image-viewer"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Просмотр изображения"
+      hidden
+    >
+      <button id="image-viewer-close" class="image-viewer__close" type="button" aria-label="Закрыть">
+        ×
+      </button>
+      <button id="image-viewer-prev" class="image-viewer__nav image-viewer__nav--prev" type="button" aria-label="Предыдущее изображение">
+        ‹
+      </button>
+      <figure class="image-viewer__frame">
+        <img id="image-viewer-image" class="image-viewer__image" alt="Изображение комментария">
+        <figcaption id="image-viewer-counter" class="image-viewer__counter"></figcaption>
+      </figure>
+      <button id="image-viewer-next" class="image-viewer__nav image-viewer__nav--next" type="button" aria-label="Следующее изображение">
+        ›
+      </button>
+    </div>
+
+    <script src="/webapp/app.js?v=20260507c"></script>
   </body>
 </html>

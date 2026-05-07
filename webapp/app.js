@@ -6,6 +6,9 @@
   const AUTO_REFRESH_INTERVAL_MS = 4000;
   const AUTO_REFRESH_NEAR_BOTTOM_PX = 88;
   const BOTTOM_SCROLL_RETRY_DELAYS_MS = [72, 180, 360];
+  const LONG_PRESS_DELAY_MS = 500;
+  const LONG_PRESS_MOVE_THRESHOLD_PX = 10;
+  const TOUCH_CLICK_SUPPRESS_MS = 750;
   const LINKS_BLOCKED_MESSAGE = "Ссылки запрещены правилами сервиса.";
   const COMMENT_BLOCKED_CODE = "COMMENT_BLOCKED";
   const COMMENT_BLOCKED_TITLE = "Комментарий не опубликован";
@@ -46,6 +49,12 @@
     menuOpenedAt: 0,
     reportingCommentId: null,
     submittingReport: false,
+    imageViewerItems: [],
+    imageViewerIndex: 0,
+    imagePress: null,
+    commentPress: null,
+    lastImageTouchOpenAt: 0,
+    lastImageMenuOpenAt: 0,
   };
 
   const elements = {
@@ -86,6 +95,12 @@
     reportDetails: document.getElementById("report-details"),
     reportCancel: document.getElementById("report-cancel"),
     reportSubmit: document.getElementById("report-submit"),
+    imageViewer: document.getElementById("image-viewer"),
+    imageViewerImage: document.getElementById("image-viewer-image"),
+    imageViewerClose: document.getElementById("image-viewer-close"),
+    imageViewerPrev: document.getElementById("image-viewer-prev"),
+    imageViewerNext: document.getElementById("image-viewer-next"),
+    imageViewerCounter: document.getElementById("image-viewer-counter"),
   };
 
   const webApp = window.WebApp || null;
@@ -429,35 +444,295 @@
     return 180 + (hash % 120);
   }
 
-  function renderCommentMedia(container, mediaItems) {
-    const items = Array.isArray(mediaItems) ? mediaItems : [];
+  function mediaImageUrl(mediaItem) {
+    if (!mediaItem || mediaItem.kind !== "image") {
+      return "";
+    }
+    return String(
+      mediaItem.url ||
+      mediaItem.fileUrl ||
+      mediaItem.file_url ||
+      mediaItem.originalUrl ||
+      mediaItem.original_url ||
+      ""
+    );
+  }
+
+  function mediaThumbUrl(mediaItem) {
+    if (!mediaItem || mediaItem.kind !== "image") {
+      return "";
+    }
+    return String(
+      mediaItem.thumbnailUrl ||
+      mediaItem.thumbnail_url ||
+      mediaItem.thumbUrl ||
+      mediaItem.thumb_url ||
+      mediaImageUrl(mediaItem)
+    );
+  }
+
+  function commentImageItems(mediaItems) {
+    return (Array.isArray(mediaItems) ? mediaItems : [])
+      .filter(function (mediaItem) {
+        return mediaItem && mediaItem.kind === "image" && mediaImageUrl(mediaItem);
+      })
+      .map(function (mediaItem) {
+        return {
+          url: mediaImageUrl(mediaItem),
+          thumbnailUrl: mediaThumbUrl(mediaItem),
+        };
+      });
+  }
+
+  function isLongPressMovementExceeded(pressState, clientX, clientY) {
+    if (!pressState) {
+      return false;
+    }
+    return (
+      Math.abs(Number(clientX) - Number(pressState.startX)) > LONG_PRESS_MOVE_THRESHOLD_PX ||
+      Math.abs(Number(clientY) - Number(pressState.startY)) > LONG_PRESS_MOVE_THRESHOLD_PX
+    );
+  }
+
+  function releaseImagePressState() {
+    const pressState = state.imagePress;
+    if (!pressState) {
+      return;
+    }
+    if (pressState.timerId) {
+      window.clearTimeout(pressState.timerId);
+    }
+    if (pressState.button) {
+      pressState.button.classList.remove("message__image-button--pressing");
+    }
+    state.imagePress = null;
+  }
+
+  function releaseCommentPressState() {
+    const pressState = state.commentPress;
+    if (!pressState) {
+      return;
+    }
+    if (pressState.timerId) {
+      window.clearTimeout(pressState.timerId);
+    }
+    if (pressState.bubble) {
+      pressState.bubble.classList.remove("message__bubble--pressing");
+    }
+    state.commentPress = null;
+  }
+
+  function openCommentMenuFromAnchor(commentId, clientX, clientY, anchorNode) {
+    const rect = anchorNode ? anchorNode.getBoundingClientRect() : null;
+    const fallbackX = rect ? Math.min(rect.left + rect.width - 16, window.innerWidth - 28) : window.innerWidth - 28;
+    const fallbackY = rect ? Math.min(rect.top + rect.height * 0.5, window.innerHeight - 28) : window.innerHeight - 28;
+    openCommentMenu(
+      commentId,
+      Number.isFinite(clientX) ? clientX : fallbackX,
+      Number.isFinite(clientY) ? clientY : fallbackY
+    );
+    haptic("light");
+  }
+
+  function bindImageInteraction(button, commentId, items, index) {
+    button.addEventListener("pointerdown", function (event) {
+      if (state.submitting || state.deletingCommentId !== null) {
+        return;
+      }
+      if (event.pointerType !== "touch") {
+        return;
+      }
+      releaseImagePressState();
+      button.classList.add("message__image-button--pressing");
+      state.imagePress = {
+        button,
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        longPressTriggered: false,
+        timerId: window.setTimeout(function () {
+          const pressState = state.imagePress;
+          if (!pressState || pressState.pointerId !== event.pointerId) {
+            return;
+          }
+          pressState.longPressTriggered = true;
+          openCommentMenuFromAnchor(commentId, pressState.clientX, pressState.clientY, button);
+          state.lastImageMenuOpenAt = Date.now();
+          button.classList.remove("message__image-button--pressing");
+        }, LONG_PRESS_DELAY_MS),
+      };
+    });
+
+    button.addEventListener("pointermove", function (event) {
+      const pressState = state.imagePress;
+      if (!pressState || pressState.pointerId !== event.pointerId) {
+        return;
+      }
+      pressState.clientX = event.clientX;
+      pressState.clientY = event.clientY;
+      if (isLongPressMovementExceeded(pressState, event.clientX, event.clientY)) {
+        releaseImagePressState();
+      }
+    });
+
+    button.addEventListener("pointerup", function (event) {
+      if (event.pointerType === "mouse") {
+        if (event.button === 0) {
+          event.stopPropagation();
+          openImageViewer(items, index);
+        }
+        return;
+      }
+      const pressState = state.imagePress;
+      if (!pressState || pressState.pointerId !== event.pointerId) {
+        return;
+      }
+      const longPressTriggered = pressState.longPressTriggered;
+      releaseImagePressState();
+      event.stopPropagation();
+      if (longPressTriggered) {
+        event.preventDefault();
+        return;
+      }
+      state.lastImageTouchOpenAt = Date.now();
+      openImageViewer(items, index);
+    });
+
+    button.addEventListener("pointercancel", function (event) {
+      const pressState = state.imagePress;
+      if (!pressState || pressState.pointerId !== event.pointerId) {
+        return;
+      }
+      releaseImagePressState();
+    });
+
+    button.addEventListener("click", function (event) {
+      event.stopPropagation();
+      if (window.PointerEvent && event.detail !== 0) {
+        if (
+          Date.now() - state.lastImageTouchOpenAt < TOUCH_CLICK_SUPPRESS_MS ||
+          Date.now() - state.lastImageMenuOpenAt < TOUCH_CLICK_SUPPRESS_MS
+        ) {
+          event.preventDefault();
+        }
+        return;
+      }
+      event.preventDefault();
+      openImageViewer(items, index);
+    });
+
+    button.addEventListener("contextmenu", function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      releaseImagePressState();
+      if (Date.now() - state.lastImageMenuOpenAt < TOUCH_CLICK_SUPPRESS_MS) {
+        return;
+      }
+      openCommentMenuFromAnchor(commentId, event.clientX, event.clientY, button);
+      state.lastImageMenuOpenAt = Date.now();
+    });
+  }
+
+  function updateImageViewer() {
+    const total = state.imageViewerItems.length;
+    const item = total ? state.imageViewerItems[state.imageViewerIndex] : null;
+    if (!item) {
+      closeImageViewer();
+      return;
+    }
+    elements.imageViewerImage.src = item.url;
+    elements.imageViewerCounter.textContent = total > 1
+      ? `${state.imageViewerIndex + 1} из ${total}`
+      : "";
+    elements.imageViewerCounter.hidden = total <= 1;
+    elements.imageViewerPrev.hidden = total <= 1;
+    elements.imageViewerNext.hidden = total <= 1;
+  }
+
+  function openImageViewer(items, index) {
+    const images = Array.isArray(items) ? items.filter(function (item) {
+      return item && item.url;
+    }) : [];
+    if (!images.length) {
+      return;
+    }
+    state.imageViewerItems = images;
+    state.imageViewerIndex = Math.max(0, Math.min(Number(index) || 0, images.length - 1));
+    elements.imageViewer.hidden = false;
+    document.body.classList.add("image-viewer-open");
+    updateImageViewer();
+    elements.imageViewerClose.focus();
+    haptic("light");
+  }
+
+  function closeImageViewer() {
+    if (elements.imageViewer.hidden) {
+      return;
+    }
+    elements.imageViewer.hidden = true;
+    elements.imageViewerImage.removeAttribute("src");
+    state.imageViewerItems = [];
+    state.imageViewerIndex = 0;
+    document.body.classList.remove("image-viewer-open");
+  }
+
+  function showNextImage() {
+    const total = state.imageViewerItems.length;
+    if (total <= 1) {
+      return;
+    }
+    state.imageViewerIndex = (state.imageViewerIndex + 1) % total;
+    updateImageViewer();
+  }
+
+  function showPrevImage() {
+    const total = state.imageViewerItems.length;
+    if (total <= 1) {
+      return;
+    }
+    state.imageViewerIndex = (state.imageViewerIndex - 1 + total) % total;
+    updateImageViewer();
+  }
+
+  function renderCommentMedia(container, mediaItems, commentId) {
+    const items = commentImageItems(mediaItems);
     container.innerHTML = "";
     if (!items.length) {
       container.hidden = true;
       return;
     }
+    container.classList.toggle("message__media--single", items.length === 1);
+    container.classList.toggle("message__media--grid", items.length > 1);
 
-    items.forEach(function (mediaItem) {
-      if (!mediaItem || mediaItem.kind !== "image" || !mediaItem.url) {
-        return;
-      }
+    items.forEach(function (mediaItem, index) {
+      const button = document.createElement("button");
+      button.className = "message__image-button";
+      button.type = "button";
+      button.setAttribute("aria-label", "Открыть изображение комментария");
       const image = document.createElement("img");
       image.className = "message__image";
-      image.alt = "Фото в комментарии";
+      image.alt = "Изображение комментария";
       image.loading = "lazy";
-      if (mediaItem.width) {
-        image.width = Number(mediaItem.width);
-      }
-      if (mediaItem.height) {
-        image.height = Number(mediaItem.height);
-      }
+      const fallback = document.createElement("span");
+      fallback.className = "message__image-fallback";
+      fallback.textContent = "Изображение недоступно";
+      fallback.hidden = true;
       image.addEventListener("load", function () {
         if (state.stickToBottom) {
           scrollCommentsToBottom();
         }
       });
-      image.src = mediaItem.url;
-      container.appendChild(image);
+      image.addEventListener("error", function () {
+        image.hidden = true;
+        fallback.hidden = false;
+      });
+      bindImageInteraction(button, commentId, items, index);
+      image.src = mediaItem.thumbnailUrl || mediaItem.url;
+      button.appendChild(image);
+      button.appendChild(fallback);
+      container.appendChild(button);
     });
 
     container.hidden = container.childElementCount === 0;
@@ -801,6 +1076,13 @@
     elements.commentMenuBackdrop.hidden = true;
   }
 
+  function isCommentLongPressIgnoredTarget(target) {
+    return Boolean(
+      target &&
+      target.closest(".message__image-button, .message__menu-button, button, a, input, textarea, select")
+    );
+  }
+
   function positionCommentMenu(clientX, clientY) {
     const menu = elements.commentMenu;
     menu.style.left = "0px";
@@ -978,6 +1260,7 @@
     }
     node.classList.add("message--actionable");
     const menuButton = node.querySelector(".message__menu-button");
+    const bubble = node.querySelector(".message__bubble");
     if (menuButton) {
       menuButton.hidden = false;
       menuButton.addEventListener("click", function (event) {
@@ -992,26 +1275,79 @@
       });
     }
     if (useTapCommentActions()) {
-      node.addEventListener("click", function () {
-        if (state.submitting || state.deletingCommentId !== null) {
+      node.addEventListener("pointerdown", function (event) {
+        if (
+          state.submitting ||
+          state.deletingCommentId !== null ||
+          event.pointerType !== "touch" ||
+          isCommentLongPressIgnoredTarget(event.target)
+        ) {
           return;
         }
-        if (state.contextMenuCommentId !== null && Number(state.contextMenuCommentId) === Number(comment.id)) {
-          closeCommentMenu();
+        releaseCommentPressState();
+        if (bubble) {
+          bubble.classList.add("message__bubble--pressing");
+        }
+        state.commentPress = {
+          bubble,
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          startY: event.clientY,
+          clientX: event.clientX,
+          clientY: event.clientY,
+          longPressTriggered: false,
+          timerId: window.setTimeout(function () {
+            const pressState = state.commentPress;
+            if (!pressState || pressState.pointerId !== event.pointerId) {
+              return;
+            }
+            pressState.longPressTriggered = true;
+            openCommentMenuFromAnchor(comment.id, pressState.clientX, pressState.clientY, bubble || node);
+            if (bubble) {
+              bubble.classList.remove("message__bubble--pressing");
+            }
+          }, LONG_PRESS_DELAY_MS),
+        };
+      });
+
+      node.addEventListener("pointermove", function (event) {
+        const pressState = state.commentPress;
+        if (!pressState || pressState.pointerId !== event.pointerId) {
           return;
         }
-        const rect = node.getBoundingClientRect();
-        openCommentMenu(
-          comment.id,
-          Math.min(rect.left + rect.width - 16, window.innerWidth - 28),
-          Math.min(rect.top + rect.height * 0.5, window.innerHeight - 28)
-        );
-        haptic("light");
+        pressState.clientX = event.clientX;
+        pressState.clientY = event.clientY;
+        if (isLongPressMovementExceeded(pressState, event.clientX, event.clientY)) {
+          releaseCommentPressState();
+        }
+      });
+
+      node.addEventListener("pointerup", function (event) {
+        const pressState = state.commentPress;
+        if (!pressState || pressState.pointerId !== event.pointerId) {
+          return;
+        }
+        const longPressTriggered = pressState.longPressTriggered;
+        releaseCommentPressState();
+        if (longPressTriggered) {
+          event.preventDefault();
+        }
+      });
+
+      node.addEventListener("pointercancel", function (event) {
+        const pressState = state.commentPress;
+        if (!pressState || pressState.pointerId !== event.pointerId) {
+          return;
+        }
+        releaseCommentPressState();
       });
       return;
     }
 
     node.addEventListener("contextmenu", function (event) {
+      if (event.target.closest(".message__image-button")) {
+        return;
+      }
       event.preventDefault();
       openCommentMenu(comment.id, event.clientX, event.clientY);
     });
@@ -1083,7 +1419,7 @@
       node.querySelector(".message__author").textContent = authorText;
       node.querySelector(".message__time").textContent = formatCommentTime(comment.created_at);
       renderReplyReference(replyNode, comment.parent_comment);
-      renderCommentMedia(mediaNode, comment.media);
+      renderCommentMedia(mediaNode, comment.media, comment.id);
       textNode.textContent = comment.text || "";
       textNode.hidden = !comment.text;
       if (menuButton) {
@@ -1514,7 +1850,23 @@
       closeCommentBlockedDialog();
     }
   });
+  elements.imageViewerClose.addEventListener("click", closeImageViewer);
+  elements.imageViewerPrev.addEventListener("click", function (event) {
+    event.stopPropagation();
+    showPrevImage();
+  });
+  elements.imageViewerNext.addEventListener("click", function (event) {
+    event.stopPropagation();
+    showNextImage();
+  });
+  elements.imageViewer.addEventListener("click", function (event) {
+    if (event.target === elements.imageViewer) {
+      closeImageViewer();
+    }
+  });
   elements.list.addEventListener("scroll", function () {
+    releaseImagePressState();
+    releaseCommentPressState();
     state.stickToBottom = isListNearBottom();
     closeCommentMenu();
   }, { passive: true });
@@ -1574,6 +1926,21 @@
       !elements.commentMenuBackdrop.contains(event.target)
     ) {
       closeCommentMenu();
+    }
+  });
+  document.addEventListener("keydown", function (event) {
+    if (elements.imageViewer.hidden) {
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeImageViewer();
+    } else if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      showPrevImage();
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      showNextImage();
     }
   });
   elements.loadOlder.addEventListener("click", function () {
