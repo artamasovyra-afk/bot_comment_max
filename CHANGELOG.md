@@ -4,6 +4,12 @@ All notable changes to this project will be tracked here.
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-05-07
+
+### Changed
+
+- Обновлён текст ответа пользователю после создания заявки на подключение канала.
+
 ## [0.1.10] - 2026-05-07
 
 ### Fixed

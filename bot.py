@@ -3555,10 +3555,11 @@ class MaxCommentsBot:
         self.api.send_message(
             user_id=user_id,
             text=(
-                "Заявка на подключение канала отправлена.\n\n"
-                f"Канал: {channel_title or channel_id}\n\n"
-                "Супер-администратор проверит заявку. "
-                "После одобрения комментарии будут подключены автоматически."
+                "Новая заявка на подключение канала\n"
+                f"Канал: {channel_title or channel_id}\n"
+                f"ID канала: {channel_id}\n"
+                f"Ваш ID MAX: {user_id}\n"
+                f"Адрес административной панели канала: {public_app_url('/admin')}"
             ),
         )
         return True
