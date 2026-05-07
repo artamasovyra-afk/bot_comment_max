@@ -79,6 +79,7 @@ COMMENT_BLOCKED_MESSAGE = "Комментарий содержит запрещ�
 REPORT_CREATED_MESSAGE = "Жалоба отправлена. Администратор канала проверит комментарий."
 REPORT_ALREADY_EXISTS_MESSAGE = "Вы уже отправляли жалобу на этот комментарий."
 COMMENT_NOT_FOUND_MESSAGE = "Комментарий не найден."
+USER_NOT_FOUND_MESSAGE = "Пользователь не найден."
 ACCESS_DENIED_MESSAGE = "У вас нет прав для управления этим каналом."
 ADMIN_LOGIN_ACCESS_DENIED_MESSAGE = "У вас нет прав для входа в админку."
 INVALID_CREDENTIALS_MESSAGE = "Неверный логин или пароль."
@@ -361,6 +362,7 @@ def humanize_comment_error_message(message: str) -> str:
         "ACCESS_DENIED": ADMIN_LOGIN_ACCESS_DENIED_MESSAGE,
         "INVALID_CREDENTIALS": INVALID_CREDENTIALS_MESSAGE,
         "FORBIDDEN": FORBIDDEN_MESSAGE,
+        "USER_NOT_FOUND": USER_NOT_FOUND_MESSAGE,
         "Report already exists": REPORT_ALREADY_EXISTS_MESSAGE,
         "Invalid report reason": "Выберите причину жалобы.",
     }.get(normalized, normalized)
@@ -2209,6 +2211,85 @@ class CommentStore:
                 "SELECT * FROM comments WHERE id = ?",
                 (comment_id,),
             ).fetchone()
+
+    def get_user_profile_summary(
+        self,
+        *,
+        user_id: int,
+        channel_chat_id: int | None = None,
+        recent_limit: int = 3,
+    ) -> dict[str, Any] | None:
+        where = [
+            "comments.user_id = ?",
+            "comments.status = 'active'",
+            "posts.status = 'published'",
+        ]
+        params: list[Any] = [int(user_id)]
+        if channel_chat_id is not None:
+            where.append("posts.channel_chat_id = ?")
+            params.append(int(channel_chat_id))
+        where_sql = " AND ".join(where)
+        recent_items_limit = max(0, min(int(recent_limit), 10))
+
+        with self.lock:
+            summary_row = self.conn.execute(
+                f"""
+                SELECT
+                    comments.user_id AS user_id,
+                    comments.display_name AS display_name,
+                    comments.username AS username,
+                    COUNT(*) AS comments_count,
+                    MIN(comments.created_at) AS first_comment_at
+                FROM comments
+                JOIN posts ON posts.post_message_id = comments.post_message_id
+                WHERE {where_sql}
+                GROUP BY comments.user_id, comments.display_name, comments.username
+                ORDER BY MAX(comments.created_at) DESC
+                LIMIT 1
+                """,
+                tuple(params),
+            ).fetchone()
+            if summary_row is None:
+                return None
+
+            recent_rows: list[sqlite3.Row] = []
+            if recent_items_limit > 0:
+                recent_rows = self.conn.execute(
+                    f"""
+                    SELECT
+                        comments.id,
+                        comments.post_message_id,
+                        comments.text,
+                        comments.media_json,
+                        comments.created_at
+                    FROM comments
+                    JOIN posts ON posts.post_message_id = comments.post_message_id
+                    WHERE {where_sql}
+                    ORDER BY comments.created_at DESC
+                    LIMIT ?
+                    """,
+                    tuple(params + [recent_items_limit]),
+                ).fetchall()
+
+        recent_comments = [
+            {
+                "id": int(row["id"]),
+                "postId": safe_text(row["post_message_id"]),
+                "textPreview": comment_reply_preview_text(row),
+                "createdAt": safe_text(row["created_at"]),
+            }
+            for row in recent_rows
+        ]
+        return {
+            "id": int(summary_row["user_id"]),
+            "displayName": safe_text(summary_row["display_name"]) or "Пользователь",
+            "username": safe_text(summary_row["username"]) or None,
+            "avatarUrl": None,
+            "profileUrl": None,
+            "commentsCount": int(summary_row["comments_count"] or 0),
+            "firstCommentAt": safe_text(summary_row["first_comment_at"]) or None,
+            "recentComments": recent_comments,
+        }
 
     def set_comment_discussion_copy_message_id(
         self,
@@ -7024,6 +7105,17 @@ class MaxCommentsBot:
             "webapp_url": self.direct_webapp_url(post["post_message_id"]),
         }
 
+    def serialize_comment_author(self, comment: sqlite3.Row) -> dict[str, Any]:
+        user_id = int(comment["user_id"])
+        return {
+            "id": user_id,
+            "maxUserId": str(user_id),
+            "displayName": safe_text(comment["display_name"]) or "Пользователь",
+            "username": safe_text(comment["username"]) or None,
+            "avatarUrl": None,
+            "profileUrl": None,
+        }
+
     def serialize_comment(
         self,
         comment: sqlite3.Row,
@@ -7038,6 +7130,7 @@ class MaxCommentsBot:
             "user_id": int(comment["user_id"]),
             "display_name": comment["display_name"],
             "username": comment["username"],
+            "author": self.serialize_comment_author(comment),
             "text": comment["text"],
             "media": deserialize_comment_media(comment["media_json"]),
             "parent_comment": self.serialize_parent_comment(parent_comment),
@@ -7055,9 +7148,61 @@ class MaxCommentsBot:
             "user_id": int(comment["user_id"]),
             "display_name": comment["display_name"],
             "username": comment["username"],
+            "author": self.serialize_comment_author(comment),
             "text": "Комментарий удалён модератором" if is_deleted else comment_reply_preview_text(comment),
             "has_media": False if is_deleted else bool(deserialize_comment_media(comment["media_json"])),
             "status": safe_text(comment["status"] if "status" in comment.keys() else COMMENT_STATUS_ACTIVE),
+        }
+
+    def get_user_profile_payload(
+        self,
+        *,
+        user_id: int,
+        reference: str | None,
+        init_data: str,
+    ) -> dict[str, Any]:
+        self.authenticate_webapp_user(init_data)
+
+        reference_value = safe_text(reference)
+        if not reference_value:
+            raise MaxApiError("Post not found")
+
+        post = self.resolve_post_reference(reference_value)
+        if post is None:
+            raise MaxApiError("Post not found")
+        if safe_text(post["status"] if "status" in post.keys() else "published") != "published":
+            raise MaxApiError("Post not found")
+        channel_chat_id = int(post["channel_chat_id"])
+
+        profile = self.store.get_user_profile_summary(
+            user_id=int(user_id),
+            channel_chat_id=channel_chat_id,
+            recent_limit=3,
+        )
+        if profile is None:
+            raise MaxApiError("USER_NOT_FOUND")
+
+        return {
+            "ok": True,
+            "profile": {
+                "id": int(profile["id"]),
+                "displayName": safe_text(profile["displayName"]) or "Пользователь",
+                "username": safe_text(profile.get("username")) or None,
+                "avatarUrl": safe_text(profile.get("avatarUrl")) or None,
+                "profileUrl": safe_text(profile.get("profileUrl")) or None,
+                "commentsCount": int(profile["commentsCount"] or 0),
+                "firstCommentAt": safe_text(profile.get("firstCommentAt")) or None,
+            },
+            "recentComments": [
+                {
+                    "id": int(item["id"]),
+                    "postId": safe_text(item["postId"]),
+                    "textPreview": safe_text(item["textPreview"]),
+                    "createdAt": safe_text(item["createdAt"]),
+                }
+                for item in profile.get("recentComments", [])
+                if isinstance(item, dict)
+            ],
         }
 
     @staticmethod
@@ -7159,6 +7304,9 @@ class CommentWebServer:
                     return
                 if path.startswith("/api/admin/"):
                     self.handle_admin_get(path, parse.parse_qs(parsed.query, keep_blank_values=True))
+                    return
+                if path.startswith("/api/users/") and path.endswith("/profile"):
+                    self.handle_user_profile(path, parse.parse_qs(parsed.query, keep_blank_values=True))
                     return
                 if path.startswith("/api/posts/"):
                     self.handle_api_get(path, parse.parse_qs(parsed.query, keep_blank_values=True))
@@ -7447,6 +7595,42 @@ class CommentWebServer:
                     self.send_json(HTTPStatus.NOT_FOUND, {"error": humanize_comment_error_message(str(exc))})
                     return
                 self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+
+            def handle_user_profile(self, path: str, query: dict[str, list[str]]) -> None:
+                raw_user_id = parse.unquote(path.removeprefix("/api/users/").removesuffix("/profile")).strip("/")
+                try:
+                    user_id = int(raw_user_id)
+                except ValueError:
+                    self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "INVALID_ID", "message": "Некорректный ID"})
+                    return
+
+                reference = safe_text((query.get("post_ref") or query.get("reference") or [""])[0]) or None
+                try:
+                    result = app.get_user_profile_payload(
+                        user_id=user_id,
+                        reference=reference,
+                        init_data=self.read_init_data_header(),
+                    )
+                except WebAppAuthError as exc:
+                    self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "UNAUTHORIZED", "message": str(exc)})
+                    return
+                except MaxApiError as exc:
+                    status = HTTPStatus.BAD_REQUEST
+                    code = safe_text(str(exc))
+                    if code == "USER_NOT_FOUND":
+                        status = HTTPStatus.NOT_FOUND
+                    elif "not found" in code.lower():
+                        status = HTTPStatus.NOT_FOUND
+                    self.send_json(
+                        status,
+                        {
+                            "ok": False,
+                            "error": code or "PROFILE_ERROR",
+                            "message": humanize_comment_error_message(code),
+                        },
+                    )
+                    return
+                self.send_json(HTTPStatus.OK, result)
 
             def handle_create_comment(self, path: str) -> None:
                 reference, suffix = self.extract_post_reference(path)

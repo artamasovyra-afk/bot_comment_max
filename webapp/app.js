@@ -55,6 +55,9 @@
     commentPress: null,
     lastImageTouchOpenAt: 0,
     lastImageMenuOpenAt: 0,
+    profileModalUserId: null,
+    profileRequestToken: 0,
+    profileCache: {},
   };
 
   const elements = {
@@ -95,6 +98,16 @@
     reportDetails: document.getElementById("report-details"),
     reportCancel: document.getElementById("report-cancel"),
     reportSubmit: document.getElementById("report-submit"),
+    profileModal: document.getElementById("profile-modal"),
+    profileAvatar: document.getElementById("profile-avatar"),
+    profileName: document.getElementById("profile-name"),
+    profileUsername: document.getElementById("profile-username"),
+    profileStatus: document.getElementById("profile-status"),
+    profileCommentsCount: document.getElementById("profile-comments-count"),
+    profileFirstComment: document.getElementById("profile-first-comment"),
+    profileRecent: document.getElementById("profile-recent"),
+    profileRecentList: document.getElementById("profile-recent-list"),
+    profileClose: document.getElementById("profile-close"),
     imageViewer: document.getElementById("image-viewer"),
     imageViewerImage: document.getElementById("image-viewer-image"),
     imageViewerClose: document.getElementById("image-viewer-close"),
@@ -223,6 +236,21 @@
       });
     } catch (_err) {
       return "";
+    }
+  }
+
+  function formatProfileDate(value) {
+    if (!value) {
+      return "—";
+    }
+    try {
+      return new Date(value).toLocaleDateString("ru-RU", {
+        day: "numeric",
+        month: "long",
+        year: "numeric",
+      });
+    } catch (_err) {
+      return value;
     }
   }
 
@@ -444,6 +472,74 @@
     return 180 + (hash % 120);
   }
 
+  function commentAuthorData(comment) {
+    const author = comment && typeof comment.author === "object" ? comment.author : null;
+    const userId = Number(
+      (author && (author.id || author.userId || author.user_id || author.maxUserId || author.max_user_id)) ||
+      (comment && comment.user_id)
+    ) || null;
+    if (!userId) {
+      return null;
+    }
+    const displayName = String(
+      (author && (author.displayName || author.display_name)) ||
+      (comment && comment.display_name) ||
+      "Пользователь"
+    ).trim() || "Пользователь";
+    const username = String(
+      (author && (author.username || author.user_name)) ||
+      (comment && comment.username) ||
+      ""
+    ).trim();
+    const avatarUrl = String(
+      (author && (author.avatarUrl || author.avatar_url)) || ""
+    ).trim();
+    const profileUrl = String(
+      (author && (author.profileUrl || author.profile_url)) || ""
+    ).trim();
+    return {
+      userId,
+      displayName,
+      username: username || null,
+      avatarUrl: avatarUrl || null,
+      profileUrl: profileUrl || null,
+    };
+  }
+
+  function profileCacheKey(user) {
+    return `${user.userId}:${state.postRef || ""}`;
+  }
+
+  function openExternalUrl(url) {
+    const targetUrl = String(url || "").trim();
+    if (!targetUrl) {
+      return;
+    }
+    if (webApp && typeof webApp.openLink === "function") {
+      webApp.openLink(targetUrl);
+      return;
+    }
+    window.open(targetUrl, "_blank", "noopener,noreferrer");
+  }
+
+  function renderAvatarBadge(element, user) {
+    if (!element) {
+      return;
+    }
+    const displayName = user && user.displayName ? user.displayName : "Пользователь";
+    const avatarUrl = String((user && user.avatarUrl) || "").trim();
+    element.style.setProperty("--avatar-hue", String(avatarHue(displayName)));
+    if (avatarUrl) {
+      element.textContent = "";
+      element.classList.add("message__avatar--image", "profile-card__avatar--image");
+      element.style.backgroundImage = `url("${avatarUrl.replace(/"/g, "%22")}")`;
+      return;
+    }
+    element.textContent = avatarInitials(displayName);
+    element.classList.remove("message__avatar--image", "profile-card__avatar--image");
+    element.style.removeProperty("background-image");
+  }
+
   function mediaImageUrl(mediaItem) {
     if (!mediaItem || mediaItem.kind !== "image") {
       return "";
@@ -482,6 +578,151 @@
           thumbnailUrl: mediaThumbUrl(mediaItem),
         };
       });
+  }
+
+  function renderProfileAvatar(element, user) {
+    renderAvatarBadge(element, user);
+  }
+
+  function resetProfileModal(user) {
+    const author = user || { displayName: "Пользователь", username: null };
+    renderProfileAvatar(elements.profileAvatar, author);
+    elements.profileName.textContent = author.displayName;
+    elements.profileUsername.textContent = author.username ? `@${author.username}` : "";
+    elements.profileUsername.hidden = !author.username;
+    elements.profileStatus.hidden = false;
+    elements.profileStatus.textContent = "Загружаем профиль…";
+    elements.profileCommentsCount.textContent = "0";
+    elements.profileFirstComment.textContent = "—";
+    elements.profileRecent.hidden = true;
+    elements.profileRecentList.innerHTML = "";
+  }
+
+  function renderProfileModal(user, payload) {
+    const profile = payload && payload.profile ? payload.profile : {};
+    const recentComments = Array.isArray(payload && payload.recentComments) ? payload.recentComments : [];
+    const displayName = String(profile.displayName || user.displayName || "Пользователь").trim() || "Пользователь";
+    const username = String(profile.username || user.username || "").trim();
+    renderProfileAvatar(elements.profileAvatar, {
+      displayName,
+      avatarUrl: profile.avatarUrl || user.avatarUrl || null,
+    });
+    elements.profileName.textContent = displayName;
+    elements.profileUsername.textContent = username ? `@${username}` : "";
+    elements.profileUsername.hidden = !username;
+    elements.profileStatus.hidden = true;
+    elements.profileCommentsCount.textContent = String(Number(profile.commentsCount) || 0);
+    elements.profileFirstComment.textContent = formatProfileDate(profile.firstCommentAt);
+    elements.profileRecentList.innerHTML = "";
+    recentComments.forEach(function (item) {
+      const row = document.createElement("div");
+      row.className = "profile-card__recent-item";
+      const time = document.createElement("div");
+      time.className = "profile-card__recent-time";
+      time.textContent = formatCommentTime(item.createdAt);
+      const preview = document.createElement("div");
+      preview.className = "profile-card__recent-text";
+      preview.textContent = item.textPreview || "Комментарий";
+      row.appendChild(time);
+      row.appendChild(preview);
+      elements.profileRecentList.appendChild(row);
+    });
+    elements.profileRecent.hidden = recentComments.length === 0;
+  }
+
+  function showProfileError(user, message) {
+    renderProfileAvatar(elements.profileAvatar, user);
+    elements.profileName.textContent = user.displayName || "Пользователь";
+    elements.profileUsername.textContent = user.username ? `@${user.username}` : "";
+    elements.profileUsername.hidden = !user.username;
+    elements.profileStatus.hidden = false;
+    elements.profileStatus.textContent = message;
+    elements.profileCommentsCount.textContent = "—";
+    elements.profileFirstComment.textContent = "—";
+    elements.profileRecent.hidden = true;
+    elements.profileRecentList.innerHTML = "";
+  }
+
+  function closeProfileModal() {
+    state.profileModalUserId = null;
+    state.profileRequestToken += 1;
+    elements.profileModal.hidden = true;
+    document.body.classList.remove("profile-modal-open");
+  }
+
+  async function openUserProfile(user) {
+    if (!user || !user.userId) {
+      return;
+    }
+    if (user.profileUrl) {
+      openExternalUrl(user.profileUrl);
+      return;
+    }
+
+    state.profileModalUserId = Number(user.userId);
+    state.profileRequestToken += 1;
+    const requestToken = state.profileRequestToken;
+    elements.profileModal.hidden = false;
+    document.body.classList.add("profile-modal-open");
+    resetProfileModal(user);
+    elements.profileClose.focus();
+
+    const cacheKey = profileCacheKey(user);
+    if (state.profileCache[cacheKey]) {
+      renderProfileModal(user, state.profileCache[cacheKey]);
+      return;
+    }
+    if (!state.postRef) {
+      showProfileError(user, "Не удалось открыть профиль пользователя. Попробуйте позже.");
+      return;
+    }
+
+    try {
+      const params = new URLSearchParams();
+      params.set("post_ref", state.postRef);
+      const payload = await fetchJson(
+        `/api/users/${encodeURIComponent(user.userId)}/profile?${params.toString()}`,
+        {
+          headers: buildApiHeaders(),
+        }
+      );
+      if (requestToken !== state.profileRequestToken || elements.profileModal.hidden) {
+        return;
+      }
+      state.profileCache[cacheKey] = payload;
+      renderProfileModal(user, payload);
+    } catch (error) {
+      if (requestToken !== state.profileRequestToken || elements.profileModal.hidden) {
+        return;
+      }
+      showProfileError(
+        user,
+        error.code === "USER_NOT_FOUND"
+          ? "Пользователь не найден."
+          : "Не удалось открыть профиль пользователя. Попробуйте позже."
+      );
+    }
+  }
+
+  function bindAuthorProfileHandlers(node, comment) {
+    const user = commentAuthorData(comment);
+    if (!user) {
+      return;
+    }
+    const clickableNodes = [
+      node.querySelector(".message__avatar-button"),
+      node.querySelector(".message__author-link"),
+    ];
+    clickableNodes.forEach(function (button) {
+      if (!button) {
+        return;
+      }
+      button.addEventListener("click", function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        openUserProfile(user);
+      });
+    });
   }
 
   function isLongPressMovementExceeded(pressState, clientX, clientY) {
@@ -990,7 +1231,15 @@
   function renderEmptyState() {
     const node = elements.template.content.firstElementChild.cloneNode(true);
     node.classList.add("message--empty");
-    node.querySelector(".message__avatar").remove();
+    const avatarButton = node.querySelector(".message__avatar-button");
+    if (avatarButton) {
+      avatarButton.remove();
+    }
+    const authorLink = node.querySelector(".message__author-link");
+    const authorTextNode = node.querySelector(".message__author");
+    if (authorLink && authorTextNode) {
+      authorLink.replaceWith(authorTextNode);
+    }
     const menuButton = node.querySelector(".message__menu-button");
     if (menuButton) {
       menuButton.remove();
@@ -1413,9 +1662,13 @@
         node.classList.add("message--self");
       }
 
-      node.style.setProperty("--avatar-hue", String(avatarHue(comment.display_name)));
+      const author = commentAuthorData(comment) || {
+        displayName: authorText,
+        avatarUrl: null,
+      };
+      node.style.setProperty("--avatar-hue", String(avatarHue(author.displayName)));
       node.dataset.commentId = String(comment.id);
-      node.querySelector(".message__avatar").textContent = avatarInitials(comment.display_name);
+      renderAvatarBadge(node.querySelector(".message__avatar"), author);
       node.querySelector(".message__author").textContent = authorText;
       node.querySelector(".message__time").textContent = formatCommentTime(comment.created_at);
       renderReplyReference(replyNode, comment.parent_comment);
@@ -1425,6 +1678,7 @@
       if (menuButton) {
         menuButton.hidden = true;
       }
+      bindAuthorProfileHandlers(node, comment);
       bindCommentActionHandlers(node, comment);
       elements.list.appendChild(node);
     });
@@ -1844,6 +2098,12 @@
       closeReportModal();
     }
   });
+  elements.profileClose.addEventListener("click", closeProfileModal);
+  elements.profileModal.addEventListener("click", function (event) {
+    if (event.target === elements.profileModal) {
+      closeProfileModal();
+    }
+  });
   elements.blockedFix.addEventListener("click", closeCommentBlockedDialog);
   elements.blockedModal.addEventListener("click", function (event) {
     if (event.target === elements.blockedModal) {
@@ -1929,18 +2189,22 @@
     }
   });
   document.addEventListener("keydown", function (event) {
-    if (elements.imageViewer.hidden) {
+    if (!elements.imageViewer.hidden) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeImageViewer();
+      } else if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        showPrevImage();
+      } else if (event.key === "ArrowRight") {
+        event.preventDefault();
+        showNextImage();
+      }
       return;
     }
-    if (event.key === "Escape") {
+    if (!elements.profileModal.hidden && event.key === "Escape") {
       event.preventDefault();
-      closeImageViewer();
-    } else if (event.key === "ArrowLeft") {
-      event.preventDefault();
-      showPrevImage();
-    } else if (event.key === "ArrowRight") {
-      event.preventDefault();
-      showNextImage();
+      closeProfileModal();
     }
   });
   elements.loadOlder.addEventListener("click", function () {
