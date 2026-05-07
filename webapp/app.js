@@ -54,7 +54,6 @@
     imageViewerIndex: 0,
     imagePress: null,
     commentPress: null,
-    reactionPickerCommentId: null,
     reactionRequestCommentIds: new Set(),
     lastImageTouchOpenAt: 0,
     lastImageMenuOpenAt: 0,
@@ -84,7 +83,11 @@
     template: document.getElementById("comment-template"),
     commentMenu: document.getElementById("comment-menu"),
     commentMenuBackdrop: document.getElementById("comment-menu-backdrop"),
+    commentMenuReactions: document.getElementById("comment-menu-reactions"),
+    commentMenuDivider: document.getElementById("comment-menu-divider"),
     commentMenuReply: document.getElementById("comment-menu-reply"),
+    commentMenuCopy: document.getElementById("comment-menu-copy"),
+    commentMenuCopyLink: document.getElementById("comment-menu-copy-link"),
     commentMenuEdit: document.getElementById("comment-menu-edit"),
     commentMenuDelete: document.getElementById("comment-menu-delete"),
     commentMenuReport: document.getElementById("comment-menu-report"),
@@ -659,28 +662,6 @@
     renderCommentReactions(node.querySelector(".message__reactions"), comment);
   }
 
-  function setReactionPickerComment(commentId) {
-    const normalizedCommentId = Number(commentId) || null;
-    const previousCommentId = state.reactionPickerCommentId;
-    if (previousCommentId === normalizedCommentId) {
-      return;
-    }
-    state.reactionPickerCommentId = normalizedCommentId;
-    if (previousCommentId !== null) {
-      renderCommentReactionBlock(previousCommentId);
-    }
-    if (normalizedCommentId !== null) {
-      renderCommentReactionBlock(normalizedCommentId);
-    }
-  }
-
-  function closeReactionPicker() {
-    if (state.reactionPickerCommentId === null) {
-      return;
-    }
-    setReactionPickerComment(null);
-  }
-
   function applyCommentReactionUpdate(commentId, payload) {
     const comment = getCommentById(commentId);
     if (!comment) {
@@ -711,6 +692,9 @@
 
     state.reactionRequestCommentIds.add(normalizedCommentId);
     renderCommentReactionBlock(normalizedCommentId);
+    if (state.contextMenuCommentId === normalizedCommentId) {
+      renderCommentMenuReactions(getCommentById(normalizedCommentId));
+    }
     try {
       const result = await fetchJson(`/api/comments/${encodeURIComponent(normalizedCommentId)}/reaction`, {
         method: "POST",
@@ -723,7 +707,9 @@
         }),
       });
       applyCommentReactionUpdate(normalizedCommentId, result);
-      closeReactionPicker();
+      if (state.contextMenuCommentId === normalizedCommentId) {
+        closeCommentMenu();
+      }
       haptic("light");
     } catch (error) {
       setBanner(error.message || "Не удалось обновить реакцию.", "error");
@@ -731,6 +717,9 @@
     } finally {
       state.reactionRequestCommentIds.delete(normalizedCommentId);
       renderCommentReactionBlock(normalizedCommentId);
+      if (state.contextMenuCommentId === normalizedCommentId) {
+        renderCommentMenuReactions(getCommentById(normalizedCommentId));
+      }
     }
   }
 
@@ -742,14 +731,12 @@
     const normalizedCommentId = Number(comment && comment.id);
     const reactionState = normalizeCommentReactions(comment);
     const reactions = reactionState.reactions;
-    const myReaction = reactionState.myReaction;
-    const pickerOpen = state.reactionPickerCommentId === normalizedCommentId;
     const canReact = canUseCommentReactions();
     const reactionPending = isReactionRequestPending(normalizedCommentId);
 
     container.innerHTML = "";
 
-    if (!normalizedCommentId || (!canReact && reactions.length === 0)) {
+    if (!normalizedCommentId || reactions.length === 0) {
       container.hidden = true;
       return;
     }
@@ -790,51 +777,126 @@
       list.appendChild(button);
     });
 
-    if (canReact) {
-      const addButton = document.createElement("button");
-      addButton.type = "button";
-      addButton.className = "message__reaction-add";
-      addButton.textContent = "＋";
-      addButton.disabled = reactionPending;
-      addButton.setAttribute("aria-label", "Выбрать реакцию");
-      addButton.setAttribute("aria-expanded", pickerOpen ? "true" : "false");
-      if (pickerOpen) {
-        addButton.classList.add("message__reaction-add--open");
-      }
-      addButton.addEventListener("click", function (event) {
-        event.preventDefault();
-        event.stopPropagation();
-        if (reactionPending) {
-          return;
-        }
-        setReactionPickerComment(pickerOpen ? null : normalizedCommentId);
-      });
-      list.appendChild(addButton);
+    container.appendChild(list);
+  }
+
+  function renderCommentMenuReactions(comment) {
+    const container = elements.commentMenuReactions;
+    if (!container) {
+      return;
     }
 
-    container.appendChild(list);
+    container.innerHTML = "";
+    if (!comment || !canUseCommentReactions()) {
+      container.hidden = true;
+      if (elements.commentMenuDivider) {
+        elements.commentMenuDivider.hidden = true;
+      }
+      return;
+    }
 
-    if (pickerOpen && canReact) {
-      const picker = document.createElement("div");
-      picker.className = "message__reaction-picker";
-      REACTION_EMOJIS.forEach(function (emoji) {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "message__reaction-picker-button";
-        button.textContent = emoji;
-        button.disabled = reactionPending;
-        button.setAttribute("aria-label", `Поставить реакцию ${emoji}`);
-        if (emoji === myReaction) {
-          button.classList.add("message__reaction-picker-button--selected");
-        }
-        button.addEventListener("click", function (event) {
-          event.preventDefault();
-          event.stopPropagation();
-          submitCommentReaction(normalizedCommentId, emoji);
-        });
-        picker.appendChild(button);
+    const normalizedCommentId = Number(comment.id);
+    const reactionState = normalizeCommentReactions(comment);
+    const myReaction = reactionState.myReaction;
+    const reactionPending = isReactionRequestPending(normalizedCommentId);
+
+    REACTION_EMOJIS.forEach(function (emoji) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "comment-menu__reaction";
+      button.textContent = emoji;
+      button.disabled = reactionPending;
+      button.setAttribute("aria-label", `Поставить реакцию ${emoji}`);
+      if (emoji === myReaction) {
+        button.classList.add("comment-menu__reaction--selected");
+      }
+      button.addEventListener("click", function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        submitCommentReaction(normalizedCommentId, emoji);
       });
-      container.appendChild(picker);
+      container.appendChild(button);
+    });
+
+    container.hidden = false;
+    if (elements.commentMenuDivider) {
+      elements.commentMenuDivider.hidden = false;
+    }
+  }
+
+  async function copyTextToClipboard(text) {
+    const normalizedText = String(text || "");
+    if (!normalizedText) {
+      throw new Error("Нечего копировать.");
+    }
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(normalizedText);
+      return;
+    }
+    const fallbackField = document.createElement("textarea");
+    fallbackField.value = normalizedText;
+    fallbackField.setAttribute("readonly", "true");
+    fallbackField.style.position = "fixed";
+    fallbackField.style.opacity = "0";
+    fallbackField.style.pointerEvents = "none";
+    document.body.appendChild(fallbackField);
+    fallbackField.focus();
+    fallbackField.select();
+    const success = document.execCommand("copy");
+    document.body.removeChild(fallbackField);
+    if (!success) {
+      throw new Error("Не удалось скопировать текст.");
+    }
+  }
+
+  function commentClipboardText(comment) {
+    const text = String((comment && comment.text) || "").trim();
+    if (text) {
+      return text;
+    }
+    if (comment && Array.isArray(comment.media) && comment.media.length) {
+      return "Фото";
+    }
+    return "Комментарий";
+  }
+
+  function commentShareUrl(commentId) {
+    const url = new URL(window.location.href);
+    if (state.postRef) {
+      url.searchParams.set("post", state.postRef);
+    }
+    url.hash = `comment-${Number(commentId)}`;
+    return url.toString();
+  }
+
+  async function copyCommentText(commentId) {
+    const comment = getCommentById(commentId);
+    if (!comment) {
+      return;
+    }
+    try {
+      await copyTextToClipboard(commentClipboardText(comment));
+      closeCommentMenu();
+      setBanner("Комментарий скопирован.", "success");
+      haptic("success");
+    } catch (error) {
+      setBanner(error.message || "Не удалось скопировать комментарий.", "error");
+      haptic("warning");
+    }
+  }
+
+  async function copyCommentLink(commentId) {
+    if (!commentId) {
+      return;
+    }
+    try {
+      await copyTextToClipboard(commentShareUrl(commentId));
+      closeCommentMenu();
+      setBanner("Ссылка на комментарий скопирована.", "success");
+      haptic("success");
+    } catch (error) {
+      setBanner(error.message || "Не удалось скопировать ссылку.", "error");
+      haptic("warning");
     }
   }
 
@@ -1396,12 +1458,7 @@
   }
 
   function hasCommentActions(comment) {
-    return (
-      canReplyComment(comment) ||
-      canEditComment(comment) ||
-      canDeleteComment(comment) ||
-      canReportComment(comment)
-    );
+    return Boolean(comment);
   }
 
   function getCommentById(commentId) {
@@ -1429,6 +1486,13 @@
     state.menuOpenedAt = 0;
     elements.commentMenu.hidden = true;
     elements.commentMenuBackdrop.hidden = true;
+    if (elements.commentMenuReactions) {
+      elements.commentMenuReactions.hidden = true;
+      elements.commentMenuReactions.innerHTML = "";
+    }
+    if (elements.commentMenuDivider) {
+      elements.commentMenuDivider.hidden = true;
+    }
   }
 
   function isCommentLongPressIgnoredTarget(target) {
@@ -1459,10 +1523,12 @@
       return;
     }
 
-    closeReactionPicker();
     state.contextMenuCommentId = Number(commentId);
     state.menuOpenedAt = Date.now();
+    renderCommentMenuReactions(comment);
     elements.commentMenuReply.hidden = !canReplyComment(comment);
+    elements.commentMenuCopy.hidden = false;
+    elements.commentMenuCopyLink.hidden = false;
     elements.commentMenuEdit.hidden = !canEditComment(comment);
     elements.commentMenuDelete.hidden = !canDeleteComment(comment);
     elements.commentMenuReport.hidden = !canReportComment(comment);
@@ -1522,7 +1588,6 @@
     if (!canEditComment(comment)) {
       return;
     }
-    closeReactionPicker();
     cancelReplying();
     clearPhotoSelection();
     closeCommentMenu();
@@ -1540,7 +1605,6 @@
     if (!canReplyComment(comment)) {
       return;
     }
-    closeReactionPicker();
     if (state.editingCommentId !== null) {
       cancelEditing({ clearInput: false });
     }
@@ -1564,7 +1628,6 @@
     if (!canReportComment(comment)) {
       return;
     }
-    closeReactionPicker();
     closeCommentMenu();
     state.reportingCommentId = Number(commentId);
     elements.reportReason.value = "insult";
@@ -1751,15 +1814,6 @@
     }
 
     clearBanner();
-
-    if (
-      state.reactionPickerCommentId !== null &&
-      !state.comments.some(function (comment) {
-        return Number(comment.id) === Number(state.reactionPickerCommentId);
-      })
-    ) {
-      state.reactionPickerCommentId = null;
-    }
 
     let currentDayKey = "";
     state.comments.forEach(function (comment) {
@@ -2196,6 +2250,16 @@
       beginReplyingToComment(state.contextMenuCommentId);
     }
   });
+  elements.commentMenuCopy.addEventListener("click", function () {
+    if (state.contextMenuCommentId !== null) {
+      copyCommentText(state.contextMenuCommentId);
+    }
+  });
+  elements.commentMenuCopyLink.addEventListener("click", function () {
+    if (state.contextMenuCommentId !== null) {
+      copyCommentLink(state.contextMenuCommentId);
+    }
+  });
   elements.commentMenuEdit.addEventListener("click", function () {
     if (state.contextMenuCommentId !== null) {
       beginEditingComment(state.contextMenuCommentId);
@@ -2243,7 +2307,6 @@
     releaseImagePressState();
     releaseCommentPressState();
     state.stickToBottom = isListNearBottom();
-    closeReactionPicker();
     closeCommentMenu();
   }, { passive: true });
   elements.input.addEventListener("focus", function () {
@@ -2296,13 +2359,6 @@
     if (state.menuOpenedAt && Date.now() - state.menuOpenedAt < 250) {
       return;
     }
-    const clickTarget = event.target instanceof Element ? event.target : null;
-    if (
-      state.reactionPickerCommentId !== null &&
-      (!clickTarget || !clickTarget.closest(".message__reactions"))
-    ) {
-      closeReactionPicker();
-    }
     if (
       state.contextMenuCommentId !== null &&
       !elements.commentMenu.contains(event.target) &&
@@ -2324,10 +2380,6 @@
         showNextImage();
       }
       return;
-    }
-    if (event.key === "Escape" && state.reactionPickerCommentId !== null) {
-      event.preventDefault();
-      closeReactionPicker();
     }
   });
   elements.loadOlder.addEventListener("click", function () {
