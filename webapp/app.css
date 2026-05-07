@@ -44,8 +44,7 @@ body {
   font-family: var(--font-ui);
 }
 
-body.image-viewer-open,
-body.profile-modal-open {
+body.image-viewer-open {
   overflow: hidden;
 }
 
@@ -325,21 +324,7 @@ body.profile-modal-open {
   box-shadow: 0 8px 18px rgba(57, 105, 184, 0.16);
 }
 
-.message__avatar-button {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 42px;
-  min-width: 42px;
-  height: 42px;
-  padding: 0;
-  border: none;
-  background: transparent;
-  cursor: pointer;
-}
-
-.message__avatar-button:focus-visible,
-.message__author-link:focus-visible,
+.message__author-target:focus-visible,
 .modal-card__button:focus-visible {
   outline: 2px solid rgba(47, 128, 255, 0.52);
   outline-offset: 3px;
@@ -350,8 +335,7 @@ body.profile-modal-open {
   color: #ffffff;
 }
 
-.message__avatar--image,
-.profile-card__avatar--image {
+.message__avatar--image {
   background-position: center;
   background-repeat: no-repeat;
   background-size: cover;
@@ -396,19 +380,11 @@ body.profile-modal-open {
   overflow-wrap: anywhere;
 }
 
-.message__author-link {
-  display: inline-flex;
-  align-items: center;
-  min-width: 0;
-  padding: 0;
-  border: none;
-  background: transparent;
-  color: inherit;
+.message__author-target {
   cursor: pointer;
-  text-align: left;
 }
 
-.message__author-link:hover .message__author {
+.message__author.message__author-target:hover {
   text-decoration: underline;
   text-decoration-thickness: 1px;
   text-underline-offset: 2px;
@@ -1018,129 +994,6 @@ body.profile-modal-open {
   box-shadow: none;
 }
 
-.profile-card {
-  display: grid;
-  gap: 16px;
-  max-height: min(88vh, 760px);
-  overflow: auto;
-}
-
-.profile-card__header {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: 14px;
-  align-items: center;
-}
-
-.profile-card__avatar {
-  --avatar-hue: 210;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 64px;
-  height: 64px;
-  border-radius: 22px;
-  background: linear-gradient(
-    135deg,
-    hsl(var(--avatar-hue) 76% 92%),
-    hsl(var(--avatar-hue) 78% 84%)
-  );
-  color: hsl(var(--avatar-hue) 46% 34%);
-  font-size: 24px;
-  font-weight: 800;
-  letter-spacing: -0.03em;
-  box-shadow: 0 14px 30px rgba(57, 105, 184, 0.18);
-}
-
-.profile-card__copy {
-  min-width: 0;
-}
-
-.profile-card__name {
-  margin-top: 6px;
-  color: var(--max-text);
-  font-size: 18px;
-  font-weight: 800;
-  line-height: 1.25;
-  overflow-wrap: anywhere;
-}
-
-.profile-card__username,
-.profile-card__status {
-  color: var(--max-muted);
-  font-size: 13px;
-  line-height: 1.45;
-}
-
-.profile-card__status {
-  margin: 0;
-}
-
-.profile-card__stats {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-}
-
-.profile-card__stat {
-  display: grid;
-  gap: 6px;
-  padding: 14px;
-  border: 1px solid rgba(47, 128, 255, 0.12);
-  border-radius: 18px;
-  background: rgba(242, 247, 255, 0.92);
-}
-
-.profile-card__stat-label {
-  color: var(--max-muted);
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.profile-card__stat-value {
-  color: var(--max-text);
-  font-size: 16px;
-  line-height: 1.2;
-}
-
-.profile-card__recent {
-  display: grid;
-  gap: 10px;
-}
-
-.profile-card__recent-title {
-  color: var(--max-text);
-  font-size: 13px;
-  font-weight: 800;
-}
-
-.profile-card__recent-list {
-  display: grid;
-  gap: 8px;
-}
-
-.profile-card__recent-item {
-  display: grid;
-  gap: 4px;
-  padding: 12px 14px;
-  border: 1px solid rgba(47, 128, 255, 0.1);
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.84);
-}
-
-.profile-card__recent-time {
-  color: var(--max-muted);
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.profile-card__recent-text {
-  color: var(--max-text);
-  font-size: 14px;
-  line-height: 1.45;
-  overflow-wrap: anywhere;
-}
-
 .report-card {
   display: grid;
   gap: 0;
@@ -1253,12 +1106,6 @@ body.profile-modal-open {
     font-size: 12px;
   }
 
-  .message__avatar-button {
-    width: 34px;
-    min-width: 34px;
-    height: 34px;
-  }
-
   .message__bubble {
     max-width: 100%;
   }
@@ -1362,25 +1209,6 @@ body.profile-modal-open {
     right: 18px;
   }
 
-  .profile-card {
-    padding: 18px;
-    gap: 14px;
-  }
-
-  .profile-card__header {
-    gap: 12px;
-  }
-
-  .profile-card__avatar {
-    width: 54px;
-    height: 54px;
-    border-radius: 18px;
-    font-size: 20px;
-  }
-
-  .profile-card__stats {
-    grid-template-columns: 1fr;
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {

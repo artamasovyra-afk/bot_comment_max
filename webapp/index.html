@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
     <title>Комментарии к посту</title>
-    <link rel="stylesheet" href="/webapp/app.css?v=20260508b">
+    <link rel="stylesheet" href="/webapp/app.css?v=20260508c">
     <script src="https://st.max.ru/js/max-web-app.js"></script>
   </head>
   <body>
@@ -103,18 +103,14 @@
 
     <template id="comment-template">
       <article class="message">
-        <button class="message__avatar-button" type="button" aria-label="Открыть профиль пользователя">
-          <span class="message__avatar"></span>
-        </button>
+        <div class="message__avatar"></div>
         <div class="message__content">
             <div class="message__bubble">
             <button class="message__menu-button" type="button" aria-label="Действия с комментарием">
               ⋯
             </button>
             <div class="message__meta">
-              <button class="message__author-link" type="button" aria-label="Открыть профиль пользователя">
-                <span class="message__author"></span>
-              </button>
+              <div class="message__author"></div>
             </div>
             <div class="message__reply" hidden>
               <div class="message__reply-author"></div>
@@ -191,40 +187,6 @@
       </section>
     </div>
 
-    <div id="profile-modal" class="modal-backdrop" hidden>
-      <section
-        class="modal-card profile-card"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="profile-modal-title"
-      >
-        <div class="profile-card__header">
-          <div id="profile-avatar" class="profile-card__avatar">?</div>
-          <div class="profile-card__copy">
-            <h2 id="profile-modal-title" class="modal-card__title">Профиль пользователя</h2>
-            <div id="profile-name" class="profile-card__name">Пользователь</div>
-            <div id="profile-username" class="profile-card__username" hidden></div>
-          </div>
-        </div>
-        <p id="profile-status" class="profile-card__status">Загружаем профиль…</p>
-        <div class="profile-card__stats">
-          <div class="profile-card__stat">
-            <span class="profile-card__stat-label">Комментарии в канале</span>
-            <strong id="profile-comments-count" class="profile-card__stat-value">0</strong>
-          </div>
-          <div class="profile-card__stat">
-            <span class="profile-card__stat-label">Первый комментарий</span>
-            <strong id="profile-first-comment" class="profile-card__stat-value">—</strong>
-          </div>
-        </div>
-        <div id="profile-recent" class="profile-card__recent" hidden>
-          <div class="profile-card__recent-title">Последние комментарии</div>
-          <div id="profile-recent-list" class="profile-card__recent-list"></div>
-        </div>
-        <button id="profile-close" class="modal-card__button" type="button">Закрыть</button>
-      </section>
-    </div>
-
     <div
       id="image-viewer"
       class="image-viewer"
@@ -248,6 +210,6 @@
       </button>
     </div>
 
-    <script src="/webapp/app.js?v=20260508b"></script>
+    <script src="/webapp/app.js?v=20260508c"></script>
   </body>
 </html>
