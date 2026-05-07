@@ -3288,7 +3288,7 @@ class MaxCommentsBot:
         }
         if permissions and "write" not in permissions:
             return False, "У бота нет права писать сообщения в канале."
-        edit_permissions = {"edit_message", "post_edit_delete_message", "delete_message"}
+        edit_permissions = {"edit", "edit_message", "post_edit_delete_message", "delete", "delete_message"}
         if permissions and not permissions.intersection(edit_permissions):
             return False, "У бота нет права редактировать посты канала."
         return True, None
