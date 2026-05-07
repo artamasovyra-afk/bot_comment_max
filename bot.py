@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib import error, parse, request
 
 from config import (
@@ -3050,27 +3050,166 @@ class MaxCommentsBot:
                 return value
         return None
 
-    def extract_forwarded_channel_post(self, message: dict[str, Any]) -> ForwardedChannelPost | None:
-        link = message.get("link") or (message.get("body") or {}).get("link")
-        if not isinstance(link, dict):
-            return None
+    def iter_nested_dicts(self, payload: Any) -> Iterable[dict[str, Any]]:
+        stack: list[Any] = [payload]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, dict):
+                yield current
+                stack.extend(current.values())
+            elif isinstance(current, list):
+                stack.extend(current)
 
-        channel_id_value = self.first_payload_value(
-            link,
+    def forwarded_payload_candidates(self, message: dict[str, Any]) -> list[dict[str, Any]]:
+        body = message.get("body") if isinstance(message.get("body"), dict) else {}
+        candidates: list[dict[str, Any]] = []
+        for value in (
+            message.get("link"),
+            body.get("link"),
+            body.get("forward"),
+            body.get("forwarded_message"),
+            body.get("shared_message"),
+        ):
+            if isinstance(value, dict):
+                candidates.append(value)
+
+        attachments = body.get("attachments")
+        if isinstance(attachments, list):
+            for attachment in attachments:
+                candidates.extend(self.iter_nested_dicts(attachment))
+
+        seen: set[int] = set()
+        unique_candidates: list[dict[str, Any]] = []
+        for candidate in candidates:
+            marker = id(candidate)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            unique_candidates.append(candidate)
+        return unique_candidates
+
+    def extract_channel_id_from_forward_payload(self, payload: dict[str, Any]) -> int | None:
+        direct_value = self.first_payload_value(
+            payload,
             [
                 ("chat_id",),
                 ("chatId",),
+                ("channel_id",),
+                ("channelId",),
                 ("from_chat_id",),
                 ("fromChatId",),
+                ("source_chat_id",),
+                ("sourceChatId",),
+                ("sender_chat_id",),
+                ("senderChatId",),
                 ("chat", "chat_id"),
                 ("chat", "chatId"),
+                ("chat", "id"),
+                ("channel", "chat_id"),
+                ("channel", "chatId"),
+                ("channel", "id"),
+                ("sender_chat", "chat_id"),
+                ("sender_chat", "chatId"),
+                ("senderChat", "chatId"),
+                ("senderChat", "id"),
                 ("message", "recipient", "chat_id"),
                 ("message", "recipient", "chatId"),
+                ("message", "recipient", "id"),
                 ("message", "chat_id"),
                 ("message", "chatId"),
             ],
         )
-        channel_id = validate_positive_int(channel_id_value, minimum=-10**18, maximum=10**18)
+        channel_id = validate_positive_int(direct_value, minimum=-10**18, maximum=10**18)
+        if channel_id is not None and channel_id != 0:
+            return channel_id
+
+        id_keys = ("chat_id", "chatId", "channel_id", "channelId")
+        for node in self.iter_nested_dicts(payload):
+            node_value = self.first_payload_value(node, [(key,) for key in id_keys])
+            node_channel_id = validate_positive_int(node_value, minimum=-10**18, maximum=10**18)
+            if node_channel_id is None or node_channel_id == 0:
+                continue
+            node_type = safe_text(node.get("type") or node.get("chat_type") or node.get("chatType")).lower()
+            has_chat_hint = bool(
+                safe_text(node.get("title") or node.get("name") or node.get("chat_title") or node.get("channel_title"))
+                or "channel" in node_type
+                or "chat" in node_type
+            )
+            if node_channel_id < 0 or has_chat_hint:
+                return node_channel_id
+        return None
+
+    def extract_channel_title_from_forward_payload(self, payload: dict[str, Any], channel_id: int) -> str:
+        title = safe_text(
+            self.first_payload_value(
+                payload,
+                [
+                    ("chat", "title"),
+                    ("chat", "name"),
+                    ("channel", "title"),
+                    ("channel", "name"),
+                    ("sender_chat", "title"),
+                    ("sender_chat", "name"),
+                    ("senderChat", "title"),
+                    ("senderChat", "name"),
+                    ("channel_title",),
+                    ("channelTitle",),
+                    ("chat_title",),
+                    ("chatTitle",),
+                    ("message", "recipient", "title"),
+                    ("message", "recipient", "name"),
+                ],
+            )
+        )
+        if title:
+            return title
+
+        for node in self.iter_nested_dicts(payload):
+            node_channel_id = self.extract_channel_id_from_forward_payload(node)
+            if node_channel_id != channel_id:
+                continue
+            title = safe_text(
+                node.get("title")
+                or node.get("name")
+                or node.get("chat_title")
+                or node.get("chatTitle")
+                or node.get("channel_title")
+                or node.get("channelTitle")
+            )
+            if title:
+                return title
+        return ""
+
+    def first_nested_text_value(self, payload: dict[str, Any], keys: set[str]) -> str:
+        for node in self.iter_nested_dicts(payload):
+            for key in keys:
+                value = safe_text(node.get(key))
+                if value:
+                    return value
+        return ""
+
+    def forward_payload_has_channel_hint(self, message: dict[str, Any]) -> bool:
+        for candidate in self.forwarded_payload_candidates(message):
+            if self.extract_channel_id_from_forward_payload(candidate) is not None:
+                return True
+            candidate_type = safe_text(candidate.get("type") or candidate.get("link_type") or candidate.get("linkType")).lower()
+            if any(marker in candidate_type for marker in ("forward", "message", "share", "link")):
+                return True
+        return False
+
+    def extract_forwarded_channel_post(self, message: dict[str, Any]) -> ForwardedChannelPost | None:
+        for link in self.forwarded_payload_candidates(message):
+            forwarded = self.extract_forwarded_channel_post_from_payload(message, link)
+            if forwarded is not None:
+                return forwarded
+        return None
+
+    def extract_forwarded_channel_post_from_payload(
+        self,
+        message: dict[str, Any],
+        link: dict[str, Any],
+    ) -> ForwardedChannelPost | None:
+        channel_id = self.extract_channel_id_from_forward_payload(link)
         if channel_id is None or channel_id == 0:
             return None
 
@@ -3083,26 +3222,21 @@ class MaxCommentsBot:
             or linked_body.get("message_id")
             or linked_message.get("message_id")
             or link.get("message_id")
+            or linked_body.get("messageId")
+            or linked_message.get("messageId")
+            or link.get("messageId")
+            or self.first_nested_text_value(link, {"mid", "message_id", "messageId"})
         ) or None
-        post_text = safe_text(linked_body.get("text") or linked_message.get("text") or link.get("text"))
-        post_url = safe_text(linked_message.get("url") or link.get("url")) or None
+        post_text = safe_text(
+            linked_body.get("text")
+            or linked_message.get("text")
+            or link.get("text")
+            or self.first_nested_text_value(link, {"text"})
+        )
+        post_url = safe_text(linked_message.get("url") or link.get("url") or self.first_nested_text_value(link, {"url"})) or None
         raw_attachments = linked_body.get("attachments") or linked_message.get("attachments") or []
         post_attachments = [item for item in raw_attachments if isinstance(item, dict)] if isinstance(raw_attachments, list) else []
-        channel_title = safe_text(
-            self.first_payload_value(
-                link,
-                [
-                    ("chat", "title"),
-                    ("chat", "name"),
-                    ("channel_title",),
-                    ("channelTitle",),
-                    ("chat_title",),
-                    ("chatTitle",),
-                    ("message", "recipient", "title"),
-                    ("message", "recipient", "name"),
-                ],
-            )
-        )
+        channel_title = self.extract_channel_title_from_forward_payload(link, int(channel_id))
         raw_payload = {
             "link": link,
             "body": message.get("body") or {},
@@ -3318,12 +3452,38 @@ class MaxCommentsBot:
     def handle_forwarded_channel_post_request(self, message: dict[str, Any], user_id: int) -> bool:
         forwarded = self.extract_forwarded_channel_post(message)
         if forwarded is None:
+            if self.forward_payload_has_channel_hint(message):
+                body = message.get("body") if isinstance(message.get("body"), dict) else {}
+                attachment_types = [
+                    safe_text(item.get("type"))
+                    for item in (body.get("attachments") or [])
+                    if isinstance(item, dict)
+                ]
+                logger.warning(
+                    "Forwarded channel request from user %s was not recognized. body_keys=%s attachment_types=%s",
+                    user_id,
+                    sorted(body.keys()),
+                    attachment_types,
+                )
+                self.api.send_message(
+                    user_id=user_id,
+                    text=(
+                        "Не удалось определить канал по пересланному сообщению.\n\n"
+                        "Проверьте, что:\n"
+                        "1. Сообщение переслано именно из канала.\n"
+                        "2. Бот добавлен в этот канал.\n"
+                        "3. Бот назначен администратором канала.\n\n"
+                        "После этого попробуйте переслать пост ещё раз."
+                    ),
+                )
+                return True
             return False
         if not self.ensure_user_accepted_terms(user_id):
             return True
 
         channel_id = int(forwarded.channel_id)
         if self.get_channel_binding(channel_id) is not None:
+            logger.info("Connection request skipped because channel %s is already connected", channel_id)
             self.api.send_message(
                 user_id=user_id,
                 text=(
@@ -3336,6 +3496,7 @@ class MaxCommentsBot:
 
         can_manage, manage_error = self.ensure_bot_can_manage_channel(channel_id)
         if not can_manage:
+            logger.warning("Connection request for channel %s rejected: bot cannot manage channel: %s", channel_id, manage_error)
             self.api.send_message(
                 user_id=user_id,
                 text=(
@@ -3350,6 +3511,7 @@ class MaxCommentsBot:
             return True
 
         if not self.requester_is_channel_admin(channel_id, user_id):
+            logger.warning("Connection request for channel %s rejected: user %s is not channel admin", channel_id, user_id)
             self.api.send_message(
                 user_id=user_id,
                 text=(
@@ -3361,6 +3523,7 @@ class MaxCommentsBot:
 
         pending = self.store.get_pending_channel_connection_request(channel_id=channel_id)
         if pending is not None:
+            logger.info("Connection request for channel %s skipped: pending request %s exists", channel_id, pending["id"])
             self.api.send_message(
                 user_id=user_id,
                 text=(
@@ -3381,6 +3544,12 @@ class MaxCommentsBot:
             requester_user_id=user_id,
             requester_max_user_id=user_id,
             raw_payload=forwarded.raw_payload,
+        )
+        logger.info(
+            "Created channel connection request %s for channel %s from user %s",
+            request_row["id"],
+            channel_id,
+            user_id,
         )
         self.notify_super_admins_about_channel_request(request_row)
         self.api.send_message(
