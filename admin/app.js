@@ -14,6 +14,8 @@
     insideMax: false,
     apiBase: panelConfig.apiBase || "/api/admin",
     mode: panelConfig.mode || "channel",
+    imageViewerItems: [],
+    imageViewerIndex: 0,
   };
 
   const $ = (selector) => document.querySelector(selector);
@@ -130,6 +132,183 @@
       .replaceAll(">", "&gt;")
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#039;");
+  }
+
+  function mediaItemKind(mediaItem) {
+    if (!mediaItem) return "";
+    const directKind = String(mediaItem.kind || mediaItem.type || "").trim().toLowerCase();
+    if (directKind) return directKind;
+    const mimeType = String(mediaItem.mime_type || mediaItem.mimeType || "").trim().toLowerCase();
+    return mimeType.startsWith("image/") ? "image" : "";
+  }
+
+  function normalizeMediaUrl(rawUrl) {
+    const value = String(rawUrl || "").trim();
+    if (!value) return "";
+    if (/^https?:\/\//i.test(value) || value.startsWith("data:")) {
+      return value;
+    }
+    if (value.startsWith("/")) {
+      return `${window.location.origin}${value}`;
+    }
+    return value;
+  }
+
+  function mediaImageUrl(mediaItem) {
+    if (!mediaItem || mediaItemKind(mediaItem) !== "image") {
+      return "";
+    }
+    return normalizeMediaUrl(
+      mediaItem.url ||
+      mediaItem.fileUrl ||
+      mediaItem.file_url ||
+      mediaItem.originalUrl ||
+      mediaItem.original_url ||
+      mediaItem.path ||
+      ""
+    );
+  }
+
+  function mediaThumbUrl(mediaItem) {
+    if (!mediaItem || mediaItemKind(mediaItem) !== "image") {
+      return "";
+    }
+    return normalizeMediaUrl(
+      mediaItem.thumbnailUrl ||
+      mediaItem.thumbnail_url ||
+      mediaItem.thumbUrl ||
+      mediaItem.thumb_url ||
+      mediaImageUrl(mediaItem)
+    );
+  }
+
+  function galleryImageItems(mediaItems) {
+    return (Array.isArray(mediaItems) ? mediaItems : [])
+      .filter((item) => mediaItemKind(item) === "image" && mediaImageUrl(item))
+      .map((item) => ({
+        id: Number(item.id || item.attachmentId || item.attachment_id || 0) || null,
+        url: mediaImageUrl(item),
+        thumbnailUrl: mediaThumbUrl(item),
+        width: Number(item.width || 0) || 0,
+        height: Number(item.height || 0) || 0,
+      }));
+  }
+
+  function updateImageViewer() {
+    const viewer = $("#image-viewer");
+    const image = $("#image-viewer-image");
+    const counter = $("#image-viewer-counter");
+    const prev = $("#image-viewer-prev");
+    const next = $("#image-viewer-next");
+    const items = state.imageViewerItems;
+    const total = items.length;
+    const item = total ? items[state.imageViewerIndex] : null;
+    if (!viewer || !image || !counter || !prev || !next || !item) {
+      closeImageViewer();
+      return;
+    }
+    image.src = item.url;
+    counter.textContent = total > 1 ? `${state.imageViewerIndex + 1} из ${total}` : "";
+    counter.hidden = total <= 1;
+    prev.hidden = total <= 1;
+    next.hidden = total <= 1;
+  }
+
+  function openImageViewer(items, index = 0) {
+    const viewer = $("#image-viewer");
+    const closeButton = $("#image-viewer-close");
+    const images = Array.isArray(items) ? items.filter((item) => item && item.url) : [];
+    if (!viewer || !closeButton || !images.length) {
+      return;
+    }
+    state.imageViewerItems = images;
+    state.imageViewerIndex = Math.max(0, Math.min(Number(index) || 0, images.length - 1));
+    viewer.hidden = false;
+    document.body.classList.add("image-viewer-open");
+    updateImageViewer();
+    closeButton.focus();
+  }
+
+  function closeImageViewer() {
+    const viewer = $("#image-viewer");
+    const image = $("#image-viewer-image");
+    if (!viewer || viewer.hidden) {
+      return;
+    }
+    viewer.hidden = true;
+    if (image) {
+      image.removeAttribute("src");
+    }
+    state.imageViewerItems = [];
+    state.imageViewerIndex = 0;
+    document.body.classList.remove("image-viewer-open");
+  }
+
+  function showNextImage() {
+    const total = state.imageViewerItems.length;
+    if (total <= 1) return;
+    state.imageViewerIndex = (state.imageViewerIndex + 1) % total;
+    updateImageViewer();
+  }
+
+  function showPrevImage() {
+    const total = state.imageViewerItems.length;
+    if (total <= 1) return;
+    state.imageViewerIndex = (state.imageViewerIndex - 1 + total) % total;
+    updateImageViewer();
+  }
+
+  function renderMediaGallery(mediaItems, logLabel) {
+    const items = galleryImageItems(mediaItems);
+    if (!items.length) {
+      return null;
+    }
+    const container = document.createElement("div");
+    container.className = `item-media${items.length === 1 ? " item-media--single" : ""}`;
+    items.forEach((item, index) => {
+      const button = document.createElement("button");
+      button.className = "item-media-button";
+      button.type = "button";
+      button.setAttribute("aria-label", "Открыть изображение");
+
+      const image = document.createElement("img");
+      image.className = "item-media-image";
+      image.alt = "Изображение комментария";
+      image.loading = "lazy";
+      if (item.width > 0) image.width = item.width;
+      if (item.height > 0) image.height = item.height;
+
+      const fallback = document.createElement("span");
+      fallback.className = "item-media-fallback";
+      fallback.textContent = "Изображение недоступно";
+      fallback.hidden = true;
+
+      image.addEventListener("load", () => {
+        image.hidden = false;
+        fallback.hidden = true;
+        button.classList.remove("is-error");
+      });
+      image.addEventListener("error", () => {
+        if ((image.currentSrc || image.src) !== item.url && item.url) {
+          image.src = item.url;
+          return;
+        }
+        image.hidden = true;
+        fallback.hidden = false;
+        button.classList.add("is-error");
+        console.warn("Admin image failed to load", {
+          context: logLabel,
+          attachmentId: item.id,
+          src: image.currentSrc || image.src || "",
+        });
+      });
+      button.addEventListener("click", () => openImageViewer(items, index));
+
+      image.src = item.thumbnailUrl || item.url;
+      button.append(image, fallback);
+      container.append(button);
+    });
+    return container;
   }
 
   function channelQuery() {
@@ -308,6 +487,7 @@
   function renderCommentItem(comment) {
     const item = document.createElement("article");
     item.className = "item";
+    const text = String(comment.text || "").trim();
     item.innerHTML = `
       <div class="item-row">
         <div>
@@ -317,7 +497,7 @@
         </div>
         ${statusPill(comment.status)}
       </div>
-      <div class="item-text">${escapeHtml(comment.text || "Фото/медиа")}</div>
+      ${text ? `<div class="item-text">${escapeHtml(text)}</div>` : ""}
       <div class="item-actions">
         ${
           comment.status === "active"
@@ -326,12 +506,17 @@
         }
       </div>
     `;
+    const mediaNode = renderMediaGallery(comment.media || comment.attachments, `comment:${comment.id}`);
+    if (mediaNode) {
+      item.querySelector(".item-actions")?.before(mediaNode);
+    }
     return item;
   }
 
   function renderReportItem(report) {
     const item = document.createElement("article");
     item.className = "item";
+    const commentText = String(report.comment_text || "").trim();
     item.innerHTML = `
       <div class="item-row">
         <div>
@@ -341,7 +526,7 @@
         </div>
         ${statusPill(report.status)}
       </div>
-      <div class="item-text">${escapeHtml(report.comment_text || "")}</div>
+      ${commentText ? `<div class="item-text">${escapeHtml(commentText)}</div>` : ""}
       ${report.details ? `<div class="item-meta">Описание: ${escapeHtml(report.details)}</div>` : ""}
       ${report.admin_comment ? `<div class="item-meta">Комментарий администратора: ${escapeHtml(report.admin_comment)}</div>` : ""}
       <div class="item-actions">
@@ -350,6 +535,13 @@
         <button class="ghost-button" type="button" data-reject-report="${report.id}">Отклонить</button>
       </div>
     `;
+    const mediaNode = renderMediaGallery(report.comment_media || report.attachments, `report:${report.id}`);
+    if (mediaNode) {
+      const detailsNode = item.querySelector(".item-actions");
+      if (detailsNode) {
+        detailsNode.before(mediaNode);
+      }
+    }
     return item;
   }
 
@@ -878,6 +1070,10 @@
   }
 
   function bindEvents() {
+    const viewer = $("#image-viewer");
+    const viewerClose = $("#image-viewer-close");
+    const viewerPrev = $("#image-viewer-prev");
+    const viewerNext = $("#image-viewer-next");
     $("#login-form").addEventListener("submit", handleLogin);
     $("#logout-button").addEventListener("click", handleLogout);
     $("#refresh-button").addEventListener("click", loadAll);
@@ -906,6 +1102,34 @@
       }
     });
     views.admin.addEventListener("click", handleAdminClick);
+    if (viewerClose) viewerClose.addEventListener("click", closeImageViewer);
+    if (viewerPrev) viewerPrev.addEventListener("click", (event) => {
+      event.stopPropagation();
+      showPrevImage();
+    });
+    if (viewerNext) viewerNext.addEventListener("click", (event) => {
+      event.stopPropagation();
+      showNextImage();
+    });
+    if (viewer) {
+      viewer.addEventListener("click", (event) => {
+        if (event.target === viewer) {
+          closeImageViewer();
+        }
+      });
+    }
+    document.addEventListener("keydown", (event) => {
+      if ($("#image-viewer")?.hidden) {
+        return;
+      }
+      if (event.key === "Escape") {
+        closeImageViewer();
+      } else if (event.key === "ArrowLeft") {
+        showPrevImage();
+      } else if (event.key === "ArrowRight") {
+        showNextImage();
+      }
+    });
   }
 
   async function bootstrap() {

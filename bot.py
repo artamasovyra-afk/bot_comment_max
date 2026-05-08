@@ -573,6 +573,110 @@ def serialize_comment_media(media_items: list[dict[str, Any]] | None) -> str:
     return json.dumps(media_items or [], ensure_ascii=False, separators=(",", ":"))
 
 
+def comment_media_storage_path(media_item: dict[str, Any] | None) -> str:
+    if not isinstance(media_item, dict):
+        return ""
+    direct_value = safe_text(media_item.get("storage_path")).strip("/")
+    if direct_value:
+        return direct_value
+    raw_candidates = [
+        media_item.get("path"),
+        media_item.get("public_path"),
+        media_item.get("url"),
+        media_item.get("fileUrl"),
+        media_item.get("file_url"),
+        media_item.get("originalUrl"),
+        media_item.get("original_url"),
+        media_item.get("thumbnailUrl"),
+        media_item.get("thumbnail_url"),
+    ]
+    for raw_candidate in raw_candidates:
+        candidate = safe_text(raw_candidate)
+        if not candidate:
+            continue
+        parsed_candidate = parse.urlparse(candidate)
+        candidate_path = parsed_candidate.path if parsed_candidate.scheme else candidate
+        if not candidate_path.startswith("/media/comments/"):
+            continue
+        relative_path = parse.unquote(candidate_path.removeprefix("/media/comments/")).strip("/")
+        if relative_path:
+            return relative_path
+    return ""
+
+
+def normalize_comment_media_item(media_item: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(media_item, dict):
+        return None
+    kind = safe_text(media_item.get("kind") or media_item.get("type")).lower()
+    mime_type = safe_text(media_item.get("mime_type") or media_item.get("mimeType")).lower()
+    if not kind and mime_type.startswith("image/"):
+        kind = "image"
+    if not kind:
+        return None
+
+    storage_path = comment_media_storage_path(media_item)
+    normalized_path = comment_media_public_path(storage_path) if storage_path else safe_text(
+        media_item.get("path") or media_item.get("public_path")
+    )
+    normalized_url = comment_media_public_url(storage_path) if storage_path else safe_text(
+        media_item.get("url")
+        or media_item.get("fileUrl")
+        or media_item.get("file_url")
+        or media_item.get("originalUrl")
+        or media_item.get("original_url")
+    )
+    if normalized_url.startswith("/"):
+        normalized_url = public_app_url(normalized_url)
+    if not normalized_url and normalized_path:
+        normalized_url = public_app_url(normalized_path)
+
+    thumbnail_url = safe_text(
+        media_item.get("thumbnailUrl")
+        or media_item.get("thumbnail_url")
+        or media_item.get("thumbUrl")
+        or media_item.get("thumb_url")
+    )
+    if thumbnail_url.startswith("/"):
+        thumbnail_url = public_app_url(thumbnail_url)
+    if not thumbnail_url:
+        thumbnail_url = normalized_url
+
+    size_bytes = validate_positive_int(
+        media_item.get("size_bytes") if "size_bytes" in media_item else media_item.get("sizeBytes"),
+        minimum=1,
+        maximum=COMMENT_IMAGE_MAX_BYTES,
+    )
+    width = validate_positive_int(media_item.get("width"), minimum=1, maximum=20000)
+    height = validate_positive_int(media_item.get("height"), minimum=1, maximum=20000)
+    file_name = safe_file_name(
+        media_item.get("file_name") if "file_name" in media_item else media_item.get("fileName"),
+        fallback="comment-image",
+    )
+
+    normalized: dict[str, Any] = {
+        "kind": kind,
+        "type": kind,
+        "storage_path": storage_path,
+        "url": normalized_url,
+        "path": normalized_path,
+        "fileUrl": normalized_url,
+        "file_url": normalized_url,
+        "originalUrl": normalized_url,
+        "original_url": normalized_url,
+        "thumbnailUrl": thumbnail_url,
+        "thumbnail_url": thumbnail_url,
+        "mime_type": mime_type,
+        "mimeType": mime_type,
+        "file_name": file_name,
+        "fileName": file_name,
+        "width": width,
+        "height": height,
+        "size_bytes": size_bytes,
+        "sizeBytes": size_bytes,
+    }
+    return normalized
+
+
 def deserialize_comment_media(raw_value: str | None) -> list[dict[str, Any]]:
     if not raw_value:
         return []
@@ -582,7 +686,12 @@ def deserialize_comment_media(raw_value: str | None) -> list[dict[str, Any]]:
         return []
     if not isinstance(payload, list):
         return []
-    return [item for item in payload if isinstance(item, dict)]
+    normalized_items: list[dict[str, Any]] = []
+    for item in payload:
+        normalized = normalize_comment_media_item(item)
+        if normalized is not None:
+            normalized_items.append(normalized)
+    return normalized_items
 
 
 def safe_file_name(file_name: Any, *, fallback: str) -> str:
@@ -2685,6 +2794,7 @@ class CommentStore:
                 comments.username AS comment_username,
                 comments.created_at AS comment_created_at,
                 comments.status AS comment_status,
+                comments.media_json AS comment_media_json,
                 posts.post_text AS post_text,
                 posts.post_title AS post_title,
                 COALESCE(report_counts.report_count, 0) AS report_count
@@ -5218,7 +5328,7 @@ class MaxCommentsBot:
         ]
 
     def comment_media_absolute_path(self, media_item: dict[str, Any]) -> Path | None:
-        storage_path = safe_text(media_item.get("storage_path"))
+        storage_path = comment_media_storage_path(media_item)
         if not storage_path:
             return None
         candidate = (COMMENT_MEDIA_DIR / storage_path).resolve()
@@ -5891,6 +6001,7 @@ class MaxCommentsBot:
         }
 
     def serialize_admin_comment(self, comment: sqlite3.Row) -> dict[str, Any]:
+        media_items = deserialize_comment_media(comment["media_json"]) if "media_json" in comment.keys() else []
         return {
             "id": int(comment["id"]),
             "post_id": safe_text(comment["post_message_id"]),
@@ -5906,9 +6017,12 @@ class MaxCommentsBot:
             "post_title": safe_text(comment["post_title"] if "post_title" in comment.keys() else "") or snippet(safe_text(comment["post_text"]), 90),
             "post_preview": snippet(safe_text(comment["post_text"]), 140),
             "reports_count": int(comment["report_count"] if "report_count" in comment.keys() else 0),
+            "media": media_items,
+            "attachments": media_items,
         }
 
     def serialize_report(self, report: sqlite3.Row) -> dict[str, Any]:
+        media_items = deserialize_comment_media(report["comment_media_json"]) if "comment_media_json" in report.keys() else []
         return {
             "id": int(report["id"]),
             "comment_id": int(report["comment_id"]),
@@ -5923,6 +6037,8 @@ class MaxCommentsBot:
             "created_at": safe_text(report["created_at"]),
             "updated_at": safe_text(report["updated_at"]),
             "comment_text": safe_text(report["comment_text"]),
+            "comment_media": media_items,
+            "attachments": media_items,
             "comment_author": safe_text(report["comment_author"]),
             "comment_username": safe_text(report["comment_username"]),
             "comment_created_at": safe_text(report["comment_created_at"]),
@@ -7255,6 +7371,7 @@ class MaxCommentsBot:
         reaction_summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         reaction_payload = reaction_summary if isinstance(reaction_summary, dict) else {}
+        media_items = deserialize_comment_media(comment["media_json"])
         normalized_my_reaction = (
             safe_text(reaction_payload.get("myReaction") or reaction_payload.get("my_reaction")) or None
         )
@@ -7280,7 +7397,8 @@ class MaxCommentsBot:
             "username": comment["username"],
             "author": self.serialize_comment_author(comment),
             "text": comment["text"],
-            "media": deserialize_comment_media(comment["media_json"]),
+            "media": media_items,
+            "attachments": media_items,
             "parent_comment": self.serialize_parent_comment(parent_comment),
             "source_kind": comment["source_kind"],
             "status": safe_text(comment["status"] if "status" in comment.keys() else COMMENT_STATUS_ACTIVE),
@@ -7589,6 +7707,7 @@ class CommentWebServer:
             def serve_comment_media(self, request_path: str) -> None:
                 file_path = self.resolve_comment_media_path(request_path)
                 if file_path is None:
+                    logger.warning("Comment media file not found for request path %s", request_path)
                     self.send_json(HTTPStatus.NOT_FOUND, {"error": "Media file not found"})
                     return
                 payload = file_path.read_bytes()
@@ -7603,6 +7722,7 @@ class CommentWebServer:
             def send_comment_media_headers(self, request_path: str) -> None:
                 file_path = self.resolve_comment_media_path(request_path)
                 if file_path is None:
+                    logger.warning("Comment media headers requested for missing path %s", request_path)
                     self.send_response(HTTPStatus.NOT_FOUND)
                     self.send_header("Content-Length", "0")
                     self.end_headers()

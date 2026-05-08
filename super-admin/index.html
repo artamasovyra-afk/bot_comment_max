@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Супер-админ MAX Comments</title>
-    <link rel="stylesheet" href="/admin/app.css?v=20260506a" />
+    <link rel="stylesheet" href="/admin/app.css?v=20260508b" />
   </head>
   <body>
     <main class="shell">
@@ -238,12 +238,22 @@
       </section>
     </main>
 
+    <div id="image-viewer" class="image-viewer" hidden>
+      <button id="image-viewer-close" class="image-viewer__close" type="button" aria-label="Закрыть">×</button>
+      <button id="image-viewer-prev" class="image-viewer__nav image-viewer__nav--prev" type="button" aria-label="Предыдущее изображение">‹</button>
+      <figure class="image-viewer__frame">
+        <img id="image-viewer-image" class="image-viewer__image" alt="Изображение комментария">
+        <figcaption id="image-viewer-counter" class="image-viewer__counter"></figcaption>
+      </figure>
+      <button id="image-viewer-next" class="image-viewer__nav image-viewer__nav--next" type="button" aria-label="Следующее изображение">›</button>
+    </div>
+
     <script>
       window.ADMIN_PANEL_CONFIG = {
         mode: "super",
         apiBase: "/api/super-admin"
       };
     </script>
-    <script src="/admin/app.js?v=20260506a"></script>
+    <script src="/admin/app.js?v=20260508b"></script>
   </body>
 </html>

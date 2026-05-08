@@ -390,7 +390,8 @@
     }
 
     items.forEach(function (mediaItem) {
-      if (!mediaItem || mediaItem.kind !== "image" || !mediaItem.url) {
+      const imageUrl = mediaImageUrl(mediaItem);
+      if (!mediaItem || mediaItemKind(mediaItem) !== "image" || !imageUrl) {
         return;
       }
       const image = document.createElement("img");
@@ -408,7 +409,7 @@
           scrollCommentsToBottom();
         }
       });
-      image.src = mediaItem.preview_url || mediaItem.url;
+      image.src = normalizeMediaAssetUrl(mediaItem.preview_url || mediaItem.previewUrl || imageUrl);
       container.appendChild(image);
     });
 
@@ -540,25 +541,55 @@
     openExternalUrl(targetUrl);
   }
 
-  function mediaImageUrl(mediaItem) {
-    if (!mediaItem || mediaItem.kind !== "image") {
+  function mediaItemKind(mediaItem) {
+    if (!mediaItem) {
       return "";
     }
-    return String(
+    const directKind = String(mediaItem.kind || mediaItem.type || "").trim().toLowerCase();
+    if (directKind) {
+      return directKind;
+    }
+    const mimeType = String(mediaItem.mime_type || mediaItem.mimeType || "").trim().toLowerCase();
+    if (mimeType.indexOf("image/") === 0) {
+      return "image";
+    }
+    return "";
+  }
+
+  function normalizeMediaAssetUrl(rawUrl) {
+    const normalized = String(rawUrl || "").trim();
+    if (!normalized) {
+      return "";
+    }
+    if (/^https?:\/\//i.test(normalized) || normalized.indexOf("data:") === 0) {
+      return normalized;
+    }
+    if (normalized.charAt(0) === "/") {
+      return `${window.location.origin}${normalized}`;
+    }
+    return normalized;
+  }
+
+  function mediaImageUrl(mediaItem) {
+    if (!mediaItem || mediaItemKind(mediaItem) !== "image") {
+      return "";
+    }
+    return normalizeMediaAssetUrl(
       mediaItem.url ||
       mediaItem.fileUrl ||
       mediaItem.file_url ||
       mediaItem.originalUrl ||
       mediaItem.original_url ||
+      mediaItem.path ||
       ""
     );
   }
 
   function mediaThumbUrl(mediaItem) {
-    if (!mediaItem || mediaItem.kind !== "image") {
+    if (!mediaItem || mediaItemKind(mediaItem) !== "image") {
       return "";
     }
-    return String(
+    return normalizeMediaAssetUrl(
       mediaItem.thumbnailUrl ||
       mediaItem.thumbnail_url ||
       mediaItem.thumbUrl ||
@@ -570,12 +601,15 @@
   function commentImageItems(mediaItems) {
     return (Array.isArray(mediaItems) ? mediaItems : [])
       .filter(function (mediaItem) {
-        return mediaItem && mediaItem.kind === "image" && mediaImageUrl(mediaItem);
+        return mediaItem && mediaItemKind(mediaItem) === "image" && mediaImageUrl(mediaItem);
       })
       .map(function (mediaItem) {
         return {
+          id: Number(mediaItem.id || mediaItem.attachmentId || mediaItem.attachment_id || 0) || null,
           url: mediaImageUrl(mediaItem),
           thumbnailUrl: mediaThumbUrl(mediaItem),
+          width: Number(mediaItem.width || 0) || 0,
+          height: Number(mediaItem.height || 0) || 0,
         };
       });
   }
@@ -1135,14 +1169,31 @@
       fallback.className = "message__image-fallback";
       fallback.textContent = "Изображение недоступно";
       fallback.hidden = true;
+      if (mediaItem.width > 0) {
+        image.width = mediaItem.width;
+      }
+      if (mediaItem.height > 0) {
+        image.height = mediaItem.height;
+      }
       image.addEventListener("load", function () {
+        image.hidden = false;
+        fallback.hidden = true;
         if (state.stickToBottom) {
           scrollCommentsToBottom();
         }
       });
       image.addEventListener("error", function () {
+        if ((image.currentSrc || image.src) !== mediaItem.url && mediaItem.url) {
+          image.src = mediaItem.url;
+          return;
+        }
         image.hidden = true;
         fallback.hidden = false;
+        console.warn("Comment image failed to load", {
+          commentId: commentId,
+          attachmentId: mediaItem.id,
+          src: image.currentSrc || image.src || "",
+        });
       });
       bindImageInteraction(button, commentId, items, index);
       image.src = mediaItem.thumbnailUrl || mediaItem.url;
