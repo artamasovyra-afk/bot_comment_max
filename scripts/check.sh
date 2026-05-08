@@ -10,5 +10,7 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 1
 fi
 
+python3 -m black --check .
+python3 -m isort --check-only .
 PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m py_compile bot.py config.py
 python3 -m json.tool data/taboo_words_ru_en_uk.json >/dev/null

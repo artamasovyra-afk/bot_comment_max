@@ -84,7 +84,6 @@ WEBHOOK_PATH = os.getenv("MAX_WEBHOOK_PATH", "/webhook").strip() or "/webhook"
 if not WEBHOOK_PATH.startswith("/"):
     WEBHOOK_PATH = f"/{WEBHOOK_PATH}"
 WEBHOOK_SECRET = optional_env("MAX_WEBHOOK_SECRET")
-WEBHOOK_PUBLIC_URL = (
-    optional_env("MAX_WEBHOOK_PUBLIC_URL")
-    or (f"{WEB_APP_PUBLIC_URL}{WEBHOOK_PATH}" if WEB_APP_PUBLIC_URL else "")
+WEBHOOK_PUBLIC_URL = optional_env("MAX_WEBHOOK_PUBLIC_URL") or (
+    f"{WEB_APP_PUBLIC_URL}{WEBHOOK_PATH}" if WEB_APP_PUBLIC_URL else ""
 )

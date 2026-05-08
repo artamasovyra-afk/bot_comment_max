@@ -51,13 +51,15 @@
 
 Само приложение в runtime по-прежнему использует только стандартную библиотеку Python.
 
-Для разработки и unit-тестов в [requirements.txt](/Users/urij/vscode/requirements.txt:1) теперь добавлен `pytest`.
+Для разработки и unit-тестов в [requirements.txt](/Users/urij/vscode/requirements.txt:1) теперь добавлены `pytest`, `black` и `isort`.
 
 Это даёт единый воспроизводимый способ подготовки окружения на новой машине:
 
 ```bash
 pip install -r requirements.txt
 ```
+
+Автоформатирование в этой задаче не применялось ко всему проекту целиком: для `black` и `isort` добавлена конфигурация, а большой файл [bot.py](/Users/urij/vscode/bot.py:1) пока временно исключён из проверок, чтобы не создавать неконтролируемый diff на тысячи строк.
 
 ## Настройка
 
@@ -166,6 +168,15 @@ python3 bot.py
 
 ## Проверки
 
+Проверка форматирования:
+
+```bash
+black .
+isort .
+black --check .
+isort --check-only .
+```
+
 Быстрая локальная проверка проекта:
 
 ```bash
@@ -192,6 +203,11 @@ pytest
 - валидацию allowed emoji реакций
 - hash/verify пароля администратора
 - генерацию и проверку admin session token
+
+`./scripts/check.sh` теперь дополнительно запускает:
+
+- `black --check .`
+- `isort --check-only .`
 
 ## Режим доставки событий
 

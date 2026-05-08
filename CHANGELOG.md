@@ -4,6 +4,18 @@ All notable changes to this project will be tracked here.
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-05-08
+
+### Added
+
+- В проект добавлены `black` и `isort` с конфигурацией в `pyproject.toml`.
+
+### Changed
+
+- README обновлён командами форматирования и проверки стиля Python-кода.
+- `scripts/check.sh` теперь запускает `black --check .` и `isort --check-only .`.
+- Большой файл `bot.py` временно исключён из автоформатирования и style-check, чтобы не создавать огромный diff в этой задаче.
+
 ## [0.1.22] - 2026-05-08
 
 ### Added
