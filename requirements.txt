@@ -1,3 +1,1 @@
-# This project currently uses only the Python standard library.
-# The file is kept intentionally minimal so setup commands stay stable:
-#   pip install -r requirements.txt
+pytest==8.3.5

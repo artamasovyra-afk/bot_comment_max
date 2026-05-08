@@ -4,6 +4,17 @@ All notable changes to this project will be tracked here.
 
 ## [Unreleased]
 
+## [0.1.22] - 2026-05-08
+
+### Added
+
+- В `requirements.txt` добавлен `pytest` для локального запуска unit-тестов.
+- Добавлена папка `tests/` и базовый набор unit-тестов для безопасных функций без MAX API.
+
+### Changed
+
+- README обновлён инструкцией по запуску `pytest` и описанием минимального тестового покрытия.
+
 ## [0.1.21] - 2026-05-08
 
 ### Added
