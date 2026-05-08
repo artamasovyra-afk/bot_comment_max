@@ -7392,6 +7392,8 @@ class MaxCommentsBot:
             "id": comment_id_override or int(comment["id"]),
             "post_message_id": comment["post_message_id"],
             "parent_comment_id": int(comment["parent_comment_id"]) if comment["parent_comment_id"] is not None else None,
+            "replyToCommentId": int(comment["parent_comment_id"]) if comment["parent_comment_id"] is not None else None,
+            "reply_to_comment_id": int(comment["parent_comment_id"]) if comment["parent_comment_id"] is not None else None,
             "user_id": int(comment["user_id"]),
             "display_name": comment["display_name"],
             "username": comment["username"],
@@ -7400,6 +7402,8 @@ class MaxCommentsBot:
             "media": media_items,
             "attachments": media_items,
             "parent_comment": self.serialize_parent_comment(parent_comment),
+            "replyPreview": self.serialize_parent_comment(parent_comment),
+            "reply_preview": self.serialize_parent_comment(parent_comment),
             "source_kind": comment["source_kind"],
             "status": safe_text(comment["status"] if "status" in comment.keys() else COMMENT_STATUS_ACTIVE),
             "reactions": reactions,
@@ -7414,6 +7418,8 @@ class MaxCommentsBot:
         is_deleted = safe_text(comment["status"] if "status" in comment.keys() else COMMENT_STATUS_ACTIVE) != COMMENT_STATUS_ACTIVE
         return {
             "id": int(comment["id"]),
+            "authorName": safe_text(comment["display_name"]) or None,
+            "author_name": safe_text(comment["display_name"]) or None,
             "user_id": int(comment["user_id"]),
             "display_name": comment["display_name"],
             "username": comment["username"],

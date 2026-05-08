@@ -54,6 +54,7 @@
     imageViewerIndex: 0,
     imagePress: null,
     commentPress: null,
+    revealingReplyTarget: false,
     reactionRequestCommentIds: new Set(),
     lastImageTouchOpenAt: 0,
     lastImageMenuOpenAt: 0,
@@ -1206,18 +1207,54 @@
   }
 
   function renderReplyReference(container, parentComment) {
+    if (!container) {
+      return;
+    }
     if (!parentComment) {
+      container.removeAttribute("data-reply-comment-id");
+      container.removeAttribute("role");
+      container.removeAttribute("tabindex");
+      container.removeAttribute("aria-label");
+      container.classList.remove("message__reply--interactive");
       container.hidden = true;
       return;
     }
     const authorNode = container.querySelector(".message__reply-author");
     const textNode = container.querySelector(".message__reply-text");
-    const author = parentComment.username
-      ? `${parentComment.display_name} @${parentComment.username}`
-      : parentComment.display_name;
-    const preview = parentComment.text || (parentComment.has_media ? "Фото" : "Комментарий");
+    const targetCommentId = Number(
+      parentComment.id ||
+      parentComment.replyToCommentId ||
+      parentComment.reply_to_comment_id ||
+      0
+    ) || null;
+    const status = String(parentComment.status || "").trim().toLowerCase();
+    const displayName = String(
+      parentComment.display_name ||
+      parentComment.authorName ||
+      parentComment.author_name ||
+      ""
+    ).trim();
+    const username = String(parentComment.username || "").trim();
+    const author = username && displayName
+      ? `${displayName} @${username}`
+      : displayName || (username ? `@${username}` : "Комментарий");
+    const preview = String(parentComment.text || "").trim() || (parentComment.has_media ? "Фото" : "Комментарий");
+    const canJumpToSource = Boolean(targetCommentId && (!status || status === "active"));
     authorNode.textContent = author;
     textNode.textContent = preview;
+    if (canJumpToSource) {
+      container.dataset.replyCommentId = String(targetCommentId);
+      container.classList.add("message__reply--interactive");
+      container.tabIndex = 0;
+      container.setAttribute("role", "button");
+      container.setAttribute("aria-label", "Перейти к исходному комментарию");
+    } else {
+      container.removeAttribute("data-reply-comment-id");
+      container.removeAttribute("role");
+      container.removeAttribute("tabindex");
+      container.removeAttribute("aria-label");
+      container.classList.remove("message__reply--interactive");
+    }
     container.hidden = false;
   }
 
@@ -1317,6 +1354,85 @@
         highlightCommentNode(targetNode);
       }
     });
+  }
+
+  function captureBannerState() {
+    return {
+      hidden: Boolean(elements.banner.hidden),
+      text: String(elements.banner.textContent || ""),
+      tone: String(elements.banner.dataset.tone || ""),
+    };
+  }
+
+  function restoreBannerState(snapshot) {
+    if (!snapshot || snapshot.hidden || !snapshot.text) {
+      clearBanner();
+      return;
+    }
+    setBanner(snapshot.text, snapshot.tone);
+  }
+
+  async function revealReplyTargetComment(commentId) {
+    const normalizedCommentId = Number(commentId) || null;
+    if (!normalizedCommentId) {
+      setBanner("Исходный комментарий недоступен.", "warning");
+      haptic("warning");
+      return false;
+    }
+    if (getCommentNode(normalizedCommentId)) {
+      scrollToComment(normalizedCommentId, { highlight: true });
+      haptic("light");
+      return true;
+    }
+    if (state.revealingReplyTarget) {
+      return false;
+    }
+    if (!state.hasMore) {
+      setBanner("Исходный комментарий недоступен.", "warning");
+      haptic("warning");
+      return false;
+    }
+
+    const previousBanner = captureBannerState();
+    let loadingBannerShown = false;
+    state.revealingReplyTarget = true;
+    state.loadingOlder = true;
+    updateThreadControls();
+
+    try {
+      while (!getCommentNode(normalizedCommentId) && state.hasMore) {
+        if (!loadingBannerShown) {
+          setBanner("Ищем исходный комментарий…", "loading");
+          loadingBannerShown = true;
+        }
+        const previousOldestCommentId = state.oldestCommentId;
+        await loadThread({ loadOlder: true, silent: true });
+        if (state.oldestCommentId === previousOldestCommentId) {
+          break;
+        }
+      }
+
+      if (getCommentNode(normalizedCommentId)) {
+        if (loadingBannerShown) {
+          restoreBannerState(previousBanner);
+        }
+        scrollToComment(normalizedCommentId, { highlight: true });
+        haptic("light");
+        return true;
+      }
+
+      setBanner("Исходный комментарий недоступен.", "warning");
+      haptic("warning");
+      return false;
+    } catch (error) {
+      setBanner(error.message || "Не удалось перейти к исходному комментарию.", "error");
+      haptic("warning");
+      return false;
+    } finally {
+      state.revealingReplyTarget = false;
+      state.loadingOlder = false;
+      updateThreadControls();
+    }
   }
 
   function updateLocalReadState(commentId) {
@@ -1549,7 +1665,7 @@
   function isCommentLongPressIgnoredTarget(target) {
     return Boolean(
       target &&
-      target.closest(".message__image-button, .message__menu-button, .message__author-target, button, a, input, textarea, select")
+      target.closest(".message__image-button, .message__menu-button, .message__author-target, .message__reply--interactive, button, a, input, textarea, select")
     );
   }
 
@@ -1727,6 +1843,33 @@
     }
   }
 
+  function bindReplyReferenceHandlers(container) {
+    if (!container) {
+      return;
+    }
+    container.addEventListener("click", function (event) {
+      const targetCommentId = Number(container.dataset.replyCommentId || 0) || null;
+      if (!targetCommentId) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      revealReplyTargetComment(targetCommentId);
+    });
+    container.addEventListener("keydown", function (event) {
+      if (event.key !== "Enter" && event.key !== " ") {
+        return;
+      }
+      const targetCommentId = Number(container.dataset.replyCommentId || 0) || null;
+      if (!targetCommentId) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      revealReplyTargetComment(targetCommentId);
+    });
+  }
+
   function bindCommentActionHandlers(node, comment) {
     if (!hasCommentActions(comment)) {
       return;
@@ -1897,6 +2040,7 @@
       node.querySelector(".message__author").textContent = authorText;
       node.querySelector(".message__time").textContent = formatCommentTime(comment.created_at);
       renderReplyReference(replyNode, comment.parent_comment);
+      bindReplyReferenceHandlers(replyNode);
       renderCommentMedia(mediaNode, comment.media, comment.id);
       textNode.textContent = comment.text || "";
       textNode.hidden = !comment.text;
