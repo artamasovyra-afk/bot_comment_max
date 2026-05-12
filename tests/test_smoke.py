@@ -141,3 +141,84 @@ def test_admin_session_token_roundtrip_and_tamper(
 
     monkeypatch.setattr(bot_module.time, "time", lambda: 1_700_000_000 + 3601)
     assert app.admin_context_from_session_token(token) is None
+
+
+def test_resolve_message_user_id_prefers_sender_without_chat_lookup(bot_module) -> None:
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.bot_info = {"user_id": 999}
+    app.dialog_user_cache = {}
+
+    class FakeApi:
+        def get_chat(self, chat_id: int) -> dict[str, object]:
+            raise AssertionError("get_chat should not be called when sender.user_id is present")
+
+    app.api = FakeApi()
+
+    message = {
+        "sender": {"user_id": 42},
+        "recipient": {"chat_type": "dialog", "chat_id": 555, "user_id": 999},
+    }
+
+    assert app.resolve_message_user_id(message) == 42
+
+
+def test_resolve_message_user_id_falls_back_to_dialog_with_user(bot_module) -> None:
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.bot_info = {"user_id": 999}
+    app.dialog_user_cache = {}
+
+    class FakeApi:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        def get_chat(self, chat_id: int) -> dict[str, object]:
+            self.calls.append(chat_id)
+            return {"dialog_with_user": {"user_id": 4242}}
+
+    fake_api = FakeApi()
+    app.api = fake_api
+
+    message = {
+        "recipient": {"chat_type": "dialog", "chat_id": 555, "user_id": 999},
+        "link": {"type": "forward", "chat_id": -74631532033454},
+    }
+
+    assert app.resolve_message_user_id(message) == 4242
+    assert app.resolve_message_user_id(message) == 4242
+    assert fake_api.calls == [555]
+
+
+def test_handle_new_message_uses_resolved_dialog_user_for_forwarded_channel_request(
+    bot_module,
+) -> None:
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.bot_info = {"user_id": 999}
+    app.dialog_user_cache = {}
+
+    class FakeApi:
+        def get_chat(self, chat_id: int) -> dict[str, object]:
+            return {"dialog_with_user": {"user_id": 4242}}
+
+    app.api = FakeApi()
+    app.is_own_message = lambda sender: False
+    app.maybe_auto_attach_channel_post = lambda message: False
+    app.message_text_or_payload = lambda message: ""
+    app.handle_senderless_channel_command = lambda message, text: False
+    app.forward_payload_has_channel_hint = lambda message: True
+
+    captured: dict[str, int] = {}
+
+    def fake_handle_forwarded(message: dict[str, object], user_id: int) -> bool:
+        captured["user_id"] = user_id
+        return True
+
+    app.handle_forwarded_channel_post_request = fake_handle_forwarded
+
+    message = {
+        "recipient": {"chat_type": "dialog", "chat_id": 555, "user_id": 999},
+        "link": {"type": "forward", "chat_id": -74631532033454},
+    }
+
+    app.handle_new_message(message)
+
+    assert captured == {"user_id": 4242}

@@ -70,6 +70,7 @@ BIND_CHANNEL_CODE_TTL_SECONDS = 30 * 60
 BIND_CHANNEL_CLEANUP_INTERVAL_SECONDS = 10 * 60
 SUPPORTED_DELIVERY_MODES = {"polling", "webhook"}
 WEBHOOK_UPDATE_TYPES = ["message_created"]
+DIALOG_USER_CACHE_TTL_SECONDS = 5 * 60
 ADMIN_SESSION_COOKIE = "max_comments_admin"
 SUPER_ADMIN_SESSION_COOKIE = "max_comments_super_admin"
 ADMIN_SESSION_MAX_AGE_SECONDS = 24 * 60 * 60
@@ -3093,6 +3094,7 @@ class MaxCommentsBot:
         self.update_queue: queue.Queue = queue.Queue()
         self.update_worker_thread: threading.Thread | None = None
         self.chat_info_cache: dict[int, tuple[dict[str, str], float]] = {}
+        self.dialog_user_cache: dict[int, tuple[int, float]] = {}
 
     def run(self) -> None:
         logger.info("Starting MAX Comments bot version %s", APP_VERSION)
@@ -3777,14 +3779,96 @@ class MaxCommentsBot:
     def handle_update(self, update: dict[str, Any]) -> None:
         update_type = safe_text(update.get("update_type"))
         if update_type != "message_created":
-            logger.info("Ignored update type: %s", update_type or "<empty>")
+            logger.info(
+                "Ignored update type: %s payload_keys=%s",
+                update_type or "<empty>",
+                sorted(update.keys()),
+            )
             return
         self.handle_new_message(update.get("message") or {})
+
+    def message_reply_chat_id(self, message: dict[str, Any]) -> int | None:
+        recipient = message.get("recipient") if isinstance(message.get("recipient"), dict) else {}
+        return validate_positive_int(
+            recipient.get("chat_id"),
+            minimum=1,
+            maximum=10**18,
+        )
+
+    def resolve_message_user_id(self, message: dict[str, Any]) -> int | None:
+        sender = message.get("sender") if isinstance(message.get("sender"), dict) else {}
+        sender_user = sender.get("user") if isinstance(sender.get("user"), dict) else {}
+        for candidate in (
+            sender.get("user_id"),
+            sender_user.get("user_id"),
+            sender_user.get("id"),
+            sender.get("id"),
+        ):
+            user_id = validate_positive_int(candidate, minimum=1, maximum=10**18)
+            if user_id is not None:
+                return user_id
+
+        recipient = message.get("recipient") if isinstance(message.get("recipient"), dict) else {}
+        recipient_user_id = validate_positive_int(
+            recipient.get("user_id"),
+            minimum=1,
+            maximum=10**18,
+        )
+        bot_user_id = validate_positive_int(
+            (self.bot_info or {}).get("user_id"),
+            minimum=1,
+            maximum=10**18,
+        )
+        if recipient_user_id is not None and (bot_user_id is None or recipient_user_id != bot_user_id):
+            return recipient_user_id
+
+        if safe_text(recipient.get("chat_type")) != "dialog":
+            return None
+        dialog_chat_id = validate_positive_int(
+            recipient.get("chat_id"),
+            minimum=1,
+            maximum=10**18,
+        )
+        if dialog_chat_id is None:
+            return None
+
+        cached = self.dialog_user_cache.get(dialog_chat_id)
+        now = time.time()
+        if cached is not None and now - cached[1] <= DIALOG_USER_CACHE_TTL_SECONDS:
+            return cached[0]
+
+        try:
+            chat = self.api.get_chat(dialog_chat_id)
+        except MaxApiError as exc:
+            logger.warning("Failed to resolve dialog user for chat %s: %s", dialog_chat_id, exc)
+            return None
+
+        dialog_user = chat.get("dialog_with_user") if isinstance(chat.get("dialog_with_user"), dict) else {}
+        dialog_user_id = validate_positive_int(
+            dialog_user.get("user_id") or dialog_user.get("id"),
+            minimum=1,
+            maximum=10**18,
+        )
+        if dialog_user_id is None:
+            logger.warning(
+                "Dialog chat %s does not expose dialog_with_user.user_id while resolving message sender",
+                dialog_chat_id,
+            )
+            return None
+
+        self.dialog_user_cache[dialog_chat_id] = (dialog_user_id, now)
+        logger.info(
+            "Resolved requester user %s from dialog chat %s via dialog_with_user",
+            dialog_user_id,
+            dialog_chat_id,
+        )
+        return dialog_user_id
 
     def handle_new_message(self, message: dict[str, Any]) -> None:
         text = self.message_text_or_payload(message)
         sender = message.get("sender") or {}
-        user_id = sender.get("user_id")
+        user_id = self.resolve_message_user_id(message)
+        reply_chat_id = self.message_reply_chat_id(message)
         if self.is_own_message(sender):
             return
         if self.maybe_auto_attach_channel_post(message):
@@ -3792,6 +3876,30 @@ class MaxCommentsBot:
         if not user_id:
             if text.startswith("/") and self.handle_senderless_channel_command(message, text):
                 return
+            if self.forward_payload_has_channel_hint(message):
+                body = message.get("body") if isinstance(message.get("body"), dict) else {}
+                recipient = message.get("recipient") if isinstance(message.get("recipient"), dict) else {}
+                attachment_types = [
+                    safe_text(item.get("type"))
+                    for item in (body.get("attachments") or [])
+                    if isinstance(item, dict)
+                ]
+                logger.warning(
+                    "Forwarded channel request without resolvable requester user_id. "
+                    "sender_keys=%s recipient_keys=%s body_keys=%s attachment_types=%s",
+                    sorted(sender.keys()),
+                    sorted(recipient.keys()),
+                    sorted(body.keys()),
+                    attachment_types,
+                )
+                if reply_chat_id is not None:
+                    self.api.send_message(
+                        chat_id=reply_chat_id,
+                        text=(
+                            "Не удалось определить пользователя, отправившего пересланный пост.\n\n"
+                            "Откройте диалог с ботом кнопкой “Начать” и перешлите пост ещё раз."
+                        ),
+                    )
             return
 
         if text.startswith("/"):
@@ -3848,6 +3956,12 @@ class MaxCommentsBot:
                 )
                 return True
             return False
+        logger.info(
+            "Resolved forwarded channel request candidate from user %s for channel %s post %s",
+            user_id,
+            forwarded.channel_id,
+            forwarded.post_message_id or "<unknown>",
+        )
         if not self.ensure_user_accepted_terms(user_id):
             return True
 
