@@ -651,7 +651,11 @@
       return;
     }
     for (const admin of state.admins) {
-      const displayName = admin.display_name || admin.username || "Имя не указано";
+      const resolvedName = admin.resolved_name || admin.display_name || admin.username || "Имя не указано";
+      const firstName = admin.first_name || (!admin.first_name && !admin.last_name ? resolvedName : "—");
+      const lastName = admin.last_name || "—";
+      const displayName = admin.display_name || "—";
+      const username = admin.username ? `@${String(admin.username).replace(/^@+/, "")}` : "—";
       const channelText = admin.role === "super_admin"
         ? "Все каналы"
         : (admin.channel_ids || []).join(", ") || "Каналы не назначены";
@@ -661,8 +665,12 @@
       item.innerHTML = `
         <div class="item-row">
           <div>
-            <div class="item-title">${escapeHtml(admin.max_user_id)}</div>
-            <div class="item-meta">Имя: ${escapeHtml(displayName)}</div>
+            <div class="item-title">${escapeHtml(resolvedName)}</div>
+            <div class="item-meta">MAX ID: ${escapeHtml(admin.max_user_id)}</div>
+            <div class="item-meta">Имя: ${escapeHtml(firstName)}</div>
+            <div class="item-meta">Фамилия: ${escapeHtml(lastName)}</div>
+            <div class="item-meta">display_name: ${escapeHtml(displayName)}</div>
+            <div class="item-meta">username: ${escapeHtml(username)}</div>
             <div class="item-meta">Роль: ${escapeHtml(admin.role)} · ${admin.is_active ? "активен" : "отключён"}</div>
             <div class="item-meta">Каналы: ${escapeHtml(channelText)} · всего ${Number(admin.channel_count || 0)}</div>
             ${admin.must_change_password ? '<div class="item-meta">Пароль по умолчанию, нужна смена</div>' : ""}

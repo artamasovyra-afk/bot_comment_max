@@ -327,6 +327,63 @@ def test_admin_delete_user_rejects_last_active_super_admin(bot_module, tmp_path)
     assert int(reloaded["is_active"]) == 1
 
 
+def test_admin_list_users_enriches_missing_profile_from_channel_member_lookup(
+    bot_module, tmp_path
+) -> None:
+    store = bot_module.CommentStore(str(tmp_path / "admin-profiles.sqlite3"))
+    store.ensure_admin_user(
+        max_user_id="424242",
+        role=bot_module.ROLE_CHANNEL_ADMIN,
+        password="password",
+        must_change_password=False,
+        is_active=True,
+    )
+    store.add_channel_admin(user_id=424242, channel_id=-1001)
+
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.store = store
+
+    class FakeApi:
+        def get_chat_members(
+            self, chat_id: int, *, user_ids: list[int] | None = None
+        ) -> list[dict[str, object]]:
+            assert chat_id == -1001
+            assert user_ids == [424242]
+            return [
+                {
+                    "user_id": 424242,
+                    "first_name": "Иван",
+                    "last_name": "Петров",
+                    "username": "ivan_petrov",
+                }
+            ]
+
+    app.api = FakeApi()
+
+    context = bot_module.AdminContext(
+        user_id=9001,
+        role=bot_module.ROLE_SUPER_ADMIN,
+        channel_ids=set(),
+        admin_user_id=9001,
+    )
+
+    payload = app.admin_list_users(context)
+
+    assert payload["ok"] is True
+    assert payload["users"][0]["first_name"] == "Иван"
+    assert payload["users"][0]["last_name"] == "Петров"
+    assert payload["users"][0]["display_name"] == "Иван Петров"
+    assert payload["users"][0]["username"] == "ivan_petrov"
+    assert payload["users"][0]["resolved_name"] == "Иван Петров"
+
+    reloaded = store.get_admin_user_by_max_user_id("424242")
+    assert reloaded is not None
+    assert reloaded["first_name"] == "Иван"
+    assert reloaded["last_name"] == "Петров"
+    assert reloaded["display_name"] == "Иван Петров"
+    assert reloaded["username"] == "ivan_petrov"
+
+
 def test_requester_channel_admin_status_returns_unknown_when_max_api_cannot_verify(
     bot_module,
 ) -> None:

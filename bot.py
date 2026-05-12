@@ -354,6 +354,27 @@ def ensure_comment_text_has_no_taboo(text: str) -> None:
         raise CommentBlockedError(category=safe_text(result.get("category")) or "taboo")
 
 
+def build_admin_profile_display_name(
+    *,
+    first_name: str | None = None,
+    last_name: str | None = None,
+    display_name: str | None = None,
+    username: str | None = None,
+) -> str:
+    clean_first_name = safe_text(first_name)
+    clean_last_name = safe_text(last_name)
+    full_name = " ".join(part for part in [clean_first_name, clean_last_name] if part)
+    if full_name:
+        return full_name
+    clean_display_name = safe_text(display_name)
+    if clean_display_name:
+        return clean_display_name
+    clean_username = safe_text(username).lstrip("@")
+    if clean_username:
+        return f"@{clean_username}"
+    return ""
+
+
 def humanize_comment_error_message(message: str) -> str:
     normalized = safe_text(message)
     if not normalized:
@@ -953,6 +974,16 @@ class MaxApiClient:
             return []
         return [item for item in members if isinstance(item, dict)]
 
+    def get_chat_members(self, chat_id: int, *, user_ids: list[int] | None = None) -> list[dict[str, Any]]:
+        query: dict[str, Any] = {}
+        if user_ids:
+            query["user_ids"] = [int(user_id) for user_id in user_ids]
+        payload = self._request("GET", f"/chats/{int(chat_id)}/members", query=query or None)
+        members = payload.get("members") or payload.get("participants") or []
+        if not isinstance(members, list):
+            return []
+        return [item for item in members if isinstance(item, dict)]
+
     def get_chat_member_me(self, chat_id: int) -> dict[str, Any]:
         return self._request("GET", f"/chats/{int(chat_id)}/members/me")
 
@@ -1195,6 +1226,10 @@ class CommentStore:
                     max_user_id TEXT NOT NULL UNIQUE,
                     password_hash TEXT NOT NULL,
                     role TEXT NOT NULL,
+                    first_name TEXT,
+                    last_name TEXT,
+                    display_name TEXT,
+                    username TEXT,
                     must_change_password INTEGER NOT NULL DEFAULT 1,
                     is_active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
@@ -1316,6 +1351,26 @@ class CommentStore:
         if "delete_reason" not in post_columns:
             self.conn.execute(
                 "ALTER TABLE posts ADD COLUMN delete_reason TEXT"
+            )
+        admin_user_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(admin_users)").fetchall()
+        }
+        if "first_name" not in admin_user_columns:
+            self.conn.execute(
+                "ALTER TABLE admin_users ADD COLUMN first_name TEXT"
+            )
+        if "last_name" not in admin_user_columns:
+            self.conn.execute(
+                "ALTER TABLE admin_users ADD COLUMN last_name TEXT"
+            )
+        if "display_name" not in admin_user_columns:
+            self.conn.execute(
+                "ALTER TABLE admin_users ADD COLUMN display_name TEXT"
+            )
+        if "username" not in admin_user_columns:
+            self.conn.execute(
+                "ALTER TABLE admin_users ADD COLUMN username TEXT"
             )
         self.conn.executescript(
             """
@@ -1505,6 +1560,10 @@ class CommentStore:
         max_user_id: str | int,
         role: str,
         password: str | None = None,
+        first_name: str | None = None,
+        last_name: str | None = None,
+        display_name: str | None = None,
+        username: str | None = None,
         must_change_password: bool = True,
         is_active: bool = True,
     ) -> sqlite3.Row:
@@ -1515,6 +1574,20 @@ class CommentStore:
         if not normalized_user_id:
             raise ValueError("max_user_id is required")
         existing = self.get_admin_user_by_max_user_id(normalized_user_id)
+        clean_first_name = safe_text(first_name) or None
+        clean_last_name = safe_text(last_name) or None
+        clean_username = safe_text(username).lstrip("@") or None
+        clean_display_name = build_admin_profile_display_name(
+            first_name=clean_first_name,
+            last_name=clean_last_name,
+            display_name=display_name,
+            username=clean_username,
+        ) or None
+        if existing is not None:
+            clean_first_name = clean_first_name if clean_first_name is not None else safe_text(existing["first_name"]) or None
+            clean_last_name = clean_last_name if clean_last_name is not None else safe_text(existing["last_name"]) or None
+            clean_display_name = clean_display_name if clean_display_name is not None else safe_text(existing["display_name"]) or None
+            clean_username = clean_username if clean_username is not None else safe_text(existing["username"]).lstrip("@") or None
         now = utc_now()
         with self.lock:
             if existing is None:
@@ -1524,17 +1597,25 @@ class CommentStore:
                         max_user_id,
                         password_hash,
                         role,
+                        first_name,
+                        last_name,
+                        display_name,
+                        username,
                         must_change_password,
                         is_active,
                         created_at,
                         updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         normalized_user_id,
                         hash_admin_password(password or normalized_user_id),
                         normalized_role,
+                        clean_first_name,
+                        clean_last_name,
+                        clean_display_name,
+                        clean_username,
                         1 if must_change_password else 0,
                         1 if is_active else 0,
                         now,
@@ -1546,12 +1627,20 @@ class CommentStore:
                     """
                     UPDATE admin_users
                     SET role = ?,
+                        first_name = ?,
+                        last_name = ?,
+                        display_name = ?,
+                        username = ?,
                         is_active = ?,
                         updated_at = ?
                     WHERE max_user_id = ?
                     """,
                     (
                         normalized_role,
+                        clean_first_name,
+                        clean_last_name,
+                        clean_display_name,
+                        clean_username,
                         1 if is_active else 0,
                         now,
                         normalized_user_id,
@@ -1562,6 +1651,50 @@ class CommentStore:
         if row is None:
             raise RuntimeError("admin user was not saved")
         return row
+
+    def update_admin_user_profile(
+        self,
+        *,
+        admin_user_id: int,
+        first_name: str | None = None,
+        last_name: str | None = None,
+        display_name: str | None = None,
+        username: str | None = None,
+    ) -> sqlite3.Row | None:
+        row = self.get_admin_user_by_id(admin_user_id)
+        if row is None:
+            return None
+        clean_first_name = safe_text(first_name) or None
+        clean_last_name = safe_text(last_name) or None
+        clean_username = safe_text(username).lstrip("@") or None
+        clean_display_name = build_admin_profile_display_name(
+            first_name=clean_first_name,
+            last_name=clean_last_name,
+            display_name=display_name,
+            username=clean_username,
+        ) or None
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE admin_users
+                SET first_name = ?,
+                    last_name = ?,
+                    display_name = ?,
+                    username = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    clean_first_name,
+                    clean_last_name,
+                    clean_display_name,
+                    clean_username,
+                    utc_now(),
+                    int(admin_user_id),
+                ),
+            )
+            self.conn.commit()
+        return self.get_admin_user_by_id(admin_user_id)
 
     def list_admin_users(self) -> list[sqlite3.Row]:
         with self.lock:
@@ -6159,34 +6292,125 @@ class MaxCommentsBot:
             "must_change_password": context.must_change_password,
         }
 
-    def serialize_admin_user(self, admin_user: sqlite3.Row) -> dict[str, Any]:
-        raw_channel_ids = safe_text(admin_user["channel_ids"] if "channel_ids" in admin_user.keys() else "")
-        channel_ids = [
+    @staticmethod
+    def admin_user_value(admin_user: sqlite3.Row | dict[str, Any], key: str) -> Any:
+        if isinstance(admin_user, sqlite3.Row):
+            return admin_user[key] if key in admin_user.keys() else None
+        return admin_user.get(key)
+
+    def admin_user_channel_ids(self, admin_user: sqlite3.Row | dict[str, Any]) -> list[int]:
+        raw_channel_ids = self.admin_user_value(admin_user, "channel_ids")
+        if isinstance(raw_channel_ids, list):
+            normalized_channel_ids: set[int] = set()
+            for item in raw_channel_ids:
+                channel_id = validate_positive_int(item, minimum=-10**18, maximum=10**18)
+                if channel_id is not None:
+                    normalized_channel_ids.add(int(channel_id))
+            return sorted(normalized_channel_ids)
+        return [
             int(item)
-            for item in raw_channel_ids.split(",")
+            for item in safe_text(raw_channel_ids).split(",")
             if safe_text(item)
         ]
-        role = safe_text(admin_user["role"])
-        is_active = bool(int(admin_user["is_active"]))
+
+    def enrich_admin_user_profile(self, admin_user: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        payload = dict(admin_user)
+        first_name = safe_text(self.admin_user_value(payload, "first_name"))
+        last_name = safe_text(self.admin_user_value(payload, "last_name"))
+        display_name = safe_text(self.admin_user_value(payload, "display_name"))
+        username = safe_text(self.admin_user_value(payload, "username")).lstrip("@")
+        if any([first_name, last_name, display_name, username]):
+            return payload
+        admin_user_id = validate_positive_int(self.admin_user_value(payload, "id"), minimum=1, maximum=10**18)
+        max_user_id = validate_positive_int(
+            self.admin_user_value(payload, "max_user_id"),
+            minimum=1,
+            maximum=10**18,
+        )
+        if admin_user_id is None or max_user_id is None:
+            return payload
+        for channel_id in self.admin_user_channel_ids(payload):
+            try:
+                members = self.api.get_chat_members(channel_id, user_ids=[int(max_user_id)])
+            except Exception:
+                logger.info(
+                    "Failed to load admin profile for %s from channel %s",
+                    max_user_id,
+                    channel_id,
+                )
+                continue
+            member = next(
+                (
+                    item
+                    for item in members
+                    if validate_positive_int(item.get("user_id"), minimum=1, maximum=10**18) == int(max_user_id)
+                ),
+                None,
+            )
+            if member is None:
+                continue
+            refreshed_first_name = safe_text(member.get("first_name")) or None
+            refreshed_last_name = safe_text(member.get("last_name")) or None
+            refreshed_username = safe_text(member.get("username")).lstrip("@") or None
+            refreshed_display_name = build_admin_profile_display_name(
+                first_name=refreshed_first_name,
+                last_name=refreshed_last_name,
+                username=refreshed_username,
+            ) or None
+            if not any([refreshed_first_name, refreshed_last_name, refreshed_display_name, refreshed_username]):
+                continue
+            self.store.update_admin_user_profile(
+                admin_user_id=int(admin_user_id),
+                first_name=refreshed_first_name,
+                last_name=refreshed_last_name,
+                display_name=refreshed_display_name,
+                username=refreshed_username,
+            )
+            payload.update(
+                {
+                    "first_name": refreshed_first_name,
+                    "last_name": refreshed_last_name,
+                    "display_name": refreshed_display_name,
+                    "username": refreshed_username,
+                }
+            )
+            return payload
+        return payload
+
+    def serialize_admin_user(self, admin_user: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        channel_ids = self.admin_user_channel_ids(admin_user)
+        role = safe_text(self.admin_user_value(admin_user, "role"))
+        is_active = bool(int(self.admin_user_value(admin_user, "is_active") or 0))
+        first_name = safe_text(self.admin_user_value(admin_user, "first_name"))
+        last_name = safe_text(self.admin_user_value(admin_user, "last_name"))
+        display_name = safe_text(self.admin_user_value(admin_user, "display_name"))
+        username = safe_text(self.admin_user_value(admin_user, "username")).lstrip("@")
+        resolved_name = build_admin_profile_display_name(
+            first_name=first_name,
+            last_name=last_name,
+            display_name=display_name,
+            username=username,
+        ) or "Имя не указано"
         return {
-            "id": int(admin_user["id"]),
-            "max_user_id": safe_text(admin_user["max_user_id"]),
+            "id": int(self.admin_user_value(admin_user, "id")),
+            "max_user_id": safe_text(self.admin_user_value(admin_user, "max_user_id")),
             "role": role,
-            "must_change_password": bool(int(admin_user["must_change_password"])),
+            "must_change_password": bool(int(self.admin_user_value(admin_user, "must_change_password") or 0)),
             "is_active": is_active,
             "channel_ids": channel_ids,
             "channel_count": len(channel_ids),
-            "display_name": safe_text(
-                admin_user["display_name"] if "display_name" in admin_user.keys() else ""
-            ),
-            "username": safe_text(admin_user["username"] if "username" in admin_user.keys() else ""),
+            "first_name": first_name,
+            "last_name": last_name,
+            "display_name": display_name,
+            "username": username,
+            "resolved_name": resolved_name,
             "can_delete": not (
                 role == ROLE_SUPER_ADMIN
                 and is_active
                 and self.store.count_active_admin_users_by_role(ROLE_SUPER_ADMIN) <= 1
             ),
-            "created_at": safe_text(admin_user["created_at"]),
-            "updated_at": safe_text(admin_user["updated_at"]),
+            "created_at": safe_text(self.admin_user_value(admin_user, "created_at")),
+            "updated_at": safe_text(self.admin_user_value(admin_user, "updated_at")),
         }
 
     def require_super_admin(self, context: AdminContext) -> None:
@@ -6739,11 +6963,12 @@ class MaxCommentsBot:
 
     def admin_list_users(self, context: AdminContext) -> dict[str, Any]:
         self.require_super_admin(context)
+        rows = [self.enrich_admin_user_profile(row) for row in self.store.list_admin_users()]
         return {
             "ok": True,
             "users": [
                 self.serialize_admin_user(row)
-                for row in self.store.list_admin_users()
+                for row in rows
             ],
         }
 
