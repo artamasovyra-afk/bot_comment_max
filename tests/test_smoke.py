@@ -8,12 +8,12 @@ import pytest
 
 
 @pytest.fixture
-def bot_module(monkeypatch: pytest.MonkeyPatch):
+def bot_module(monkeypatch: pytest.MonkeyPatch, tmp_path):
     monkeypatch.setenv("MAX_BOT_TOKEN", "test-token")
     monkeypatch.setenv("SUPER_ADMIN_LOGIN", "owner")
     monkeypatch.setenv("SUPER_ADMIN_PASSWORD", "owner-password")
     monkeypatch.setenv("ADMIN_SESSION_SECRET", "test-secret")
-    monkeypatch.setenv("MAX_DATABASE_PATH", "/tmp/max-comments-tests.sqlite3")
+    monkeypatch.setenv("MAX_DATABASE_PATH", str(tmp_path / "max-comments-tests.sqlite3"))
     sys.modules.pop("config", None)
     sys.modules.pop("bot", None)
     return importlib.import_module("bot")
@@ -243,6 +243,88 @@ def test_handle_update_bot_started_sends_terms_for_new_user(bot_module) -> None:
     app.handle_update({"update_type": "bot_started", "user": {"user_id": 101}})
 
     assert captured == [101]
+
+
+def test_admin_delete_user_soft_deletes_and_clears_channel_links(bot_module, tmp_path) -> None:
+    store = bot_module.CommentStore(str(tmp_path / "admin-delete.sqlite3"))
+    admin_user = store.ensure_admin_user(
+        max_user_id="424242",
+        role=bot_module.ROLE_CHANNEL_ADMIN,
+        password="password",
+        must_change_password=False,
+        is_active=True,
+    )
+    store.add_channel_admin(user_id=424242, channel_id=-1001)
+    store.add_channel_admin(user_id=424242, channel_id=-1002)
+
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.store = store
+
+    context = bot_module.AdminContext(
+        user_id=9001,
+        role=bot_module.ROLE_SUPER_ADMIN,
+        channel_ids=set(),
+        admin_user_id=9001,
+    )
+
+    result = app.admin_delete_user(context, admin_user_id=int(admin_user["id"]))
+
+    assert result == {
+        "ok": True,
+        "deletedAdminUserId": int(admin_user["id"]),
+        "deletedMaxUserId": "424242",
+        "removedChannelLinks": 2,
+        "removedSessions": 0,
+        "softDelete": True,
+    }
+    deleted_row = store.get_admin_user_by_id(int(admin_user["id"]))
+    assert deleted_row is not None
+    assert int(deleted_row["is_active"]) == 0
+    assert int(deleted_row["must_change_password"]) == 1
+    assert store.list_channel_admin_channel_ids(424242) == set()
+    assert app.admin_context_for_user(424242) is None
+
+    audit_row = store.conn.execute(
+        """
+        SELECT action, entity_type, entity_id, payload
+        FROM admin_audit_log
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    assert audit_row is not None
+    assert audit_row["action"] == "delete_admin_user"
+    assert audit_row["entity_type"] == "admin_user"
+    assert audit_row["entity_id"] == str(int(admin_user["id"]))
+    assert '"removedChannelLinks": 2' in audit_row["payload"]
+
+
+def test_admin_delete_user_rejects_last_active_super_admin(bot_module, tmp_path) -> None:
+    store = bot_module.CommentStore(str(tmp_path / "last-super-admin.sqlite3"))
+    super_admin = store.ensure_admin_user(
+        max_user_id="777",
+        role=bot_module.ROLE_SUPER_ADMIN,
+        password="password",
+        must_change_password=False,
+        is_active=True,
+    )
+
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.store = store
+
+    context = bot_module.AdminContext(
+        user_id=9001,
+        role=bot_module.ROLE_SUPER_ADMIN,
+        channel_ids=set(),
+        admin_user_id=9001,
+    )
+
+    with pytest.raises(bot_module.MaxApiError, match="LAST_SUPER_ADMIN"):
+        app.admin_delete_user(context, admin_user_id=int(super_admin["id"]))
+
+    reloaded = store.get_admin_user_by_id(int(super_admin["id"]))
+    assert reloaded is not None
+    assert int(reloaded["is_active"]) == 1
 
 
 def test_requester_channel_admin_status_returns_unknown_when_max_api_cannot_verify(

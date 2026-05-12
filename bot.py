@@ -362,6 +362,7 @@ def humanize_comment_error_message(message: str) -> str:
         "Post not found": "Пост для комментария больше не найден. Попробуйте открыть обсуждение заново.",
         "Parent comment not found": "Комментарий, на который вы отвечаете, больше не найден.",
         "Comment not found": "Комментарий не найден.",
+        "Admin user not found": "Администратор не найден.",
         "Comment is deleted": "Комментарий удалён.",
         "Comment is empty": "Комментарий пустой. Напишите текст или прикрепите фото.",
         "Comment is too long": "Комментарий слишком длинный. Максимум 4000 символов.",
@@ -376,6 +377,7 @@ def humanize_comment_error_message(message: str) -> str:
         "ACCESS_DENIED": ADMIN_LOGIN_ACCESS_DENIED_MESSAGE,
         "INVALID_CREDENTIALS": INVALID_CREDENTIALS_MESSAGE,
         "FORBIDDEN": FORBIDDEN_MESSAGE,
+        "LAST_SUPER_ADMIN": "Нельзя удалить последнего супер-администратора.",
         "Report already exists": REPORT_ALREADY_EXISTS_MESSAGE,
         "Invalid report reason": "Выберите причину жалобы.",
     }.get(normalized, normalized)
@@ -1446,6 +1448,18 @@ class CommentStore:
             ).fetchall()
         return {int(row["channel_id"]) for row in rows}
 
+    def count_active_admin_users_by_role(self, role: str) -> int:
+        with self.lock:
+            row = self.conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM admin_users
+                WHERE role = ? AND is_active = 1
+                """,
+                (safe_text(role),),
+            ).fetchone()
+        return int(row["count"] if row is not None else 0)
+
     def list_channel_bindings_for_channels(self, channel_ids: set[int]) -> list[sqlite3.Row]:
         normalized_ids = sorted({int(channel_id) for channel_id in channel_ids})
         if not normalized_ids:
@@ -1623,6 +1637,46 @@ class CommentStore:
             )
             self.conn.commit()
         return self.get_admin_user_by_id(admin_user_id)
+
+    def soft_delete_admin_user(self, *, admin_user_id: int) -> dict[str, Any] | None:
+        row = self.get_admin_user_by_id(admin_user_id)
+        if row is None:
+            return None
+        normalized_user_id = safe_text(row["max_user_id"])
+        removed_channel_links = 0
+        with self.lock:
+            try:
+                self.conn.execute("BEGIN")
+                if normalized_user_id.isdigit():
+                    cursor = self.conn.execute(
+                        """
+                        DELETE FROM channel_admins
+                        WHERE user_id = ?
+                        """,
+                        (int(normalized_user_id),),
+                    )
+                    removed_channel_links = max(int(cursor.rowcount), 0)
+                self.conn.execute(
+                    """
+                    UPDATE admin_users
+                    SET is_active = 0,
+                        must_change_password = 1,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (utc_now(), int(admin_user_id)),
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+        updated = self.get_admin_user_by_id(admin_user_id)
+        if updated is None:
+            raise RuntimeError("admin user was deleted unexpectedly")
+        return {
+            "admin_user": updated,
+            "removed_channel_links": removed_channel_links,
+        }
 
     def set_admin_password(
         self,
@@ -6112,13 +6166,25 @@ class MaxCommentsBot:
             for item in raw_channel_ids.split(",")
             if safe_text(item)
         ]
+        role = safe_text(admin_user["role"])
+        is_active = bool(int(admin_user["is_active"]))
         return {
             "id": int(admin_user["id"]),
             "max_user_id": safe_text(admin_user["max_user_id"]),
-            "role": safe_text(admin_user["role"]),
+            "role": role,
             "must_change_password": bool(int(admin_user["must_change_password"])),
-            "is_active": bool(int(admin_user["is_active"])),
+            "is_active": is_active,
             "channel_ids": channel_ids,
+            "channel_count": len(channel_ids),
+            "display_name": safe_text(
+                admin_user["display_name"] if "display_name" in admin_user.keys() else ""
+            ),
+            "username": safe_text(admin_user["username"] if "username" in admin_user.keys() else ""),
+            "can_delete": not (
+                role == ROLE_SUPER_ADMIN
+                and is_active
+                and self.store.count_active_admin_users_by_role(ROLE_SUPER_ADMIN) <= 1
+            ),
             "created_at": safe_text(admin_user["created_at"]),
             "updated_at": safe_text(admin_user["updated_at"]),
         }
@@ -6678,7 +6744,6 @@ class MaxCommentsBot:
             "users": [
                 self.serialize_admin_user(row)
                 for row in self.store.list_admin_users()
-                if safe_text(row["role"]) == ROLE_CHANNEL_ADMIN
             ],
         }
 
@@ -6857,6 +6922,52 @@ class MaxCommentsBot:
             payload={"max_user_id": safe_text(row["max_user_id"])},
         )
         return {"ok": True}
+
+    def admin_delete_user(
+        self,
+        context: AdminContext,
+        *,
+        admin_user_id: int,
+    ) -> dict[str, Any]:
+        self.require_super_admin(context)
+        row = self.store.get_admin_user_by_id(admin_user_id)
+        if row is None:
+            raise MaxApiError("Admin user not found")
+        role = safe_text(row["role"])
+        is_active = bool(int(row["is_active"]))
+        if role == ROLE_SUPER_ADMIN and is_active:
+            active_super_admins = self.store.count_active_admin_users_by_role(ROLE_SUPER_ADMIN)
+            if active_super_admins <= 1:
+                raise MaxApiError("LAST_SUPER_ADMIN")
+        result = self.store.soft_delete_admin_user(admin_user_id=admin_user_id)
+        if result is None:
+            raise MaxApiError("Admin user not found")
+        updated_admin_user = result["admin_user"]
+        removed_channel_links = int(result["removed_channel_links"])
+        removed_sessions = 0
+        self.store.add_admin_audit_log(
+            admin_user_id=context.user_id,
+            channel_id=0,
+            action="delete_admin_user",
+            entity_type="admin_user",
+            entity_id=admin_user_id,
+            payload={
+                "deletedAdminUserId": int(updated_admin_user["id"]),
+                "deletedMaxUserId": safe_text(updated_admin_user["max_user_id"]),
+                "deletedRole": role,
+                "softDelete": True,
+                "removedChannelLinks": removed_channel_links,
+                "removedSessions": removed_sessions,
+            },
+        )
+        return {
+            "ok": True,
+            "deletedAdminUserId": int(updated_admin_user["id"]),
+            "deletedMaxUserId": safe_text(updated_admin_user["max_user_id"]),
+            "removedChannelLinks": removed_channel_links,
+            "removedSessions": removed_sessions,
+            "softDelete": True,
+        }
 
     def admin_create_post(
         self,
@@ -8712,6 +8823,28 @@ class CommentWebServer:
                             post_reference=post_reference,
                             reason="Удалено администратором",
                         )
+                    except MaxApiError as exc:
+                        self.send_max_api_error(exc)
+                        return
+                    self.send_json(HTTPStatus.OK, result)
+                    return
+                if path.startswith("/api/admin/users/") and "/channels/" not in path:
+                    try:
+                        raw_admin_user_id = path.removeprefix("/api/admin/users/").strip("/")
+                        if "/" in raw_admin_user_id:
+                            self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+                            return
+                        admin_user_id = int(parse.unquote(raw_admin_user_id))
+                        result = app.admin_delete_user(
+                            context,
+                            admin_user_id=admin_user_id,
+                        )
+                    except ValueError:
+                        self.send_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {"ok": False, "error": "INVALID_ID", "message": "Некорректный ID"},
+                        )
+                        return
                     except MaxApiError as exc:
                         self.send_max_api_error(exc)
                         return

@@ -290,6 +290,7 @@ export SUPER_ADMIN_PASSWORD="VeryStrongPassword123"
 - заявки на подключение каналов
 - все посты, комментарии и жалобы
 - назначение администраторов каналов
+- удаление администраторов из системы с очисткой их привязок к каналам
 - ручная синхронизация
 - webhook/polling
 - системная информация и версия проекта
@@ -349,12 +350,21 @@ export SUPER_ADMIN_PASSWORD="VeryStrongPassword123"
 Чтобы назначить администратора канала:
 
 1. Войдите в `/super-admin`.
-2. Откройте раздел `Администраторы каналов`.
+2. Откройте раздел `Администраторы`.
 3. Укажите MAX user id, роль `channel_admin` и выберите доступные каналы.
 4. Сохраните. Новый администратор входит с логином MAX user id и паролем по умолчанию MAX user id.
 
 Чтобы администратор канала сменил пароль, он входит в `/admin` и использует форму в предупреждении `Вы используете пароль по умолчанию`.
 Выход выполняется кнопкой `Выйти`, backend очищает cookie-сессию соответствующей панели.
+
+Супер-администратор может удалить администратора из системы в разделе `/super-admin → Администраторы`.
+При удалении:
+
+- запись администратора переводится в `inactive` через soft delete
+- очищаются его связи с каналами
+- старые cookie-сессии перестают давать доступ, потому что backend больше не пропускает `is_active = 0`
+- исторические комментарии, посты и сами каналы не удаляются
+- действие записывается в `admin_audit_log`
 
 ## Подключение канала через заявку
 
@@ -610,6 +620,7 @@ ssh root@188.225.58.60 'install -m 700 -d /root/.ssh && cat >> /root/.ssh/author
 - `GET /api/super-admin/users`
 - `POST /api/super-admin/users`
 - `PATCH /api/super-admin/users/<admin_user_id>`
+- `DELETE /api/super-admin/users/<admin_user_id>`
 - `POST /api/super-admin/users/<admin_user_id>/reset-password`
 - `DELETE /api/super-admin/users/<admin_user_id>/channels/<channel_id>`
 - `POST /api/super-admin/channels`

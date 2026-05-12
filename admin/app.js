@@ -651,26 +651,40 @@
       return;
     }
     for (const admin of state.admins) {
+      const displayName = admin.display_name || admin.username || "Имя не указано";
       const channelText = admin.role === "super_admin"
         ? "Все каналы"
         : (admin.channel_ids || []).join(", ") || "Каналы не назначены";
+      const deleteBlocked = admin.can_delete === false;
       const item = document.createElement("article");
       item.className = "item";
       item.innerHTML = `
         <div class="item-row">
           <div>
             <div class="item-title">${escapeHtml(admin.max_user_id)}</div>
+            <div class="item-meta">Имя: ${escapeHtml(displayName)}</div>
             <div class="item-meta">Роль: ${escapeHtml(admin.role)} · ${admin.is_active ? "активен" : "отключён"}</div>
-            <div class="item-meta">Каналы: ${escapeHtml(channelText)}</div>
+            <div class="item-meta">Каналы: ${escapeHtml(channelText)} · всего ${Number(admin.channel_count || 0)}</div>
             ${admin.must_change_password ? '<div class="item-meta">Пароль по умолчанию, нужна смена</div>' : ""}
+            ${deleteBlocked ? '<div class="item-meta">Удаление недоступно: последний активный супер-администратор</div>' : ""}
           </div>
           ${statusPill(admin.is_active ? "active" : "deleted")}
         </div>
         <div class="item-actions">
-          <button class="ghost-button" type="button" data-edit-admin="${admin.id}">Редактировать</button>
-          <button class="ghost-button" type="button" data-reset-admin-password="${admin.id}">Сбросить пароль</button>
-          <button class="danger-button" type="button" data-toggle-admin="${admin.id}" data-next-active="${admin.is_active ? "0" : "1"}">
-            ${admin.is_active ? "Отключить" : "Включить"}
+          ${admin.role === "channel_admin" ? `<button class="ghost-button" type="button" data-edit-admin="${admin.id}">Редактировать</button>` : ""}
+          ${admin.role === "channel_admin" ? `<button class="ghost-button" type="button" data-reset-admin-password="${admin.id}">Сбросить пароль</button>` : ""}
+          ${admin.role === "channel_admin"
+            ? `<button class="danger-button" type="button" data-toggle-admin="${admin.id}" data-next-active="${admin.is_active ? "0" : "1"}">
+                ${admin.is_active ? "Отключить" : "Включить"}
+              </button>`
+            : ""}
+          <button
+            class="danger-button"
+            type="button"
+            data-delete-admin="${admin.id}"
+            ${deleteBlocked ? "disabled" : ""}
+          >
+            Удалить
           </button>
         </div>
       `;
@@ -956,6 +970,7 @@
     const editAdmin = event.target.closest("[data-edit-admin]");
     const resetAdminPassword = event.target.closest("[data-reset-admin-password]");
     const toggleAdmin = event.target.closest("[data-toggle-admin]");
+    const deleteAdmin = event.target.closest("[data-delete-admin]");
     const approveChannelRequest = event.target.closest("[data-approve-channel-request]");
     const rejectChannelRequest = event.target.closest("[data-reject-channel-request]");
     try {
@@ -1021,6 +1036,19 @@
         });
         await loadAll();
         setNotice("Статус администратора обновлён.");
+        return;
+      }
+      if (deleteAdmin) {
+        if (!window.confirm(
+          "Удалить администратора?\n\nАдминистратор будет удалён из системы. Его связи с каналами будут удалены. Исторические комментарии и посты не удаляются."
+        )) {
+          return;
+        }
+        await requestJson(`${state.apiBase}/users/${encodeURIComponent(deleteAdmin.dataset.deleteAdmin)}`, {
+          method: "DELETE",
+        });
+        await loadAll();
+        setNotice("Администратор удалён.");
         return;
       }
       if (deletePost) {

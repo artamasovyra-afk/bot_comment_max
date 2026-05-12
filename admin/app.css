@@ -438,6 +438,11 @@ textarea:focus {
   font-size: 13px;
 }
 
+.item-actions button[disabled] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .item-title {
   min-width: 0;
   font-weight: 800;
