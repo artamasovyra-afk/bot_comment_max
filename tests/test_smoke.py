@@ -222,3 +222,44 @@ def test_handle_new_message_uses_resolved_dialog_user_for_forwarded_channel_requ
     app.handle_new_message(message)
 
     assert captured == {"user_id": 4242}
+
+
+def test_handle_update_bot_started_sends_terms_for_new_user(bot_module) -> None:
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.store = object()
+
+    captured: list[int] = []
+
+    class FakeStore:
+        def has_accepted_terms(self, *, max_user_id: int, version: str) -> bool:
+            return False
+
+    app.store = FakeStore()
+    app.send_terms_welcome = lambda user_id: captured.append(user_id)
+    app.send_connection_instruction = lambda user_id: (_ for _ in ()).throw(
+        AssertionError("instructions should not be sent before terms are accepted")
+    )
+
+    app.handle_update({"update_type": "bot_started", "user": {"user_id": 101}})
+
+    assert captured == [101]
+
+
+def test_requester_channel_admin_status_returns_unknown_when_max_api_cannot_verify(
+    bot_module,
+) -> None:
+    app = object.__new__(bot_module.MaxCommentsBot)
+
+    class FakeApi:
+        def get_chat(self, chat_id: int) -> dict[str, object]:
+            raise bot_module.MaxApiError("chat lookup failed")
+
+        def get_chat_admins(self, chat_id: int) -> list[dict[str, object]]:
+            raise bot_module.MaxApiError("admins lookup failed")
+
+    app.api = FakeApi()
+
+    status, note = app.requester_channel_admin_status(-74631532033454, 4242)
+
+    assert status is None
+    assert "Не удалось автоматически проверить" in note

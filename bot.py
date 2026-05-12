@@ -69,7 +69,7 @@ COMMENT_LINK_RE = re.compile(
 BIND_CHANNEL_CODE_TTL_SECONDS = 30 * 60
 BIND_CHANNEL_CLEANUP_INTERVAL_SECONDS = 10 * 60
 SUPPORTED_DELIVERY_MODES = {"polling", "webhook"}
-WEBHOOK_UPDATE_TYPES = ["message_created"]
+WEBHOOK_UPDATE_TYPES = ["message_created", "bot_started"]
 DIALOG_USER_CACHE_TTL_SECONDS = 5 * 60
 ADMIN_SESSION_COOKIE = "max_comments_admin"
 SUPER_ADMIN_SESSION_COOKIE = "max_comments_super_admin"
@@ -116,6 +116,16 @@ MODERATION_TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁёІіЇїЄєҐґ']+",
 MODERATION_COMPACT_RE = re.compile(r"[^0-9A-Za-zА-Яа-яЁёІіЇїЄєҐґ']+", re.UNICODE)
 MODERATION_REPEATED_CHAR_RE = re.compile(r"(.)\1{2,}", re.UNICODE)
 TABOO_RULES_CACHE: dict[str, Any] | None = None
+
+CHANNEL_REQUEST_REASON_TERMS_NOT_ACCEPTED = "terms_not_accepted"
+CHANNEL_REQUEST_REASON_FORWARD_NOT_FOUND = "forward_payload_not_found"
+CHANNEL_REQUEST_REASON_CHANNEL_ALREADY_CONNECTED = "channel_already_connected"
+CHANNEL_REQUEST_REASON_BOT_NOT_CHANNEL_ADMIN = "bot_not_channel_admin"
+CHANNEL_REQUEST_REASON_REQUESTER_NOT_CHANNEL_ADMIN = "requester_not_channel_admin"
+CHANNEL_REQUEST_REASON_REQUESTER_CHANNEL_ADMIN_UNVERIFIED = "requester_channel_admin_unverified"
+CHANNEL_REQUEST_REASON_PENDING_EXISTS = "pending_request_exists"
+CHANNEL_REQUEST_REASON_DB_ERROR = "db_error"
+CHANNEL_REQUEST_REASON_CREATED = "created"
 
 
 def read_app_version() -> str:
@@ -3366,8 +3376,9 @@ class MaxCommentsBot:
             text=(
                 "Это бот ЦИТ 😉\n"
                 "Он поможет вам сделать комментарии под постами!\n\n"
+                "Перед подключением канала необходимо принять условия использования.\n\n"
                 "Мы с уважением относимся к правилам МАКС. Перед использованием бота, пожалуйста, "
-                "ознакомьтесь с материалами ниже и нажмите \"Принять\" если согласны с ними:\n"
+                "ознакомьтесь с материалами ниже и нажмите \"Принять\", если согласны с ними:\n"
                 f"{self.terms_links_text()}\n\n"
                 "Большое спасибо ❤️"
             ),
@@ -3399,13 +3410,65 @@ class MaxCommentsBot:
 
     def accept_terms_for_user(self, user_id: int) -> None:
         self.store.accept_terms(max_user_id=user_id, version=TERMS_VERSION)
-        self.api.send_message(user_id=user_id, text=self.connection_instruction_text())
+        self.api.send_message(
+            user_id=user_id,
+            text=(
+                "Условия использования приняты.\n\n"
+                f"{self.connection_instruction_text()}"
+            ),
+        )
 
     def ensure_user_accepted_terms(self, user_id: int) -> bool:
         if self.store.has_accepted_terms(max_user_id=user_id, version=TERMS_VERSION):
             return True
         self.send_terms_welcome(user_id)
         return False
+
+    def extract_update_user_id(self, update: dict[str, Any]) -> int | None:
+        user = update.get("user") if isinstance(update.get("user"), dict) else {}
+        for candidate in (user.get("user_id"), user.get("userId"), user.get("id"), update.get("user_id")):
+            user_id = validate_positive_int(candidate, minimum=1, maximum=10**18)
+            if user_id is not None:
+                return user_id
+        return None
+
+    def log_channel_request_event(
+        self,
+        reason_code: str,
+        *,
+        user_id: int | None = None,
+        channel_id: int | None = None,
+        message: dict[str, Any] | None = None,
+        detail: str | None = None,
+        level: int = logging.INFO,
+    ) -> None:
+        message_id = extract_message_id(message) if isinstance(message, dict) else None
+        recipient = message.get("recipient") if isinstance(message, dict) and isinstance(message.get("recipient"), dict) else {}
+        recipient_chat_id = validate_positive_int(
+            recipient.get("chat_id"),
+            minimum=-10**18,
+            maximum=10**18,
+        )
+        logger.log(
+            level,
+            "channel_request_event reason=%s requester_max_user_id=%s channel_id=%s message_id=%s recipient_chat_id=%s detail=%s",
+            safe_text(reason_code),
+            user_id if user_id is not None else "<unknown>",
+            channel_id if channel_id is not None else "<unknown>",
+            message_id or "<unknown>",
+            recipient_chat_id if recipient_chat_id is not None else "<unknown>",
+            safe_text(detail) or "-",
+        )
+
+    def handle_bot_started(self, update: dict[str, Any]) -> None:
+        user_id = self.extract_update_user_id(update)
+        if user_id is None:
+            logger.warning("bot_started update is missing user_id payload_keys=%s", sorted(update.keys()))
+            return
+        if self.store.has_accepted_terms(max_user_id=user_id, version=TERMS_VERSION):
+            self.send_connection_instruction(user_id)
+            return
+        self.send_terms_welcome(user_id)
 
     def nested_payload_value(self, payload: Any, *keys: str) -> Any:
         current = payload
@@ -3665,21 +3728,33 @@ class MaxCommentsBot:
             return False, "У бота нет права редактировать посты канала."
         return True, None
 
-    def requester_is_channel_admin(self, channel_id: int, requester_user_id: int) -> bool:
+    def requester_channel_admin_status(self, channel_id: int, requester_user_id: int) -> tuple[bool | None, str | None]:
+        owner_lookup_failed = False
         try:
             chat = self.api.get_chat(channel_id)
             owner_id = validate_positive_int(chat.get("owner_id") or chat.get("ownerId"), minimum=1, maximum=10**18)
             if owner_id is not None and int(owner_id) == int(requester_user_id):
-                return True
-        except MaxApiError:
-            logger.exception("Failed to load channel owner for request validation: %s", channel_id)
+                return True, None
+        except MaxApiError as exc:
+            owner_lookup_failed = True
+            logger.warning("Failed to load channel owner for request validation: %s", exc)
 
         try:
             admins = self.api.get_chat_admins(channel_id)
-        except MaxApiError:
-            logger.exception("Failed to load channel admins for request validation: %s", channel_id)
-            return False
-        return any(self.member_user_id(admin) == int(requester_user_id) for admin in admins)
+        except MaxApiError as exc:
+            logger.warning("Failed to load channel admins for request validation: %s", exc)
+            if owner_lookup_failed:
+                return (
+                    None,
+                    "Не удалось автоматически проверить, что отправитель заявки является администратором канала.",
+                )
+            return (
+                None,
+                "Не удалось загрузить список администраторов канала для автоматической проверки заявителя.",
+            )
+        if any(self.member_user_id(admin) == int(requester_user_id) for admin in admins):
+            return True, None
+        return False, "MAX не подтвердил, что отправитель заявки является администратором этого канала."
 
     def issue_bind_code(self) -> str:
         while True:
@@ -3778,6 +3853,9 @@ class MaxCommentsBot:
 
     def handle_update(self, update: dict[str, Any]) -> None:
         update_type = safe_text(update.get("update_type"))
+        if update_type == "bot_started":
+            self.handle_bot_started(update)
+            return
         if update_type != "message_created":
             logger.info(
                 "Ignored update type: %s payload_keys=%s",
@@ -3931,6 +4009,13 @@ class MaxCommentsBot:
         forwarded = self.extract_forwarded_channel_post(message)
         if forwarded is None:
             if self.forward_payload_has_channel_hint(message):
+                self.log_channel_request_event(
+                    CHANNEL_REQUEST_REASON_FORWARD_NOT_FOUND,
+                    user_id=user_id,
+                    message=message,
+                    detail="Forward payload contained channel hint but could not be parsed",
+                    level=logging.WARNING,
+                )
                 body = message.get("body") if isinstance(message.get("body"), dict) else {}
                 attachment_types = [
                     safe_text(item.get("type"))
@@ -3963,10 +4048,23 @@ class MaxCommentsBot:
             forwarded.post_message_id or "<unknown>",
         )
         if not self.ensure_user_accepted_terms(user_id):
+            self.log_channel_request_event(
+                CHANNEL_REQUEST_REASON_TERMS_NOT_ACCEPTED,
+                user_id=user_id,
+                channel_id=int(forwarded.channel_id),
+                message=message,
+                detail="Forwarded post received before terms acceptance",
+            )
             return True
 
         channel_id = int(forwarded.channel_id)
         if self.get_channel_binding(channel_id) is not None:
+            self.log_channel_request_event(
+                CHANNEL_REQUEST_REASON_CHANNEL_ALREADY_CONNECTED,
+                user_id=user_id,
+                channel_id=channel_id,
+                message=message,
+            )
             logger.info("Connection request skipped because channel %s is already connected", channel_id)
             self.api.send_message(
                 user_id=user_id,
@@ -3980,21 +4078,38 @@ class MaxCommentsBot:
 
         can_manage, manage_error = self.ensure_bot_can_manage_channel(channel_id)
         if not can_manage:
+            self.log_channel_request_event(
+                CHANNEL_REQUEST_REASON_BOT_NOT_CHANNEL_ADMIN,
+                user_id=user_id,
+                channel_id=channel_id,
+                message=message,
+                detail=manage_error,
+                level=logging.WARNING,
+            )
             logger.warning("Connection request for channel %s rejected: bot cannot manage channel: %s", channel_id, manage_error)
             self.api.send_message(
                 user_id=user_id,
                 text=(
-                    "Не удалось определить канал по пересланному сообщению.\n\n"
+                    "Бот не найден среди администраторов канала или не имеет нужных прав.\n\n"
                     "Проверьте, что:\n"
-                    "1. Сообщение переслано именно из канала.\n"
-                    "2. Бот добавлен в этот канал.\n"
-                    "3. Бот назначен администратором канала.\n\n"
+                    "1. Бот добавлен в этот канал.\n"
+                    "2. Бот назначен администратором канала.\n"
+                    "3. У бота есть права на публикацию и редактирование постов.\n\n"
                     f"{manage_error or 'После этого попробуйте переслать пост ещё раз.'}"
                 ),
             )
             return True
 
-        if not self.requester_is_channel_admin(channel_id, user_id):
+        requester_is_admin, requester_admin_note = self.requester_channel_admin_status(channel_id, user_id)
+        if requester_is_admin is False:
+            self.log_channel_request_event(
+                CHANNEL_REQUEST_REASON_REQUESTER_NOT_CHANNEL_ADMIN,
+                user_id=user_id,
+                channel_id=channel_id,
+                message=message,
+                detail=requester_admin_note,
+                level=logging.WARNING,
+            )
             logger.warning("Connection request for channel %s rejected: user %s is not channel admin", channel_id, user_id)
             self.api.send_message(
                 user_id=user_id,
@@ -4004,9 +4119,26 @@ class MaxCommentsBot:
                 ),
             )
             return True
+        verification_note = requester_admin_note if requester_is_admin is None else ""
+        if verification_note:
+            self.log_channel_request_event(
+                CHANNEL_REQUEST_REASON_REQUESTER_CHANNEL_ADMIN_UNVERIFIED,
+                user_id=user_id,
+                channel_id=channel_id,
+                message=message,
+                detail=verification_note,
+                level=logging.WARNING,
+            )
 
         pending = self.store.get_pending_channel_connection_request(channel_id=channel_id)
         if pending is not None:
+            self.log_channel_request_event(
+                CHANNEL_REQUEST_REASON_PENDING_EXISTS,
+                user_id=user_id,
+                channel_id=channel_id,
+                message=message,
+                detail=f"request_id={pending['id']}",
+            )
             logger.info("Connection request for channel %s skipped: pending request %s exists", channel_id, pending["id"])
             self.api.send_message(
                 user_id=user_id,
@@ -4021,29 +4153,56 @@ class MaxCommentsBot:
         channel_title = forwarded.channel_title
         if not channel_title:
             channel_title = self.get_chat_title_cached(channel_id)
-        request_row = self.store.create_channel_connection_request(
-            channel_id=channel_id,
-            channel_title=channel_title or None,
-            forwarded_post_id=forwarded.post_message_id,
-            requester_user_id=user_id,
-            requester_max_user_id=user_id,
-            raw_payload=forwarded.raw_payload,
-        )
+        raw_payload = dict(forwarded.raw_payload)
+        if verification_note:
+            raw_payload["_request_meta"] = {
+                "verification_status": "not_verified",
+                "verification_note": verification_note,
+            }
+        try:
+            request_row = self.store.create_channel_connection_request(
+                channel_id=channel_id,
+                channel_title=channel_title or None,
+                forwarded_post_id=forwarded.post_message_id,
+                requester_user_id=user_id,
+                requester_max_user_id=user_id,
+                raw_payload=raw_payload,
+            )
+        except Exception as exc:
+            self.log_channel_request_event(
+                CHANNEL_REQUEST_REASON_DB_ERROR,
+                user_id=user_id,
+                channel_id=channel_id,
+                message=message,
+                detail=str(exc),
+                level=logging.ERROR,
+            )
+            logger.exception("Failed to create channel connection request for channel %s", channel_id)
+            self.api.send_message(
+                user_id=user_id,
+                text="Не удалось создать заявку из-за технической ошибки. Попробуйте позже.",
+            )
+            return True
         logger.info(
             "Created channel connection request %s for channel %s from user %s",
             request_row["id"],
             channel_id,
             user_id,
         )
-        self.notify_super_admins_about_channel_request(request_row)
+        self.log_channel_request_event(
+            CHANNEL_REQUEST_REASON_CREATED,
+            user_id=user_id,
+            channel_id=channel_id,
+            message=message,
+            detail=f"request_id={request_row['id']}",
+        )
+        self.notify_super_admins_about_channel_request(request_row, verification_note=verification_note or None)
         self.api.send_message(
             user_id=user_id,
             text=(
-                "Новая заявка на подключение канала\n"
-                f"Канал: {channel_title or channel_id}\n"
-                f"ID канала: {channel_id}\n"
-                f"Ваш ID MAX: {user_id}\n"
-                f"Адрес административной панели канала: {public_app_url('/admin')}"
+                "Заявка на подключение канала отправлена.\n\n"
+                f"Канал: {channel_title or channel_id}\n\n"
+                "Супер-администратор проверит заявку. После одобрения комментарии будут подключены автоматически."
             ),
         )
         return True
@@ -4473,7 +4632,12 @@ class MaxCommentsBot:
             lines.append(line)
         self.api.send_message(user_id=user_id, text="\n".join(lines))
 
-    def notify_super_admins_about_channel_request(self, request_row: sqlite3.Row) -> None:
+    def notify_super_admins_about_channel_request(
+        self,
+        request_row: sqlite3.Row,
+        *,
+        verification_note: str | None = None,
+    ) -> None:
         admin_ids = self.admin_notice_user_ids()
         if not admin_ids:
             return
@@ -4484,6 +4648,12 @@ class MaxCommentsBot:
             f"Заявитель: `{request_row['requester_max_user_id']}`\n"
             f"Панель: {public_app_url('/super-admin')}"
         )
+        if safe_text(verification_note):
+            text += (
+                "\n\n"
+                "Автопроверка заявителя:\n"
+                f"{safe_text(verification_note)}"
+            )
         for admin_id in admin_ids:
             try:
                 self.api.send_message(user_id=admin_id, text=text, notify=True)
