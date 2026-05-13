@@ -51,6 +51,11 @@
     published: "Опубликован",
   };
 
+  const requestTypeLabels = {
+    connect_channel: "Подключение канала",
+    add_channel_admin: "Добавление администратора к каналу",
+  };
+
   function hideAllViews() {
     views.login.classList.add("hidden");
     views.denied.classList.add("hidden");
@@ -565,18 +570,40 @@
   function renderChannelRequestItem(request) {
     const item = document.createElement("article");
     item.className = "item";
+    const requestType = request.requestType || request.request_type || "connect_channel";
+    const requestTypeLabel = request.requestTypeLabel || request.request_type_label || requestTypeLabels[requestType] || requestType;
     const channelTitle = request.channelTitle || request.channel_title || request.channelId || request.channel_id || "Канал";
     const channelId = request.channelId || request.channel_id || "-";
     const requester = request.requesterMaxUserId || request.requester_max_user_id || "-";
+    const requesterProfile = request.requesterProfile || request.requester_profile || {};
+    const requesterName = requesterProfile.resolved_name || requesterProfile.display_name || requesterProfile.username || "";
     const forwardedPost = request.forwardedPostId || request.forwarded_post_id || "";
+    const verificationStatus = request.verificationStatus || request.verification_status || "verified";
+    const verificationNote = request.verificationNote || request.verification_note || "";
+    const currentAdmins = Array.isArray(request.currentAdmins || request.current_admins)
+      ? (request.currentAdmins || request.current_admins)
+      : [];
+    const currentAdminsText = currentAdmins
+      .map((admin) => {
+        const resolvedName = admin.resolved_name || admin.display_name || admin.username || admin.max_user_id;
+        const username = admin.username ? ` (@${admin.username})` : "";
+        return `${resolvedName}${username}`;
+      })
+      .join(", ");
     const isPending = request.status === "pending";
     item.innerHTML = `
       <div class="item-row">
         <div>
           <div class="item-title">${escapeHtml(channelTitle)}</div>
+          <div class="item-meta">Тип заявки: ${escapeHtml(requestTypeLabel)}</div>
           <div class="item-meta">ID канала: ${escapeHtml(channelId)} · заявитель: ${escapeHtml(requester)}</div>
+          ${requesterName ? `<div class="item-meta">Заявитель: ${escapeHtml(requesterName)}</div>` : ""}
           <div class="item-meta">Дата: ${formatDate(request.createdAt || request.created_at)}</div>
           ${forwardedPost ? `<div class="item-meta">Пост: ${escapeHtml(forwardedPost)}</div>` : ""}
+          ${currentAdminsText ? `<div class="item-meta">Текущие администраторы: ${escapeHtml(currentAdminsText)}</div>` : ""}
+          ${verificationStatus === "not_verified"
+            ? `<div class="item-meta">Автопроверка прав: ${escapeHtml(verificationNote || "не выполнена, требуется ручная проверка")}</div>`
+            : ""}
         </div>
         ${statusPill(request.status)}
       </div>
@@ -995,23 +1022,33 @@
     try {
       if (approveChannelRequest) {
         const requestId = approveChannelRequest.dataset.approveChannelRequest;
-        await requestJson(`${state.apiBase}/channel-requests/${encodeURIComponent(requestId)}/approve`, {
+        const result = await requestJson(`${state.apiBase}/channel-requests/${encodeURIComponent(requestId)}/approve`, {
           method: "POST",
           body: JSON.stringify({ adminComment: requestCommentValue(requestId) }),
         });
         await loadAll();
-        setNotice("Заявка одобрена, канал подключён.");
+        const requestType = result.request?.requestType || result.request?.request_type || "connect_channel";
+        setNotice(
+          requestType === "add_channel_admin"
+            ? "Заявка одобрена, администратор добавлен к каналу."
+            : "Заявка одобрена, канал подключён."
+        );
         setActiveTab("requests");
         return;
       }
       if (rejectChannelRequest) {
         const requestId = rejectChannelRequest.dataset.rejectChannelRequest;
-        await requestJson(`${state.apiBase}/channel-requests/${encodeURIComponent(requestId)}/reject`, {
+        const result = await requestJson(`${state.apiBase}/channel-requests/${encodeURIComponent(requestId)}/reject`, {
           method: "POST",
           body: JSON.stringify({ adminComment: requestCommentValue(requestId) }),
         });
         await loadAll();
-        setNotice("Заявка отклонена.");
+        const requestType = result.request?.requestType || result.request?.request_type || "connect_channel";
+        setNotice(
+          requestType === "add_channel_admin"
+            ? "Заявка на доступ к каналу отклонена."
+            : "Заявка отклонена."
+        );
         setActiveTab("requests");
         return;
       }

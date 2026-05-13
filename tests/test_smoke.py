@@ -456,7 +456,9 @@ def test_attach_user_to_connected_channel_creates_channel_admin_and_link(
     ]
 
 
-def test_accept_terms_for_user_attaches_saved_connected_channel_link(bot_module, tmp_path) -> None:
+def test_accept_terms_for_user_requests_forward_retry_after_pending_link(
+    bot_module, tmp_path
+) -> None:
     store = bot_module.CommentStore(str(tmp_path / "pending-connected-channel.sqlite3"))
     store.save_pending_channel_admin_link(
         user_id=424242,
@@ -467,27 +469,21 @@ def test_accept_terms_for_user_attaches_saved_connected_channel_link(bot_module,
     app = object.__new__(bot_module.MaxCommentsBot)
     app.store = store
 
-    captured: dict[str, object] = {}
+    sent_messages: list[str] = []
 
-    def fake_attach(**kwargs) -> bool:
-        captured.update(kwargs)
-        return True
+    class FakeApi:
+        def send_message(self, *, user_id: int, text: str, **kwargs) -> None:
+            sent_messages.append(text)
 
-    app.attach_user_to_connected_channel = fake_attach
-    app.api = type("FakeApi", (), {"send_message": lambda *args, **kwargs: None})()
+    app.api = FakeApi()
 
     app.accept_terms_for_user(424242)
 
-    assert captured == {
-        "user_id": 424242,
-        "channel_id": -74631532033454,
-        "channel_title": "МЦ",
-        "message": None,
-        "notify_user": True,
-        "accepted_just_now": True,
-    }
     assert store.has_accepted_terms(max_user_id=424242, version=bot_module.TERMS_VERSION) is True
     assert store.pop_pending_channel_admin_link(user_id=424242) is None
+    assert len(sent_messages) == 1
+    assert "Условия использования приняты." in sent_messages[0]
+    assert "перешлите боту пост из этого канала ещё раз" in sent_messages[0]
 
 
 def test_serialize_channel_binding_includes_multiple_admins_for_super_admin(
@@ -540,7 +536,7 @@ def test_serialize_channel_binding_includes_multiple_admins_for_super_admin(
     ]
 
 
-def test_handle_forwarded_channel_post_request_attaches_user_for_connected_channel(
+def test_handle_forwarded_channel_post_request_creates_add_admin_request_for_connected_channel(
     bot_module, tmp_path
 ) -> None:
     store = bot_module.CommentStore(str(tmp_path / "connected-forwarded.sqlite3"))
@@ -557,25 +553,151 @@ def test_handle_forwarded_channel_post_request_attaches_user_for_connected_chann
         channel_id=-74631532033454,
         channel_title="МЦ",
         post_message_id="post-1",
+        raw_payload={"forward": True},
     )
     app.forward_payload_has_channel_hint = lambda message: True
     app.log_channel_request_event = lambda *args, **kwargs: None
-
-    captured: dict[str, object] = {}
-
-    def fake_attach(**kwargs) -> bool:
-        captured.update(kwargs)
-        return True
-
-    app.attach_user_to_connected_channel = fake_attach
+    app.requester_channel_admin_status = lambda channel_id, requester_user_id: (True, None)
+    app.notify_super_admins_about_channel_request = lambda request_row, verification_note=None: None
+    sent_messages: list[str] = []
+    app.api = type(
+        "FakeApi",
+        (),
+        {"send_message": lambda self=None, *, user_id, text, **kwargs: sent_messages.append(text)},
+    )()
 
     handled = app.handle_forwarded_channel_post_request({"recipient": {"chat_id": 1}}, 424242)
 
     assert handled is True
-    assert captured == {
-        "user_id": 424242,
-        "channel_id": -74631532033454,
-        "channel_title": "МЦ",
-        "message": {"recipient": {"chat_id": 1}},
-        "notify_user": True,
+    pending = store.get_pending_channel_connection_request(
+        channel_id=-74631532033454,
+        request_type=bot_module.CHANNEL_REQUEST_TYPE_ADD_CHANNEL_ADMIN,
+        requester_max_user_id=424242,
+    )
+    assert pending is not None
+    assert pending["request_type"] == bot_module.CHANNEL_REQUEST_TYPE_ADD_CHANNEL_ADMIN
+    assert sent_messages == [
+        "Заявка на получение доступа к администрированию канала отправлена.\n\n"
+        "Канал: МЦ\n\n"
+        "Супер-администратор проверит заявку. После одобрения канал появится в вашей панели администратора."
+    ]
+    assert store.list_channel_admin_channel_ids(424242) == set()
+
+
+def test_admin_approve_add_channel_admin_request_appends_channel_without_replacing_existing(
+    bot_module, tmp_path
+) -> None:
+    store = bot_module.CommentStore(str(tmp_path / "approve-add-channel-admin.sqlite3"))
+    store.upsert_channel_binding(
+        channel_chat_id=-74631532033454,
+        comments_chat_id=-74631532033455,
+        comments_chat_url="https://max.ru/chat/comments",
+    )
+    store.upsert_channel_binding(
+        channel_chat_id=-70000000000001,
+        comments_chat_id=-70000000000002,
+        comments_chat_url="https://max.ru/chat/other",
+    )
+    store.ensure_admin_user(
+        max_user_id="424242",
+        role=bot_module.ROLE_CHANNEL_ADMIN,
+        password="password",
+        must_change_password=False,
+        is_active=True,
+    )
+    store.add_channel_admin(user_id=424242, channel_id=-70000000000001)
+    request = store.create_channel_connection_request(
+        request_type=bot_module.CHANNEL_REQUEST_TYPE_ADD_CHANNEL_ADMIN,
+        channel_id=-74631532033454,
+        channel_title="МЦ",
+        forwarded_post_id="post-1",
+        requester_user_id=424242,
+        requester_max_user_id="424242",
+        verification_status=bot_module.CHANNEL_REQUEST_VERIFICATION_STATUS_VERIFIED,
+        verification_note=None,
+        raw_payload={},
+    )
+
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.store = store
+    app.api = type("FakeApi", (), {"send_message": lambda *args, **kwargs: None})()
+    app.chat_info_cache = {}
+    app.get_chat_info_cached = lambda chat_id: {
+        "title": "МЦ" if int(chat_id) == -74631532033454 else "Другой канал",
+        "link": "",
     }
+
+    context = bot_module.AdminContext(
+        user_id=9001,
+        role=bot_module.ROLE_SUPER_ADMIN,
+        channel_ids=set(),
+        admin_user_id=9001,
+    )
+
+    result = app.admin_approve_channel_request(context, request_id=int(request["id"]))
+
+    assert result["ok"] is True
+    assert result["request"]["requestType"] == bot_module.CHANNEL_REQUEST_TYPE_ADD_CHANNEL_ADMIN
+    assert store.list_channel_admin_channel_ids(424242) == {
+        -70000000000001,
+        -74631532033454,
+    }
+
+
+def test_admin_dashboard_returns_all_admin_channels_even_when_one_channel_is_selected(
+    bot_module, tmp_path
+) -> None:
+    store = bot_module.CommentStore(str(tmp_path / "admin-dashboard-channels.sqlite3"))
+    store.ensure_admin_user(
+        max_user_id="424242",
+        role=bot_module.ROLE_CHANNEL_ADMIN,
+        password="password",
+        must_change_password=False,
+        is_active=True,
+    )
+    store.upsert_channel_binding(
+        channel_chat_id=-74631532033454,
+        comments_chat_id=-74631532033455,
+        comments_chat_url="https://max.ru/chat/comments",
+    )
+    store.upsert_channel_binding(
+        channel_chat_id=-70000000000001,
+        comments_chat_id=-70000000000002,
+        comments_chat_url="https://max.ru/chat/other",
+    )
+    store.add_channel_admin(user_id=424242, channel_id=-74631532033454)
+    store.add_channel_admin(user_id=424242, channel_id=-70000000000001)
+
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.store = store
+    app.delivery_mode = "webhook"
+    app.get_bot_username = lambda: "cit_bot"
+    app.webhook_url = lambda: "https://maxcomments.ru/webhook"
+    app.get_chat_info_cached = lambda chat_id: {
+        "title": f"Канал {chat_id}",
+        "link": "",
+    }
+    app.serialize_admin_identity = lambda context: {"role": context.role}
+    app.store.dashboard_stats = lambda *, channel_ids: {
+        "usersCount": 0,
+        "postsCount": 0,
+        "commentsCount": 0,
+        "reportsCount": 0,
+        "newReportsCount": 0,
+        "deletedCommentsCount": 0,
+    }
+
+    context = bot_module.AdminContext(
+        user_id=424242,
+        role=bot_module.ROLE_CHANNEL_ADMIN,
+        channel_ids={-74631532033454, -70000000000001},
+        admin_user_id=1,
+    )
+
+    payload = app.admin_dashboard(context, requested_channel_id=-74631532033454)
+
+    assert [item["channel_chat_id"] for item in payload["channels"]] == [
+        -74631532033454,
+        -70000000000001,
+    ]
+    assert payload["channel"]["channel_chat_id"] == -74631532033454

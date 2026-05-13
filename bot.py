@@ -110,6 +110,18 @@ CHANNEL_REQUEST_STATUSES = {
     CHANNEL_REQUEST_STATUS_CANCELLED,
     CHANNEL_REQUEST_STATUS_DUPLICATE,
 }
+CHANNEL_REQUEST_TYPE_CONNECT_CHANNEL = "connect_channel"
+CHANNEL_REQUEST_TYPE_ADD_CHANNEL_ADMIN = "add_channel_admin"
+CHANNEL_REQUEST_TYPES = {
+    CHANNEL_REQUEST_TYPE_CONNECT_CHANNEL,
+    CHANNEL_REQUEST_TYPE_ADD_CHANNEL_ADMIN,
+}
+CHANNEL_REQUEST_VERIFICATION_STATUS_VERIFIED = "verified"
+CHANNEL_REQUEST_VERIFICATION_STATUS_NOT_VERIFIED = "not_verified"
+CHANNEL_REQUEST_VERIFICATION_STATUSES = {
+    CHANNEL_REQUEST_VERIFICATION_STATUS_VERIFIED,
+    CHANNEL_REQUEST_VERIFICATION_STATUS_NOT_VERIFIED,
+}
 TERMS_VERSION = "2026-05-06"
 WEBAPP_ONLY_COMMENTS_CHAT_ID = 0
 MODERATION_TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁёІіЇїЄєҐґ']+", re.UNICODE)
@@ -124,6 +136,7 @@ CHANNEL_REQUEST_REASON_BOT_NOT_CHANNEL_ADMIN = "bot_not_channel_admin"
 CHANNEL_REQUEST_REASON_REQUESTER_NOT_CHANNEL_ADMIN = "requester_not_channel_admin"
 CHANNEL_REQUEST_REASON_REQUESTER_CHANNEL_ADMIN_UNVERIFIED = "requester_channel_admin_unverified"
 CHANNEL_REQUEST_REASON_PENDING_EXISTS = "pending_request_exists"
+CHANNEL_REQUEST_REASON_ALREADY_HAS_ACCESS = "already_has_channel_access"
 CHANNEL_REQUEST_REASON_DB_ERROR = "db_error"
 CHANNEL_REQUEST_REASON_CREATED = "created"
 
@@ -1214,11 +1227,14 @@ class CommentStore:
 
                 CREATE TABLE IF NOT EXISTS channel_connection_requests (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_type TEXT NOT NULL DEFAULT 'connect_channel',
                     channel_id TEXT,
                     channel_title TEXT,
                     forwarded_post_id TEXT,
                     requester_user_id INTEGER,
                     requester_max_user_id TEXT NOT NULL,
+                    verification_status TEXT NOT NULL DEFAULT 'verified',
+                    verification_note TEXT,
                     status TEXT NOT NULL DEFAULT 'pending',
                     admin_comment TEXT,
                     reviewed_by_admin_id INTEGER,
@@ -1378,6 +1394,22 @@ class CommentStore:
         if "username" not in admin_user_columns:
             self.conn.execute(
                 "ALTER TABLE admin_users ADD COLUMN username TEXT"
+            )
+        request_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(channel_connection_requests)").fetchall()
+        }
+        if "request_type" not in request_columns:
+            self.conn.execute(
+                "ALTER TABLE channel_connection_requests ADD COLUMN request_type TEXT NOT NULL DEFAULT 'connect_channel'"
+            )
+        if "verification_status" not in request_columns:
+            self.conn.execute(
+                "ALTER TABLE channel_connection_requests ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'verified'"
+            )
+        if "verification_note" not in request_columns:
+            self.conn.execute(
+                "ALTER TABLE channel_connection_requests ADD COLUMN verification_note TEXT"
             )
         self.conn.executescript(
             """
@@ -2251,37 +2283,54 @@ class CommentStore:
     def create_channel_connection_request(
         self,
         *,
+        request_type: str,
         channel_id: int,
         channel_title: str | None,
         forwarded_post_id: str | None,
         requester_user_id: int,
         requester_max_user_id: str | int,
+        verification_status: str = CHANNEL_REQUEST_VERIFICATION_STATUS_VERIFIED,
+        verification_note: str | None = None,
         raw_payload: dict[str, Any] | None,
     ) -> sqlite3.Row:
+        clean_request_type = safe_text(request_type) or CHANNEL_REQUEST_TYPE_CONNECT_CHANNEL
+        if clean_request_type not in CHANNEL_REQUEST_TYPES:
+            raise ValueError("Invalid channel request type")
+        clean_verification_status = (
+            safe_text(verification_status) or CHANNEL_REQUEST_VERIFICATION_STATUS_VERIFIED
+        )
+        if clean_verification_status not in CHANNEL_REQUEST_VERIFICATION_STATUSES:
+            raise ValueError("Invalid channel request verification status")
         raw_payload_json = json.dumps(raw_payload or {}, ensure_ascii=False)[:20000]
         now = utc_now()
         with self.lock:
             cursor = self.conn.execute(
                 """
                 INSERT INTO channel_connection_requests (
+                    request_type,
                     channel_id,
                     channel_title,
                     forwarded_post_id,
                     requester_user_id,
                     requester_max_user_id,
+                    verification_status,
+                    verification_note,
                     status,
                     created_at,
                     updated_at,
                     raw_payload
                 )
-                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
                 """,
                 (
+                    clean_request_type,
                     safe_text(channel_id),
                     safe_text(channel_title) or None,
                     safe_text(forwarded_post_id) or None,
                     int(requester_user_id),
                     safe_text(requester_max_user_id),
+                    clean_verification_status,
+                    safe_text(verification_note) or None,
                     now,
                     now,
                     raw_payload_json,
@@ -2294,17 +2343,31 @@ class CommentStore:
             raise RuntimeError("channel connection request was not saved")
         return row
 
-    def get_pending_channel_connection_request(self, *, channel_id: int) -> sqlite3.Row | None:
+    def get_pending_channel_connection_request(
+        self,
+        *,
+        channel_id: int,
+        request_type: str = CHANNEL_REQUEST_TYPE_CONNECT_CHANNEL,
+        requester_max_user_id: str | int | None = None,
+    ) -> sqlite3.Row | None:
+        clean_request_type = safe_text(request_type) or CHANNEL_REQUEST_TYPE_CONNECT_CHANNEL
+        if clean_request_type not in CHANNEL_REQUEST_TYPES:
+            raise ValueError("Invalid channel request type")
+        params: list[Any] = [safe_text(channel_id), clean_request_type]
+        requester_filter = ""
+        if requester_max_user_id is not None:
+            requester_filter = " AND requester_max_user_id = ?"
+            params.append(safe_text(requester_max_user_id))
         with self.lock:
             return self.conn.execute(
-                """
+                f"""
                 SELECT *
                 FROM channel_connection_requests
-                WHERE channel_id = ? AND status = 'pending'
+                WHERE channel_id = ? AND request_type = ? AND status = 'pending'{requester_filter}
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
-                (safe_text(channel_id),),
+                tuple(params),
             ).fetchone()
 
     def get_latest_channel_connection_request_for_requester(
@@ -2312,17 +2375,25 @@ class CommentStore:
         *,
         channel_id: int,
         requester_max_user_id: str | int,
+        request_type: str = CHANNEL_REQUEST_TYPE_CONNECT_CHANNEL,
     ) -> sqlite3.Row | None:
+        clean_request_type = safe_text(request_type) or CHANNEL_REQUEST_TYPE_CONNECT_CHANNEL
+        if clean_request_type not in CHANNEL_REQUEST_TYPES:
+            raise ValueError("Invalid channel request type")
         with self.lock:
             return self.conn.execute(
                 """
                 SELECT *
                 FROM channel_connection_requests
-                WHERE channel_id = ? AND requester_max_user_id = ?
+                WHERE channel_id = ? AND requester_max_user_id = ? AND request_type = ?
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
-                (safe_text(channel_id), safe_text(requester_max_user_id)),
+                (
+                    safe_text(channel_id),
+                    safe_text(requester_max_user_id),
+                    clean_request_type,
+                ),
             ).fetchone()
 
     def list_channel_connection_requests(
@@ -2368,7 +2439,12 @@ class CommentStore:
         if clean_status not in CHANNEL_REQUEST_STATUSES:
             raise ValueError("Invalid channel request status")
         now = utc_now()
-        reviewed_at = now if clean_status in {CHANNEL_REQUEST_STATUS_APPROVED, CHANNEL_REQUEST_STATUS_REJECTED} else None
+        reviewed_at = now if clean_status in {
+            CHANNEL_REQUEST_STATUS_APPROVED,
+            CHANNEL_REQUEST_STATUS_REJECTED,
+            CHANNEL_REQUEST_STATUS_DUPLICATE,
+            CHANNEL_REQUEST_STATUS_CANCELLED,
+        } else None
         with self.lock:
             row = self.conn.execute(
                 "SELECT * FROM channel_connection_requests WHERE id = ?",
@@ -3634,7 +3710,13 @@ class MaxCommentsBot:
             ]
         )
 
-    def send_terms_welcome(self, user_id: int) -> None:
+    def send_terms_welcome(self, user_id: int, *, resend_post_after_acceptance: bool = False) -> None:
+        extra_hint = (
+            "\n\n"
+            "После принятия условий перешлите пост из канала ещё раз, чтобы отправить заявку супер-администратору."
+            if resend_post_after_acceptance
+            else ""
+        )
         self.api.send_message(
             user_id=user_id,
             text=(
@@ -3643,7 +3725,7 @@ class MaxCommentsBot:
                 "Перед подключением канала необходимо принять условия использования.\n\n"
                 "Мы с уважением относимся к правилам МАКС. Перед использованием бота, пожалуйста, "
                 "ознакомьтесь с материалами ниже и нажмите \"Принять\", если согласны с ними:\n"
-                f"{self.terms_links_text()}\n\n"
+                f"{self.terms_links_text()}{extra_hint}\n\n"
                 "Большое спасибо ❤️"
             ),
             attachments=self.build_link_keyboard(
@@ -3816,22 +3898,13 @@ class MaxCommentsBot:
 
     def accept_terms_for_user(self, user_id: int) -> None:
         self.store.accept_terms(max_user_id=user_id, version=TERMS_VERSION)
-        pending_channel_link = self.store.pop_pending_channel_admin_link(user_id=user_id)
-        if pending_channel_link is not None:
-            self.attach_user_to_connected_channel(
-                user_id=user_id,
-                channel_id=int(pending_channel_link["channel_id"]),
-                channel_title=safe_text(pending_channel_link["channel_title"]) or None,
-                message=None,
-                notify_user=True,
-                accepted_just_now=True,
-            )
-            return
+        self.store.pop_pending_channel_admin_link(user_id=user_id)
         self.api.send_message(
             user_id=user_id,
             text=(
                 "Условия использования приняты.\n\n"
-                f"{self.connection_instruction_text()}"
+                f"{self.connection_instruction_text()}\n\n"
+                "Если вы хотите получить доступ к уже подключённому каналу, теперь перешлите боту пост из этого канала ещё раз, чтобы отправить заявку супер-администратору."
             ),
         )
 
@@ -4467,13 +4540,7 @@ class MaxCommentsBot:
         channel_id = int(forwarded.channel_id)
         channel_binding = self.get_channel_binding(channel_id)
         if not self.store.has_accepted_terms(max_user_id=user_id, version=TERMS_VERSION):
-            if channel_binding is not None:
-                self.store.save_pending_channel_admin_link(
-                    user_id=user_id,
-                    channel_id=channel_id,
-                    channel_title=forwarded.channel_title or None,
-                )
-            self.send_terms_welcome(user_id)
+            self.send_terms_welcome(user_id, resend_post_after_acceptance=True)
             self.log_channel_request_event(
                 CHANNEL_REQUEST_REASON_TERMS_NOT_ACCEPTED,
                 user_id=user_id,
@@ -4483,25 +4550,139 @@ class MaxCommentsBot:
             )
             return True
 
+        channel_title = forwarded.channel_title or self.get_chat_title_cached(channel_id) or None
         if channel_binding is not None:
+            existing_channel_ids = self.store.list_channel_admin_channel_ids(user_id)
+            if channel_id in existing_channel_ids:
+                self.log_channel_request_event(
+                    CHANNEL_REQUEST_REASON_ALREADY_HAS_ACCESS,
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    message=message,
+                )
+                self.api.send_message(
+                    user_id=user_id,
+                    text=(
+                        "Этот канал уже доступен вам в панели администратора.\n\n"
+                        f"Канал: {channel_title or channel_id}\n"
+                        f"Панель администратора:\n{public_app_url('/admin')}"
+                    ),
+                )
+                return True
+
+            requester_is_admin, requester_admin_note = self.requester_channel_admin_status(channel_id, user_id)
+            if requester_is_admin is False:
+                self.log_channel_request_event(
+                    CHANNEL_REQUEST_REASON_REQUESTER_NOT_CHANNEL_ADMIN,
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    message=message,
+                    detail=requester_admin_note,
+                    level=logging.WARNING,
+                )
+                self.api.send_message(
+                    user_id=user_id,
+                    text=(
+                        "Добавить доступ может только администратор этого канала.\n\n"
+                        "Проверьте, что вы являетесь администратором канала в MAX, и попробуйте снова."
+                    ),
+                )
+                return True
+
+            verification_status = CHANNEL_REQUEST_VERIFICATION_STATUS_VERIFIED
+            verification_note = ""
+            if requester_is_admin is None:
+                verification_status = CHANNEL_REQUEST_VERIFICATION_STATUS_NOT_VERIFIED
+                verification_note = requester_admin_note or (
+                    "Не удалось автоматически проверить, что заявитель является администратором канала."
+                )
+                self.log_channel_request_event(
+                    CHANNEL_REQUEST_REASON_REQUESTER_CHANNEL_ADMIN_UNVERIFIED,
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    message=message,
+                    detail=verification_note,
+                    level=logging.WARNING,
+                )
+
+            pending = self.store.get_pending_channel_connection_request(
+                channel_id=channel_id,
+                request_type=CHANNEL_REQUEST_TYPE_ADD_CHANNEL_ADMIN,
+                requester_max_user_id=user_id,
+            )
+            if pending is not None:
+                self.log_channel_request_event(
+                    CHANNEL_REQUEST_REASON_PENDING_EXISTS,
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    message=message,
+                    detail=f"request_id={pending['id']} request_type={CHANNEL_REQUEST_TYPE_ADD_CHANNEL_ADMIN}",
+                )
+                self.api.send_message(
+                    user_id=user_id,
+                    text=(
+                        "Заявка на получение доступа к администрированию этого канала уже отправлена и ожидает рассмотрения.\n\n"
+                        f"Канал: {safe_text(pending['channel_title']) or channel_id}"
+                    ),
+                )
+                return True
+
+            raw_payload = dict(forwarded.raw_payload)
+            try:
+                request_row = self.store.create_channel_connection_request(
+                    request_type=CHANNEL_REQUEST_TYPE_ADD_CHANNEL_ADMIN,
+                    channel_id=channel_id,
+                    channel_title=channel_title,
+                    forwarded_post_id=forwarded.post_message_id,
+                    requester_user_id=user_id,
+                    requester_max_user_id=user_id,
+                    verification_status=verification_status,
+                    verification_note=verification_note or None,
+                    raw_payload=raw_payload,
+                )
+            except Exception as exc:
+                self.log_channel_request_event(
+                    CHANNEL_REQUEST_REASON_DB_ERROR,
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    message=message,
+                    detail=str(exc),
+                    level=logging.ERROR,
+                )
+                logger.exception("Failed to create channel admin access request for channel %s", channel_id)
+                self.api.send_message(
+                    user_id=user_id,
+                    text="Не удалось создать заявку из-за технической ошибки. Попробуйте позже.",
+                )
+                return True
             self.log_channel_request_event(
-                CHANNEL_REQUEST_REASON_CHANNEL_ALREADY_CONNECTED,
+                CHANNEL_REQUEST_REASON_CREATED,
                 user_id=user_id,
                 channel_id=channel_id,
                 message=message,
+                detail=f"request_id={request_row['id']} request_type={CHANNEL_REQUEST_TYPE_ADD_CHANNEL_ADMIN}",
             )
-            logger.info(
-                "Forwarded post for channel %s matched an existing connected channel. "
-                "Trying to attach user %s as additional admin.",
-                channel_id,
-                user_id,
-            )
-            self.attach_user_to_connected_channel(
-                user_id=user_id,
+            self.store.add_admin_audit_log(
+                admin_user_id=user_id,
                 channel_id=channel_id,
-                channel_title=forwarded.channel_title,
-                message=message,
-                notify_user=True,
+                action="create_channel_admin_request",
+                entity_type="channel_connection_request",
+                entity_id=int(request_row["id"]),
+                payload={
+                    "requestType": CHANNEL_REQUEST_TYPE_ADD_CHANNEL_ADMIN,
+                    "channelId": safe_text(channel_id),
+                    "requesterMaxUserId": safe_text(user_id),
+                    "source": "forwarded_post",
+                },
+            )
+            self.notify_super_admins_about_channel_request(request_row, verification_note=verification_note or None)
+            self.api.send_message(
+                user_id=user_id,
+                text=(
+                    "Заявка на получение доступа к администрированию канала отправлена.\n\n"
+                    f"Канал: {channel_title or channel_id}\n\n"
+                    "Супер-администратор проверит заявку. После одобрения канал появится в вашей панели администратора."
+                ),
             )
             return True
 
@@ -4559,14 +4740,17 @@ class MaxCommentsBot:
                 level=logging.WARNING,
             )
 
-        pending = self.store.get_pending_channel_connection_request(channel_id=channel_id)
+        pending = self.store.get_pending_channel_connection_request(
+            channel_id=channel_id,
+            request_type=CHANNEL_REQUEST_TYPE_CONNECT_CHANNEL,
+        )
         if pending is not None:
             self.log_channel_request_event(
                 CHANNEL_REQUEST_REASON_PENDING_EXISTS,
                 user_id=user_id,
                 channel_id=channel_id,
                 message=message,
-                detail=f"request_id={pending['id']}",
+                detail=f"request_id={pending['id']} request_type={CHANNEL_REQUEST_TYPE_CONNECT_CHANNEL}",
             )
             logger.info("Connection request for channel %s skipped: pending request %s exists", channel_id, pending["id"])
             self.api.send_message(
@@ -4579,22 +4763,21 @@ class MaxCommentsBot:
             )
             return True
 
-        channel_title = forwarded.channel_title
-        if not channel_title:
-            channel_title = self.get_chat_title_cached(channel_id)
         raw_payload = dict(forwarded.raw_payload)
-        if verification_note:
-            raw_payload["_request_meta"] = {
-                "verification_status": "not_verified",
-                "verification_note": verification_note,
-            }
         try:
             request_row = self.store.create_channel_connection_request(
+                request_type=CHANNEL_REQUEST_TYPE_CONNECT_CHANNEL,
                 channel_id=channel_id,
                 channel_title=channel_title or None,
                 forwarded_post_id=forwarded.post_message_id,
                 requester_user_id=user_id,
                 requester_max_user_id=user_id,
+                verification_status=(
+                    CHANNEL_REQUEST_VERIFICATION_STATUS_NOT_VERIFIED
+                    if verification_note
+                    else CHANNEL_REQUEST_VERIFICATION_STATUS_VERIFIED
+                ),
+                verification_note=verification_note or None,
                 raw_payload=raw_payload,
             )
         except Exception as exc:
@@ -4624,6 +4807,19 @@ class MaxCommentsBot:
             channel_id=channel_id,
             message=message,
             detail=f"request_id={request_row['id']}",
+        )
+        self.store.add_admin_audit_log(
+            admin_user_id=user_id,
+            channel_id=channel_id,
+            action="create_channel_request",
+            entity_type="channel_connection_request",
+            entity_id=int(request_row["id"]),
+            payload={
+                "requestType": CHANNEL_REQUEST_TYPE_CONNECT_CHANNEL,
+                "channelId": safe_text(channel_id),
+                "requesterMaxUserId": safe_text(user_id),
+                "source": "forwarded_post",
+            },
         )
         self.notify_super_admins_about_channel_request(request_row, verification_note=verification_note or None)
         self.api.send_message(
@@ -5070,13 +5266,28 @@ class MaxCommentsBot:
         admin_ids = self.admin_notice_user_ids()
         if not admin_ids:
             return
+        request_type = safe_text(request_row["request_type"]) or CHANNEL_REQUEST_TYPE_CONNECT_CHANNEL
+        channel_id = validate_positive_int(request_row["channel_id"], minimum=-10**18, maximum=10**18)
+        current_admins: list[str] = []
+        if (
+            request_type == CHANNEL_REQUEST_TYPE_ADD_CHANNEL_ADMIN
+            and channel_id is not None
+            and self.get_channel_binding(int(channel_id)) is not None
+        ):
+            current_admins = [
+                self.serialize_channel_admin_brief(item)["resolved_name"]
+                for item in self.store.list_admin_users_for_channel(int(channel_id))
+                if int(item["is_active"]) == 1
+            ]
         text = (
-            "Новая заявка на подключение канала.\n\n"
+            f"Новая заявка: {self.channel_request_type_label(request_type)}.\n\n"
             f"Канал: {safe_text(request_row['channel_title']) or request_row['channel_id']}\n"
             f"ID канала: `{request_row['channel_id']}`\n"
             f"Заявитель: `{request_row['requester_max_user_id']}`\n"
             f"Панель: {public_app_url('/super-admin')}"
         )
+        if current_admins:
+            text += "\n" + f"Текущие администраторы: {', '.join(current_admins)}"
         if safe_text(verification_note):
             text += (
                 "\n\n"
@@ -5162,6 +5373,77 @@ class MaxCommentsBot:
             payload["admins"] = admins
             payload["admins_count"] = len(admins)
         return payload
+
+    def channel_request_type_label(self, request_type: str) -> str:
+        if safe_text(request_type) == CHANNEL_REQUEST_TYPE_ADD_CHANNEL_ADMIN:
+            return "Добавление администратора к каналу"
+        return "Подключение канала"
+
+    def serialize_requester_profile_for_channel_request(self, row: sqlite3.Row) -> dict[str, Any]:
+        requester_max_user_id = safe_text(row["requester_max_user_id"])
+        admin_user = self.store.get_admin_user_by_max_user_id(requester_max_user_id)
+        if admin_user is not None:
+            payload = self.serialize_admin_user(self.enrich_admin_user_profile(admin_user))
+            return {
+                "max_user_id": payload["max_user_id"],
+                "first_name": payload["first_name"],
+                "last_name": payload["last_name"],
+                "display_name": payload["display_name"],
+                "username": payload["username"],
+                "resolved_name": payload["resolved_name"],
+            }
+        requester_user_id = validate_positive_int(
+            row["requester_user_id"],
+            minimum=1,
+            maximum=10**18,
+        )
+        channel_id = validate_positive_int(
+            row["channel_id"],
+            minimum=-10**18,
+            maximum=10**18,
+        )
+        if requester_user_id is not None and channel_id is not None and hasattr(self, "api"):
+            try:
+                members = self.api.get_chat_members(int(channel_id), user_ids=[int(requester_user_id)])
+            except Exception:
+                members = []
+            member = next(
+                (
+                    item
+                    for item in members
+                    if validate_positive_int(item.get("user_id"), minimum=1, maximum=10**18) == int(requester_user_id)
+                ),
+                None,
+            )
+            if member is not None:
+                first_name = safe_text(member.get("first_name"))
+                last_name = safe_text(member.get("last_name"))
+                username = safe_text(member.get("username")).lstrip("@")
+                resolved_name = (
+                    build_admin_profile_display_name(
+                        first_name=first_name,
+                        last_name=last_name,
+                        username=username,
+                    )
+                    or requester_max_user_id
+                    or "Имя не указано"
+                )
+                return {
+                    "max_user_id": requester_max_user_id,
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "display_name": resolved_name if (first_name or last_name) else "",
+                    "username": username,
+                    "resolved_name": resolved_name,
+                }
+        return {
+            "max_user_id": requester_max_user_id,
+            "first_name": "",
+            "last_name": "",
+            "display_name": "",
+            "username": "",
+            "resolved_name": requester_max_user_id or "Имя не указано",
+        }
 
     def serialize_post_summary(self, post: sqlite3.Row) -> dict[str, Any]:
         comment_search_text = " ".join(self.store.list_comment_texts(post["post_message_id"]))
@@ -6899,13 +7181,14 @@ class MaxCommentsBot:
         *,
         requested_channel_id: int | None = None,
     ) -> dict[str, Any]:
+        available_bindings = self.list_channel_bindings_for_admin(context)
         channel_ids = self.resolve_admin_channel_ids(
             context,
             requested_channel_id=requested_channel_id,
         )
         bindings = [
             binding
-            for binding in self.list_channel_bindings_for_admin(context)
+            for binding in available_bindings
             if int(binding["channel_chat_id"]) in channel_ids
         ]
         latest_posts = self.store.list_posts(
@@ -6938,7 +7221,7 @@ class MaxCommentsBot:
             "channel": self.primary_channel_payload(bindings),
             "channels": [
                 self.serialize_channel_binding(binding, include_admins=context.is_super_admin)
-                for binding in bindings
+                for binding in available_bindings
             ],
             "stats": {
                 **self.store.dashboard_stats(channel_ids=channel_ids),
@@ -6975,8 +7258,34 @@ class MaxCommentsBot:
                 decoded = {}
             raw_payload = decoded if isinstance(decoded, dict) else {}
         channel_id = safe_text(row["channel_id"])
+        request_type = safe_text(row["request_type"]) or CHANNEL_REQUEST_TYPE_CONNECT_CHANNEL
+        verification_status = (
+            safe_text(row["verification_status"]) or CHANNEL_REQUEST_VERIFICATION_STATUS_VERIFIED
+        )
+        verification_note = safe_text(row["verification_note"])
+        if not verification_note and raw_payload.get("_request_meta"):
+            request_meta = raw_payload.get("_request_meta")
+            if isinstance(request_meta, dict):
+                verification_note = safe_text(request_meta.get("verification_note"))
+                verification_status = (
+                    safe_text(request_meta.get("verification_status"))
+                    or verification_status
+                )
+        current_admins: list[dict[str, Any]] = []
+        channel_id_int = validate_positive_int(channel_id, minimum=-10**18, maximum=10**18)
+        if channel_id_int is not None and self.get_channel_binding(int(channel_id_int)) is not None:
+            current_admins = [
+                self.serialize_channel_admin_brief(item)
+                for item in self.store.list_admin_users_for_channel(int(channel_id_int))
+                if int(item["is_active"]) == 1
+            ]
+        requester_profile = self.serialize_requester_profile_for_channel_request(row)
         payload = {
             "id": int(row["id"]),
+            "requestType": request_type,
+            "request_type": request_type,
+            "requestTypeLabel": self.channel_request_type_label(request_type),
+            "request_type_label": self.channel_request_type_label(request_type),
             "channelId": channel_id,
             "channel_id": channel_id,
             "channelTitle": safe_text(row["channel_title"]),
@@ -6987,6 +7296,12 @@ class MaxCommentsBot:
             "requester_user_id": int(row["requester_user_id"]) if row["requester_user_id"] is not None else None,
             "requesterMaxUserId": safe_text(row["requester_max_user_id"]),
             "requester_max_user_id": safe_text(row["requester_max_user_id"]),
+            "requesterProfile": requester_profile,
+            "requester_profile": requester_profile,
+            "verificationStatus": verification_status,
+            "verification_status": verification_status,
+            "verificationNote": verification_note,
+            "verification_note": verification_note,
             "status": safe_text(row["status"]),
             "adminComment": safe_text(row["admin_comment"]),
             "admin_comment": safe_text(row["admin_comment"]),
@@ -6998,6 +7313,10 @@ class MaxCommentsBot:
             "created_at": safe_text(row["created_at"]),
             "updatedAt": safe_text(row["updated_at"]),
             "updated_at": safe_text(row["updated_at"]),
+            "channelConnected": bool(current_admins),
+            "channel_connected": bool(current_admins),
+            "currentAdmins": current_admins,
+            "current_admins": current_admins,
         }
         if include_raw_payload:
             payload["rawPayload"] = raw_payload
@@ -7041,24 +7360,42 @@ class MaxCommentsBot:
         if requester_user_id is None:
             return
         channel_title = safe_text(row["channel_title"]) or safe_text(row["channel_id"])
+        request_type = safe_text(row["request_type"]) or CHANNEL_REQUEST_TYPE_CONNECT_CHANNEL
         if approved:
-            text = (
-                "Заявка одобрена.\n\n"
-                f"Канал “{channel_title}” подключён к боту. "
-                "Теперь кнопка “Комментарии” будет автоматически появляться у новых постов канала.\n\n"
-                f"Панель администратора канала:\n{public_app_url('/admin')}\n\n"
-                "Логин: ваш MAX user id\n"
-                "Пароль по умолчанию: ваш MAX user id"
-            )
+            if request_type == CHANNEL_REQUEST_TYPE_ADD_CHANNEL_ADMIN:
+                text = (
+                    "Заявка одобрена.\n\n"
+                    f"Канал “{channel_title}” добавлен в вашу панель администратора.\n\n"
+                    f"Панель администратора:\n{public_app_url('/admin')}\n\n"
+                    "Логин: ваш MAX user id\n"
+                    "Пароль по умолчанию: ваш MAX user id"
+                )
+            else:
+                text = (
+                    "Заявка одобрена.\n\n"
+                    f"Канал “{channel_title}” подключён к боту. "
+                    "Теперь кнопка “Комментарии” будет автоматически появляться у новых постов канала.\n\n"
+                    f"Панель администратора канала:\n{public_app_url('/admin')}\n\n"
+                    "Логин: ваш MAX user id\n"
+                    "Пароль по умолчанию: ваш MAX user id"
+                )
         else:
             reason = safe_text(row["admin_comment"]) or "Причина не указана"
-            text = (
-                "Заявка на подключение канала отклонена.\n\n"
-                f"Канал: {channel_title}\n\n"
-                "Причина:\n"
-                f"{reason}\n\n"
-                "Вы можете исправить замечания и отправить заявку повторно."
-            )
+            if request_type == CHANNEL_REQUEST_TYPE_ADD_CHANNEL_ADMIN:
+                text = (
+                    "Заявка на доступ к администрированию канала отклонена.\n\n"
+                    f"Канал: {channel_title}\n\n"
+                    "Причина:\n"
+                    f"{reason}"
+                )
+            else:
+                text = (
+                    "Заявка на подключение канала отклонена.\n\n"
+                    f"Канал: {channel_title}\n\n"
+                    "Причина:\n"
+                    f"{reason}\n\n"
+                    "Вы можете исправить замечания и отправить заявку повторно."
+                )
         try:
             self.api.send_message(user_id=int(requester_user_id), text=text)
         except Exception:
@@ -7080,46 +7417,116 @@ class MaxCommentsBot:
         channel_id = validate_positive_int(row["channel_id"], minimum=-10**18, maximum=10**18)
         if channel_id is None or channel_id == 0:
             raise MaxApiError("Некорректный ID канала в заявке.")
-        if self.get_channel_binding(int(channel_id)) is not None:
-            duplicate = self.store.update_channel_connection_request_status(
-                request_id=request_id,
-                status=CHANNEL_REQUEST_STATUS_DUPLICATE,
-                admin_comment="Канал уже подключён.",
-                reviewed_by_admin_id=context.user_id,
+        request_type = safe_text(row["request_type"]) or CHANNEL_REQUEST_TYPE_CONNECT_CHANNEL
+        requester_max_user_id = safe_text(row["requester_max_user_id"])
+        attached_count = 0
+        binding: sqlite3.Row | None = None
+
+        if request_type == CHANNEL_REQUEST_TYPE_ADD_CHANNEL_ADMIN:
+            binding = self.get_channel_binding(int(channel_id))
+            if binding is None:
+                raise MaxApiError("Канал ещё не подключён к сервису.")
+            existing_requester_admin = self.store.get_admin_user_by_max_user_id(requester_max_user_id)
+            if existing_requester_admin is None or safe_text(existing_requester_admin["role"]) != ROLE_SUPER_ADMIN:
+                self.store.ensure_admin_user(
+                    max_user_id=requester_max_user_id,
+                    role=ROLE_CHANNEL_ADMIN,
+                    password=requester_max_user_id,
+                    must_change_password=True,
+                    is_active=True,
+                )
+            self.store.add_channel_admin(
+                user_id=int(requester_max_user_id),
+                channel_id=int(channel_id),
             )
             self.store.add_admin_audit_log(
                 admin_user_id=context.user_id,
                 channel_id=int(channel_id),
-                action="duplicate_channel_request",
-                entity_type="channel_connection_request",
-                entity_id=request_id,
-                payload={"status": safe_text(duplicate["status"]) if duplicate is not None else "duplicate"},
+                action="add_channel_admin_link",
+                entity_type="channel_binding",
+                entity_id=channel_id,
+                payload={
+                    "requestType": request_type,
+                    "requesterMaxUserId": requester_max_user_id,
+                    "source": "forwarded_post",
+                },
             )
-            raise MaxApiError("Канал уже подключён.")
+        else:
+            if self.get_channel_binding(int(channel_id)) is not None:
+                duplicate = self.store.update_channel_connection_request_status(
+                    request_id=request_id,
+                    status=CHANNEL_REQUEST_STATUS_DUPLICATE,
+                    admin_comment="Канал уже подключён.",
+                    reviewed_by_admin_id=context.user_id,
+                )
+                self.store.add_admin_audit_log(
+                    admin_user_id=context.user_id,
+                    channel_id=int(channel_id),
+                    action="duplicate_channel_request",
+                    entity_type="channel_connection_request",
+                    entity_id=request_id,
+                    payload={"status": safe_text(duplicate["status"]) if duplicate is not None else "duplicate"},
+                )
+                raise MaxApiError("Канал уже подключён.")
 
-        can_manage, manage_error = self.ensure_bot_can_manage_channel(int(channel_id))
-        if not can_manage:
-            raise MaxApiError(manage_error or "Бот не является администратором канала.")
+            can_manage, manage_error = self.ensure_bot_can_manage_channel(int(channel_id))
+            if not can_manage:
+                raise MaxApiError(manage_error or "Бот не является администратором канала.")
 
-        requester_max_user_id = safe_text(row["requester_max_user_id"])
-        self.store.upsert_channel_binding(
-            channel_chat_id=int(channel_id),
-            comments_chat_id=WEBAPP_ONLY_COMMENTS_CHAT_ID,
-            comments_chat_url=None,
-        )
-        existing_requester_admin = self.store.get_admin_user_by_max_user_id(requester_max_user_id)
-        if existing_requester_admin is None or safe_text(existing_requester_admin["role"]) != ROLE_SUPER_ADMIN:
-            self.store.ensure_admin_user(
-                max_user_id=requester_max_user_id,
-                role=ROLE_CHANNEL_ADMIN,
-                password=requester_max_user_id,
-                must_change_password=True,
-                is_active=True,
+            self.store.upsert_channel_binding(
+                channel_chat_id=int(channel_id),
+                comments_chat_id=WEBAPP_ONLY_COMMENTS_CHAT_ID,
+                comments_chat_url=None,
             )
-        self.store.add_channel_admin(
-            user_id=int(requester_max_user_id),
-            channel_id=int(channel_id),
-        )
+            existing_requester_admin = self.store.get_admin_user_by_max_user_id(requester_max_user_id)
+            if existing_requester_admin is None or safe_text(existing_requester_admin["role"]) != ROLE_SUPER_ADMIN:
+                self.store.ensure_admin_user(
+                    max_user_id=requester_max_user_id,
+                    role=ROLE_CHANNEL_ADMIN,
+                    password=requester_max_user_id,
+                    must_change_password=True,
+                    is_active=True,
+                )
+            self.store.add_channel_admin(
+                user_id=int(requester_max_user_id),
+                channel_id=int(channel_id),
+            )
+            self.start_channel_sync()
+            try:
+                attached_count = self.sync_recent_channel_posts_for_binding(
+                    channel_chat_id=int(channel_id),
+                    comments_chat_id=WEBAPP_ONLY_COMMENTS_CHAT_ID,
+                )
+            except Exception:
+                logger.exception("Failed to sync newly approved channel %s", channel_id)
+            forwarded_post_id = safe_text(row["forwarded_post_id"])
+            if forwarded_post_id:
+                try:
+                    if self.store.get_post(forwarded_post_id) is None:
+                        self.attach_existing_post(forwarded_post_id, admin_user_id=None)
+                        attached_count += 1
+                except Exception:
+                    logger.exception("Failed to attach comments to forwarded post %s", forwarded_post_id)
+                    try:
+                        raw_payload = json.loads(safe_text(row["raw_payload"]) or "{}")
+                    except json.JSONDecodeError:
+                        raw_payload = {}
+                    forwarded = self.extract_forwarded_channel_post(raw_payload) if isinstance(raw_payload, dict) else None
+                    if forwarded is not None:
+                        try:
+                            self.register_channel_post_for_comments(
+                                post_message_id=forwarded_post_id,
+                                channel_chat_id=int(channel_id),
+                                comments_chat_id=WEBAPP_ONLY_COMMENTS_CHAT_ID,
+                                post_url=forwarded.post_url,
+                                post_text=forwarded.post_text,
+                                source_attachments=forwarded.post_attachments,
+                            )
+                            attached_count += 1
+                        except Exception:
+                            logger.exception("Failed to attach forwarded raw payload post %s", forwarded_post_id)
+            binding = self.get_channel_binding(int(channel_id))
+
         updated = self.store.update_channel_connection_request_status(
             request_id=request_id,
             status=CHANNEL_REQUEST_STATUS_APPROVED,
@@ -7131,51 +7538,20 @@ class MaxCommentsBot:
         self.store.add_admin_audit_log(
             admin_user_id=context.user_id,
             channel_id=int(channel_id),
-            action="approve_channel_request",
+            action=(
+                "approve_channel_admin_request"
+                if request_type == CHANNEL_REQUEST_TYPE_ADD_CHANNEL_ADMIN
+                else "approve_channel_request"
+            ),
             entity_type="channel_connection_request",
             entity_id=request_id,
             payload={
+                "requestType": request_type,
                 "requester_max_user_id": requester_max_user_id,
                 "forwarded_post_id": safe_text(row["forwarded_post_id"]),
             },
         )
-        self.start_channel_sync()
-        attached_count = 0
-        try:
-            attached_count = self.sync_recent_channel_posts_for_binding(
-                channel_chat_id=int(channel_id),
-                comments_chat_id=WEBAPP_ONLY_COMMENTS_CHAT_ID,
-            )
-        except Exception:
-            logger.exception("Failed to sync newly approved channel %s", channel_id)
-        forwarded_post_id = safe_text(row["forwarded_post_id"])
-        if forwarded_post_id:
-            try:
-                if self.store.get_post(forwarded_post_id) is None:
-                    self.attach_existing_post(forwarded_post_id, admin_user_id=None)
-                    attached_count += 1
-            except Exception:
-                logger.exception("Failed to attach comments to forwarded post %s", forwarded_post_id)
-                try:
-                    raw_payload = json.loads(safe_text(row["raw_payload"]) or "{}")
-                except json.JSONDecodeError:
-                    raw_payload = {}
-                forwarded = self.extract_forwarded_channel_post(raw_payload) if isinstance(raw_payload, dict) else None
-                if forwarded is not None:
-                    try:
-                        self.register_channel_post_for_comments(
-                            post_message_id=forwarded_post_id,
-                            channel_chat_id=int(channel_id),
-                            comments_chat_id=WEBAPP_ONLY_COMMENTS_CHAT_ID,
-                            post_url=forwarded.post_url,
-                            post_text=forwarded.post_text,
-                            source_attachments=forwarded.post_attachments,
-                        )
-                        attached_count += 1
-                    except Exception:
-                        logger.exception("Failed to attach forwarded raw payload post %s", forwarded_post_id)
         self.notify_requester_about_channel_request_result(updated, approved=True)
-        binding = self.get_channel_binding(int(channel_id))
         return {
             "ok": True,
             "request": self.serialize_channel_connection_request(updated),
@@ -7208,10 +7584,17 @@ class MaxCommentsBot:
         self.store.add_admin_audit_log(
             admin_user_id=context.user_id,
             channel_id=int(channel_id),
-            action="reject_channel_request",
+            action=(
+                "reject_channel_admin_request"
+                if safe_text(row["request_type"]) == CHANNEL_REQUEST_TYPE_ADD_CHANNEL_ADMIN
+                else "reject_channel_request"
+            ),
             entity_type="channel_connection_request",
             entity_id=request_id,
-            payload={"admin_comment": safe_text(admin_comment)},
+            payload={
+                "requestType": safe_text(row["request_type"]) or CHANNEL_REQUEST_TYPE_CONNECT_CHANNEL,
+                "admin_comment": safe_text(admin_comment),
+            },
         )
         self.notify_requester_about_channel_request_result(updated, approved=False)
         return {
