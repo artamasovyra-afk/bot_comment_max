@@ -5911,14 +5911,26 @@ class MaxCommentsBot:
             logger.warning("Channel post from admin has no message id: %s", message)
             return True
 
+        post_text, source_attachments, source_channel_id, used_forwarded_payload = self.resolve_channel_post_content(
+            message
+        )
+        if used_forwarded_payload:
+            logger.info(
+                "Resolved forwarded channel post for auto-attach target_channel_id=%s source_channel_id=%s "
+                "post_message_id=%s",
+                int(binding["channel_chat_id"]),
+                source_channel_id if source_channel_id is not None else "<unknown>",
+                post_message_id,
+            )
+
         try:
             self.register_channel_post_for_comments(
                 post_message_id=post_message_id,
                 channel_chat_id=int(binding["channel_chat_id"]),
                 comments_chat_id=int(binding["comments_chat_id"]),
                 post_url=message.get("url"),
-                post_text=safe_text(body.get("text")),
-                source_attachments=self.extract_post_attachments_from_message(message),
+                post_text=post_text,
+                source_attachments=source_attachments,
             )
             logger.info("Auto-attached comments button to channel post %s", post_message_id)
         except Exception:
@@ -5963,13 +5975,24 @@ class MaxCommentsBot:
             post_message_id = safe_text(body.get("mid") or message.get("mid"))
             if not post_message_id:
                 continue
+            post_text, source_attachments, source_channel_id, used_forwarded_payload = self.resolve_channel_post_content(
+                message
+            )
+            if used_forwarded_payload:
+                logger.info(
+                    "Resolved forwarded channel post during sync target_channel_id=%s source_channel_id=%s "
+                    "post_message_id=%s",
+                    channel_chat_id,
+                    source_channel_id if source_channel_id is not None else "<unknown>",
+                    post_message_id,
+                )
             self.register_channel_post_for_comments(
                 post_message_id=post_message_id,
                 channel_chat_id=channel_chat_id,
                 comments_chat_id=comments_chat_id,
                 post_url=message.get("url"),
-                post_text=safe_text(body.get("text")),
-                source_attachments=self.extract_post_attachments_from_message(message),
+                post_text=post_text,
+                source_attachments=source_attachments,
             )
             attached_count += 1
         return attached_count
@@ -5987,7 +6010,9 @@ class MaxCommentsBot:
         if self.store.get_post(post_message_id) is not None:
             return False
 
-        post_text = safe_text(body.get("text"))
+        post_text, effective_attachments, source_channel_id, used_forwarded_payload = self.resolve_channel_post_content(
+            message
+        )
         if post_text.startswith("/"):
             return False
         if CHANNEL_POST_FOOTER in post_text:
@@ -5995,10 +6020,18 @@ class MaxCommentsBot:
         if is_setup_service_message_text(post_text):
             return False
 
-        raw_attachments = body.get("attachments") or []
-        if not post_text and not raw_attachments:
+        if not post_text and not effective_attachments:
+            if source_channel_id is not None:
+                logger.info(
+                    "Skipping channel post auto-attach reason=no_renderable_content target_channel_id=%s "
+                    "source_channel_id=%s post_message_id=%s used_forwarded_payload=%s",
+                    safe_text(chat_id) or "<unknown>",
+                    source_channel_id,
+                    post_message_id,
+                    used_forwarded_payload,
+                )
             return False
-        if self.has_any_inline_keyboard(raw_attachments):
+        if self.has_any_inline_keyboard(effective_attachments):
             return False
         return True
 
@@ -6012,8 +6045,7 @@ class MaxCommentsBot:
                 return True
         return False
 
-    def extract_post_attachments_from_message(self, message: dict[str, Any]) -> list[dict[str, Any]]:
-        raw_attachments = ((message.get("body") or {}).get("attachments")) or []
+    def filter_post_attachments(self, raw_attachments: Any) -> list[dict[str, Any]]:
         if not isinstance(raw_attachments, list):
             return []
         preserved: list[dict[str, Any]] = []
@@ -6024,6 +6056,53 @@ class MaxCommentsBot:
                 continue
             preserved.append(attachment)
         return preserved
+
+    def attachment_contains_forwarded_payload(self, attachment: dict[str, Any]) -> bool:
+        attachment_type = safe_text(attachment.get("type") or attachment.get("kind")).lower()
+        if any(key in attachment for key in ("message", "forwarded_message", "shared_message", "forward", "link")):
+            if self.extract_channel_id_from_forward_payload(attachment) is not None:
+                return True
+        if any(marker in attachment_type for marker in ("forward", "shared", "share", "message")):
+            if self.extract_channel_id_from_forward_payload(attachment) is not None:
+                return True
+        return False
+
+    def resolve_channel_post_content(
+        self,
+        message: dict[str, Any],
+    ) -> tuple[str, list[dict[str, Any]], int | None, bool]:
+        body = message.get("body") if isinstance(message.get("body"), dict) else {}
+        body_text = safe_text(body.get("text"))
+        top_level_attachments = self.filter_post_attachments(body.get("attachments") or [])
+        forwarded = self.extract_forwarded_channel_post(message)
+        if forwarded is None:
+            return body_text, top_level_attachments, None, False
+
+        forwarded_text = safe_text(forwarded.post_text)
+        forwarded_attachments = self.filter_post_attachments(forwarded.post_attachments)
+        top_level_has_forward_wrapper = any(
+            self.attachment_contains_forwarded_payload(attachment) for attachment in top_level_attachments
+        )
+
+        effective_text = body_text or forwarded_text
+        effective_attachments = top_level_attachments
+        used_forwarded_payload = False
+
+        if not top_level_attachments and forwarded_attachments:
+            effective_attachments = forwarded_attachments
+            used_forwarded_payload = True
+        elif top_level_has_forward_wrapper and forwarded_attachments:
+            effective_attachments = forwarded_attachments
+            used_forwarded_payload = True
+
+        if not body_text and forwarded_text:
+            used_forwarded_payload = True
+
+        return effective_text, effective_attachments, int(forwarded.channel_id), used_forwarded_payload
+
+    def extract_post_attachments_from_message(self, message: dict[str, Any]) -> list[dict[str, Any]]:
+        _, attachments, _, _ = self.resolve_channel_post_content(message)
+        return attachments
 
     def stored_post_attachments(self, post: sqlite3.Row) -> list[dict[str, Any]]:
         try:
@@ -6160,13 +6239,23 @@ class MaxCommentsBot:
 
     def attach_existing_post(self, post_message_id: str, *, admin_user_id: int | None) -> dict[str, Any]:
         message = self.api.get_message(post_message_id)
-        post_text = safe_text(((message.get("body") or {}).get("text")))
+        post_text, source_attachments, source_channel_id, used_forwarded_payload = self.resolve_channel_post_content(
+            message
+        )
         recipient = message.get("recipient") or {}
         chat_id = recipient.get("chat_id")
         binding = self.get_channel_binding(chat_id)
         if binding is None:
             raise MaxApiError("Channel is not connected")
         post_url = message.get("url")
+        if used_forwarded_payload:
+            logger.info(
+                "Resolved forwarded channel post during manual attach target_channel_id=%s source_channel_id=%s "
+                "post_message_id=%s",
+                int(binding["channel_chat_id"]),
+                source_channel_id if source_channel_id is not None else "<unknown>",
+                post_message_id,
+            )
 
         self.register_channel_post_for_comments(
             post_message_id=post_message_id,
@@ -6174,7 +6263,7 @@ class MaxCommentsBot:
             comments_chat_id=int(binding["comments_chat_id"]),
             post_url=post_url,
             post_text=post_text,
-            source_attachments=self.extract_post_attachments_from_message(message),
+            source_attachments=source_attachments,
         )
 
         if admin_user_id is not None:

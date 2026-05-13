@@ -246,6 +246,109 @@ def test_handle_update_bot_started_sends_terms_for_new_user(bot_module) -> None:
     assert captured == [101]
 
 
+def test_should_auto_attach_channel_message_accepts_forwarded_post_with_nested_payload(
+    bot_module, tmp_path
+) -> None:
+    store = bot_module.CommentStore(str(tmp_path / "forwarded-auto-attach.sqlite3"))
+    store.upsert_channel_binding(
+        channel_chat_id=-74631532033454,
+        comments_chat_id=-74631532033455,
+        comments_chat_url="https://max.ru/chat/comments",
+    )
+
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.store = store
+
+    message = {
+        "recipient": {"chat_id": -74631532033454},
+        "body": {
+            "mid": "post-forwarded-1",
+            "attachments": [
+                {
+                    "type": "share",
+                    "message": {
+                        "body": {
+                            "text": "Пересланный пост",
+                            "attachments": [
+                                {
+                                    "type": "image",
+                                    "payload": {"url": "https://example.test/image.jpg"},
+                                }
+                            ],
+                        }
+                    },
+                    "chat_id": -70000000000001,
+                }
+            ],
+        },
+    }
+
+    assert app.should_auto_attach_channel_message(message) is True
+    assert app.extract_post_attachments_from_message(message) == [
+        {"type": "image", "payload": {"url": "https://example.test/image.jpg"}}
+    ]
+
+
+def test_maybe_auto_attach_channel_post_uses_target_channel_and_forwarded_content(
+    bot_module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.store = object()
+    app.has_channel_bindings = lambda: True
+    app.get_channel_binding = lambda chat_id: {
+        "channel_chat_id": -74631532033454,
+        "comments_chat_id": -74631532033455,
+    }
+    app.is_own_message = lambda sender: False
+    monkeypatch.setattr(bot_module.logger, "info", lambda *args, **kwargs: None)
+
+    captured: dict[str, object] = {}
+
+    def fake_register_channel_post_for_comments(**kwargs) -> None:
+        captured.update(kwargs)
+
+    app.register_channel_post_for_comments = fake_register_channel_post_for_comments
+
+    message = {
+        "recipient": {"chat_id": -74631532033454},
+        "body": {
+            "mid": "post-forwarded-2",
+            "attachments": [
+                {
+                    "type": "share",
+                    "message": {
+                        "body": {
+                            "text": "Пересланный текст",
+                            "attachments": [
+                                {
+                                    "type": "image",
+                                    "payload": {"url": "https://example.test/photo.png"},
+                                }
+                            ],
+                        }
+                    },
+                    "chat_id": -70000000000001,
+                }
+            ],
+        },
+        "url": "https://max.ru/channel/target/post-forwarded-2",
+    }
+
+    handled = bot_module.MaxCommentsBot.maybe_auto_attach_channel_post(app, message)
+
+    assert handled is True
+    assert captured == {
+        "post_message_id": "post-forwarded-2",
+        "channel_chat_id": -74631532033454,
+        "comments_chat_id": -74631532033455,
+        "post_url": "https://max.ru/channel/target/post-forwarded-2",
+        "post_text": "Пересланный текст",
+        "source_attachments": [
+            {"type": "image", "payload": {"url": "https://example.test/photo.png"}}
+        ],
+    }
+
+
 def test_admin_delete_user_soft_deletes_and_clears_channel_links(bot_module, tmp_path) -> None:
     store = bot_module.CommentStore(str(tmp_path / "admin-delete.sqlite3"))
     admin_user = store.ensure_admin_user(
