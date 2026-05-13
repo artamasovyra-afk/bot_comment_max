@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import os
 import sys
+import types
 
 import pytest
 
@@ -402,3 +403,179 @@ def test_requester_channel_admin_status_returns_unknown_when_max_api_cannot_veri
 
     assert status is None
     assert "Не удалось автоматически проверить" in note
+
+
+def test_attach_user_to_connected_channel_creates_channel_admin_and_link(
+    bot_module, tmp_path
+) -> None:
+    store = bot_module.CommentStore(str(tmp_path / "connected-channel-admin.sqlite3"))
+    store.upsert_channel_binding(
+        channel_chat_id=-74631532033454,
+        comments_chat_id=-74631532033455,
+        comments_chat_url="https://max.ru/chat/comments",
+    )
+
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.store = store
+    app.ensure_bot_can_manage_channel = lambda channel_id: (True, None)
+    app.requester_channel_admin_status = lambda channel_id, requester_user_id: (True, None)
+    app.log_channel_request_event = lambda *args, **kwargs: None
+
+    sent_messages: list[tuple[int, str]] = []
+
+    class FakeApi:
+        def send_message(self, *, user_id: int, text: str, **kwargs) -> None:
+            sent_messages.append((user_id, text))
+
+    app.api = FakeApi()
+
+    attached = app.attach_user_to_connected_channel(
+        user_id=424242,
+        channel_id=-74631532033454,
+        channel_title="МЦ",
+        notify_user=True,
+    )
+
+    assert attached is True
+    admin_user = store.get_admin_user_by_max_user_id("424242")
+    assert admin_user is not None
+    assert admin_user["role"] == bot_module.ROLE_CHANNEL_ADMIN
+    assert int(admin_user["is_active"]) == 1
+    assert store.list_channel_admin_channel_ids(424242) == {-74631532033454}
+    assert sent_messages == [
+        (
+            424242,
+            "Вы добавлены администратором к уже подключённому каналу.\n\n"
+            "Канал: МЦ\n"
+            "Панель администратора канала:\n"
+            f"{bot_module.public_app_url('/admin')}\n\n"
+            "Логин: ваш MAX user id\n"
+            "Пароль по умолчанию: ваш MAX user id\n"
+            "Если вы уже входили раньше и меняли пароль, используйте текущий пароль.",
+        )
+    ]
+
+
+def test_accept_terms_for_user_attaches_saved_connected_channel_link(bot_module, tmp_path) -> None:
+    store = bot_module.CommentStore(str(tmp_path / "pending-connected-channel.sqlite3"))
+    store.save_pending_channel_admin_link(
+        user_id=424242,
+        channel_id=-74631532033454,
+        channel_title="МЦ",
+    )
+
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.store = store
+
+    captured: dict[str, object] = {}
+
+    def fake_attach(**kwargs) -> bool:
+        captured.update(kwargs)
+        return True
+
+    app.attach_user_to_connected_channel = fake_attach
+    app.api = type("FakeApi", (), {"send_message": lambda *args, **kwargs: None})()
+
+    app.accept_terms_for_user(424242)
+
+    assert captured == {
+        "user_id": 424242,
+        "channel_id": -74631532033454,
+        "channel_title": "МЦ",
+        "message": None,
+        "notify_user": True,
+        "accepted_just_now": True,
+    }
+    assert store.has_accepted_terms(max_user_id=424242, version=bot_module.TERMS_VERSION) is True
+    assert store.pop_pending_channel_admin_link(user_id=424242) is None
+
+
+def test_serialize_channel_binding_includes_multiple_admins_for_super_admin(
+    bot_module, tmp_path
+) -> None:
+    store = bot_module.CommentStore(str(tmp_path / "channel-admins.sqlite3"))
+    store.upsert_channel_binding(
+        channel_chat_id=-74631532033454,
+        comments_chat_id=-74631532033455,
+        comments_chat_url="https://max.ru/chat/comments",
+    )
+    store.ensure_admin_user(
+        max_user_id="111",
+        role=bot_module.ROLE_CHANNEL_ADMIN,
+        password="password",
+        first_name="Иван",
+        last_name="Петров",
+        username="ivan",
+        must_change_password=False,
+        is_active=True,
+    )
+    store.ensure_admin_user(
+        max_user_id="222",
+        role=bot_module.ROLE_CHANNEL_ADMIN,
+        password="password",
+        display_name="Мария Соколова",
+        username="maria",
+        must_change_password=False,
+        is_active=True,
+    )
+    store.add_channel_admin(user_id=111, channel_id=-74631532033454)
+    store.add_channel_admin(user_id=222, channel_id=-74631532033454)
+
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.store = store
+    app.get_chat_info_cached = lambda chat_id: {
+        "title": "МЦ" if int(chat_id) == -74631532033454 else "Чат комментариев",
+        "link": "",
+    }
+    binding = store.get_channel_binding(-74631532033454)
+
+    assert binding is not None
+    payload = app.serialize_channel_binding(binding, include_admins=True)
+
+    assert payload["admins_count"] == 2
+    assert [admin["max_user_id"] for admin in payload["admins"]] == ["111", "222"]
+    assert [admin["resolved_name"] for admin in payload["admins"]] == [
+        "Иван Петров",
+        "Мария Соколова",
+    ]
+
+
+def test_handle_forwarded_channel_post_request_attaches_user_for_connected_channel(
+    bot_module, tmp_path
+) -> None:
+    store = bot_module.CommentStore(str(tmp_path / "connected-forwarded.sqlite3"))
+    store.upsert_channel_binding(
+        channel_chat_id=-74631532033454,
+        comments_chat_id=-74631532033455,
+        comments_chat_url="https://max.ru/chat/comments",
+    )
+    store.accept_terms(max_user_id=424242, version=bot_module.TERMS_VERSION)
+
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.store = store
+    app.extract_forwarded_channel_post = lambda message: types.SimpleNamespace(
+        channel_id=-74631532033454,
+        channel_title="МЦ",
+        post_message_id="post-1",
+    )
+    app.forward_payload_has_channel_hint = lambda message: True
+    app.log_channel_request_event = lambda *args, **kwargs: None
+
+    captured: dict[str, object] = {}
+
+    def fake_attach(**kwargs) -> bool:
+        captured.update(kwargs)
+        return True
+
+    app.attach_user_to_connected_channel = fake_attach
+
+    handled = app.handle_forwarded_channel_post_request({"recipient": {"chat_id": 1}}, 424242)
+
+    assert handled is True
+    assert captured == {
+        "user_id": 424242,
+        "channel_id": -74631532033454,
+        "channel_title": "МЦ",
+        "message": {"recipient": {"chat_id": 1}},
+        "notify_user": True,
+    }

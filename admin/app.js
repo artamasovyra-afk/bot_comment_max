@@ -383,6 +383,16 @@
       return;
     }
     for (const channel of state.channels) {
+      const channelAdmins = Array.isArray(channel.admins) ? channel.admins : [];
+      const channelAdminsText = isSuperAdmin() && channelAdmins.length
+        ? channelAdmins
+          .map((admin) => {
+            const resolvedName = admin.resolved_name || admin.display_name || admin.username || admin.max_user_id;
+            const username = admin.username ? ` (@${admin.username})` : "";
+            return `${resolvedName}${username}`;
+          })
+          .join(", ")
+        : "";
       const item = document.createElement("article");
       item.className = "item";
       item.innerHTML = `
@@ -391,6 +401,7 @@
             <div class="item-title">${escapeHtml(channel.channel_label || channel.channel_chat_id)}</div>
             <div class="item-meta">Канал: ${escapeHtml(channel.channel_chat_id)}</div>
             <div class="item-meta">Чат комментариев: ${escapeHtml(channel.comments_chat_label || channel.comments_chat_id)}</div>
+            ${channelAdminsText ? `<div class="item-meta">Администраторы: ${escapeHtml(channelAdminsText)}</div>` : ""}
           </div>
           <span class="pill">${channel.same_chat ? "один чат" : "отдельный чат"}</span>
         </div>
