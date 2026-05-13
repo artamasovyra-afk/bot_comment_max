@@ -928,7 +928,11 @@ class MaxApiClient:
 
         if not raw:
             return {}
-        return json.loads(raw)
+        payload_data = json.loads(raw)
+        if isinstance(payload_data, dict) and payload_data.get("success") is False:
+            detail = safe_text(payload_data.get("message") or payload_data.get("error") or "request rejected")
+            raise MaxApiError(f"{method} {url} failed: {detail}")
+        return payload_data
 
     def _request_absolute(
         self,
@@ -1078,11 +1082,14 @@ class MaxApiClient:
         *,
         text: str,
         attachments: list[dict[str, Any]] | None = None,
+        link: dict[str, Any] | None = None,
         fmt: str = "markdown",
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"text": text, "format": fmt}
         if attachments is not None:
             payload["attachments"] = attachments
+        if link is not None:
+            payload["link"] = link
         return self._request(
             "PUT",
             "/messages",
@@ -1141,6 +1148,7 @@ class CommentStore:
                     post_url TEXT,
                     post_text TEXT,
                     post_attachments_json TEXT NOT NULL DEFAULT '[]',
+                    button_message_id TEXT,
                     discussion_message_id TEXT,
                     status TEXT NOT NULL DEFAULT 'published',
                     deleted_at TEXT,
@@ -1358,6 +1366,10 @@ class CommentStore:
         if "post_attachments_json" not in post_columns:
             self.conn.execute(
                 "ALTER TABLE posts ADD COLUMN post_attachments_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "button_message_id" not in post_columns:
+            self.conn.execute(
+                "ALTER TABLE posts ADD COLUMN button_message_id TEXT"
             )
         if "status" not in post_columns:
             self.conn.execute(
@@ -1929,6 +1941,7 @@ class CommentStore:
         post_text: str,
         post_attachments: list[dict[str, Any]] | None = None,
         post_title: str | None = None,
+        button_message_id: str | None = None,
         discussion_message_id: str | None = None,
     ) -> None:
         now = utc_now()
@@ -1944,11 +1957,12 @@ class CommentStore:
                     post_url,
                     post_text,
                     post_attachments_json,
+                    button_message_id,
                     discussion_message_id,
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(post_message_id) DO UPDATE SET
                     channel_chat_id = excluded.channel_chat_id,
                     comments_chat_id = COALESCE(posts.comments_chat_id, excluded.comments_chat_id),
@@ -1956,6 +1970,7 @@ class CommentStore:
                     post_url = excluded.post_url,
                     post_text = excluded.post_text,
                     post_attachments_json = excluded.post_attachments_json,
+                    button_message_id = COALESCE(excluded.button_message_id, posts.button_message_id),
                     discussion_message_id = COALESCE(excluded.discussion_message_id, posts.discussion_message_id),
                     updated_at = excluded.updated_at
                 """,
@@ -1967,10 +1982,23 @@ class CommentStore:
                     post_url,
                     post_text,
                     post_attachments_json,
+                    safe_text(button_message_id) or None,
                     discussion_message_id,
                     now,
                     now,
                 ),
+            )
+            self.conn.commit()
+
+    def set_button_message_id(self, post_message_id: str, button_message_id: str) -> None:
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE posts
+                SET button_message_id = ?, updated_at = ?
+                WHERE post_message_id = ?
+                """,
+                (safe_text(button_message_id) or None, utc_now(), post_message_id),
             )
             self.conn.commit()
 
@@ -5931,6 +5959,7 @@ class MaxCommentsBot:
                 post_url=message.get("url"),
                 post_text=post_text,
                 source_attachments=source_attachments,
+                source_message_link=self.normalize_message_link_for_send(message.get("link")),
             )
             logger.info("Auto-attached comments button to channel post %s", post_message_id)
         except Exception:
@@ -5993,6 +6022,7 @@ class MaxCommentsBot:
                 post_url=message.get("url"),
                 post_text=post_text,
                 source_attachments=source_attachments,
+                source_message_link=self.normalize_message_link_for_send(message.get("link")),
             )
             attached_count += 1
         return attached_count
@@ -6104,6 +6134,21 @@ class MaxCommentsBot:
         _, attachments, _, _ = self.resolve_channel_post_content(message)
         return attachments
 
+    def normalize_message_link_for_send(self, raw_link: Any) -> dict[str, Any] | None:
+        if not isinstance(raw_link, dict):
+            return None
+        link_type = safe_text(raw_link.get("type"))
+        linked_message = raw_link.get("message") if isinstance(raw_link.get("message"), dict) else {}
+        link_mid = safe_text(raw_link.get("mid") or linked_message.get("mid"))
+        if not link_type or not link_mid:
+            return None
+        return {"type": link_type, "mid": link_mid}
+
+    def link_is_forwarded_post(self, link_payload: dict[str, Any] | None) -> bool:
+        if not isinstance(link_payload, dict):
+            return False
+        return safe_text(link_payload.get("type")).lower() == "forward"
+
     def stored_post_attachments(self, post: sqlite3.Row) -> list[dict[str, Any]]:
         try:
             raw_value = post["post_attachments_json"]
@@ -6137,6 +6182,7 @@ class MaxCommentsBot:
         post_text: str,
         post_title: str | None = None,
         source_attachments: list[dict[str, Any]] | None = None,
+        source_message_link: dict[str, Any] | None = None,
     ) -> sqlite3.Row:
         clean_post_text = strip_managed_channel_footer(post_text)
         clean_attachments = list(source_attachments or [])
@@ -6155,6 +6201,9 @@ class MaxCommentsBot:
             post_text=clean_post_text,
             post_attachments=clean_attachments,
             post_title=post_title,
+            button_message_id=(
+                safe_text(existing_post["button_message_id"]) or None if existing_post is not None else None
+            ),
             discussion_message_id=(
                 safe_text(existing_post["discussion_message_id"]) or None if existing_post is not None else None
             ),
@@ -6173,14 +6222,48 @@ class MaxCommentsBot:
             if discussion_message_id:
                 self.store.set_discussion_message_id(post_message_id, discussion_message_id)
 
-        self.api.edit_message(
-            post_message_id,
-            text=self.render_channel_post_text(clean_post_text, post_message_id),
-            attachments=self.render_channel_post_attachments(
+        stored_post = self.store.get_post(post_message_id)
+        if stored_post is None:
+            raise MaxApiError("Post was registered but could not be reloaded")
+
+        button_message_id = safe_text(stored_post["button_message_id"]) or None
+        if button_message_id:
+            self.api.edit_message(
+                button_message_id,
+                text=CHANNEL_POST_FOOTER,
+                attachments=self.build_comment_button(post_message_id),
+            )
+            return stored_post
+
+        try:
+            self.api.edit_message(
                 post_message_id,
-                post_attachments=clean_attachments,
-            ),
-        )
+                text=self.render_channel_post_text(clean_post_text, post_message_id),
+                attachments=self.render_channel_post_attachments(
+                    post_message_id,
+                    post_attachments=clean_attachments,
+                ),
+            )
+        except MaxApiError:
+            if not self.link_is_forwarded_post(source_message_link):
+                raise
+            reply_message = self.api.send_message(
+                chat_id=channel_chat_id,
+                text=CHANNEL_POST_FOOTER,
+                attachments=self.build_comment_button(post_message_id),
+                link={"type": "reply", "mid": post_message_id},
+                fmt="markdown",
+            )
+            button_message_id = extract_message_id(reply_message)
+            if button_message_id:
+                self.store.set_button_message_id(post_message_id, button_message_id)
+            else:
+                raise MaxApiError("MAX API did not return message id for the forwarded post button")
+            logger.info(
+                "Created fallback button message %s for forwarded channel post %s",
+                button_message_id,
+                post_message_id,
+            )
 
         stored_post = self.store.get_post(post_message_id)
         if stored_post is None:
@@ -6264,6 +6347,7 @@ class MaxCommentsBot:
             post_url=post_url,
             post_text=post_text,
             source_attachments=source_attachments,
+            source_message_link=self.normalize_message_link_for_send(message.get("link")),
         )
 
         if admin_user_id is not None:
@@ -6321,20 +6405,29 @@ class MaxCommentsBot:
             return
         if comment_count is None:
             comment_count = int(post["comment_count"])
+        button_message_id = safe_text(post["button_message_id"]) if "button_message_id" in post.keys() else ""
+        target_message_id = button_message_id or post_message_id
+        text = CHANNEL_POST_FOOTER if button_message_id else self.render_channel_post_text(post["post_text"], post_message_id)
+        attachments = (
+            self.build_comment_button(post_message_id, comment_count=comment_count)
+            if button_message_id
+            else self.render_channel_post_attachments(
+                post_message_id,
+                post_attachments=self.stored_post_attachments(post),
+                comment_count=comment_count,
+            )
+        )
         try:
             self.api.edit_message(
-                post_message_id,
-                text=self.render_channel_post_text(post["post_text"], post_message_id),
-                attachments=self.render_channel_post_attachments(
-                    post_message_id,
-                    post_attachments=self.stored_post_attachments(post),
-                    comment_count=comment_count,
-                ),
+                target_message_id,
+                text=text,
+                attachments=attachments,
             )
         except Exception:
             logger.exception(
-                "Failed to refresh comment button for post %s",
+                "Failed to refresh comment button for post %s via message %s",
                 post_message_id,
+                target_message_id,
             )
 
     def build_discussion_post_text(
@@ -7610,6 +7703,9 @@ class MaxCommentsBot:
                                 post_url=forwarded.post_url,
                                 post_text=forwarded.post_text,
                                 source_attachments=forwarded.post_attachments,
+                                source_message_link=self.normalize_message_link_for_send(
+                                    raw_payload.get("link") if isinstance(raw_payload, dict) else None
+                                ),
                             )
                             attached_count += 1
                         except Exception:

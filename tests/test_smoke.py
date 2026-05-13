@@ -346,7 +346,139 @@ def test_maybe_auto_attach_channel_post_uses_target_channel_and_forwarded_conten
         "source_attachments": [
             {"type": "image", "payload": {"url": "https://example.test/photo.png"}}
         ],
+        "source_message_link": None,
     }
+
+
+def test_register_channel_post_for_comments_creates_fallback_button_message_for_forwarded_post(
+    bot_module, tmp_path
+) -> None:
+    store = bot_module.CommentStore(str(tmp_path / "forwarded-fallback.sqlite3"))
+
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.store = store
+    app.get_bot_username = lambda: "cit_bot"
+
+    sent_messages: list[dict[str, object]] = []
+
+    class FakeApi:
+        def send_message(self, **kwargs):
+            sent_messages.append(kwargs)
+            return {"message": {"body": {"mid": "mid.button.1"}}}
+
+        def edit_message(self, *args, **kwargs):
+            raise bot_module.MaxApiError("PUT /messages failed: Error on message edit")
+
+    app.api = FakeApi()
+
+    stored = app.register_channel_post_for_comments(
+        post_message_id="mid.original.1",
+        channel_chat_id=-74631532033454,
+        comments_chat_id=0,
+        post_url="https://max.ru/id/test/1",
+        post_text="Пересланный текст",
+        source_attachments=[
+            {"type": "video", "payload": {"url": "https://example.test/video.mp4"}}
+        ],
+        source_message_link={"type": "forward", "mid": "mid.source.1"},
+    )
+
+    assert stored["button_message_id"] == "mid.button.1"
+    assert sent_messages == [
+        {
+            "chat_id": -74631532033454,
+            "text": bot_module.CHANNEL_POST_FOOTER,
+            "attachments": [
+                {
+                    "type": "inline_keyboard",
+                    "payload": {
+                        "buttons": [
+                            [
+                                {
+                                    "type": "link",
+                                    "text": "0 комментариев",
+                                    "url": "https://max.ru/cit_bot?startapp=post_bWlkLm9yaWdpbmFsLjE",
+                                }
+                            ]
+                        ]
+                    },
+                }
+            ],
+            "link": {"type": "reply", "mid": "mid.original.1"},
+            "fmt": "markdown",
+        }
+    ]
+
+
+def test_refresh_post_comment_button_updates_companion_message_when_present(
+    bot_module, tmp_path
+) -> None:
+    store = bot_module.CommentStore(str(tmp_path / "refresh-companion.sqlite3"))
+    store.upsert_post(
+        post_message_id="mid.original.2",
+        channel_chat_id=-74631532033454,
+        comments_chat_id=0,
+        post_url="https://max.ru/id/test/2",
+        post_text="Текст поста",
+        post_attachments=None,
+        button_message_id="mid.button.2",
+        discussion_message_id=None,
+    )
+
+    captured: list[dict[str, object]] = []
+
+    class FakeApi:
+        def edit_message(
+            self,
+            message_id: str,
+            *,
+            text: str,
+            attachments,
+            fmt: str = "markdown",
+            link=None,
+        ):
+            captured.append(
+                {
+                    "message_id": message_id,
+                    "text": text,
+                    "attachments": attachments,
+                    "fmt": fmt,
+                    "link": link,
+                }
+            )
+            return {"success": True}
+
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.store = store
+    app.api = FakeApi()
+    app.get_bot_username = lambda: "cit_bot"
+
+    app.refresh_post_comment_button("mid.original.2", comment_count=3)
+
+    assert captured == [
+        {
+            "message_id": "mid.button.2",
+            "text": bot_module.CHANNEL_POST_FOOTER,
+            "attachments": [
+                {
+                    "type": "inline_keyboard",
+                    "payload": {
+                        "buttons": [
+                            [
+                                {
+                                    "type": "link",
+                                    "text": "3 комментария",
+                                    "url": "https://max.ru/cit_bot?startapp=post_bWlkLm9yaWdpbmFsLjI",
+                                }
+                            ]
+                        ]
+                    },
+                }
+            ],
+            "fmt": "markdown",
+            "link": None,
+        }
+    ]
 
 
 def test_admin_delete_user_soft_deletes_and_clears_channel_links(bot_module, tmp_path) -> None:
