@@ -5939,17 +5939,16 @@ class MaxCommentsBot:
             logger.warning("Channel post from admin has no message id: %s", message)
             return True
 
-        post_text, source_attachments, source_channel_id, used_forwarded_payload = self.resolve_channel_post_content(
-            message
-        )
-        if used_forwarded_payload:
+        if self.extract_forwarded_channel_post(message) is not None:
             logger.info(
-                "Resolved forwarded channel post for auto-attach target_channel_id=%s source_channel_id=%s "
+                "Skipping channel post auto-attach reason=forwarded_post_ignored target_channel_id=%s "
                 "post_message_id=%s",
                 int(binding["channel_chat_id"]),
-                source_channel_id if source_channel_id is not None else "<unknown>",
                 post_message_id,
             )
+            return True
+
+        post_text, source_attachments, _, _ = self.resolve_channel_post_content(message)
 
         try:
             self.register_channel_post_for_comments(
@@ -5959,7 +5958,6 @@ class MaxCommentsBot:
                 post_url=message.get("url"),
                 post_text=post_text,
                 source_attachments=source_attachments,
-                source_message_link=self.normalize_message_link_for_send(message.get("link")),
             )
             logger.info("Auto-attached comments button to channel post %s", post_message_id)
         except Exception:
@@ -6004,17 +6002,7 @@ class MaxCommentsBot:
             post_message_id = safe_text(body.get("mid") or message.get("mid"))
             if not post_message_id:
                 continue
-            post_text, source_attachments, source_channel_id, used_forwarded_payload = self.resolve_channel_post_content(
-                message
-            )
-            if used_forwarded_payload:
-                logger.info(
-                    "Resolved forwarded channel post during sync target_channel_id=%s source_channel_id=%s "
-                    "post_message_id=%s",
-                    channel_chat_id,
-                    source_channel_id if source_channel_id is not None else "<unknown>",
-                    post_message_id,
-                )
+            post_text, source_attachments, _, _ = self.resolve_channel_post_content(message)
             self.register_channel_post_for_comments(
                 post_message_id=post_message_id,
                 channel_chat_id=channel_chat_id,
@@ -6022,7 +6010,6 @@ class MaxCommentsBot:
                 post_url=message.get("url"),
                 post_text=post_text,
                 source_attachments=source_attachments,
-                source_message_link=self.normalize_message_link_for_send(message.get("link")),
             )
             attached_count += 1
         return attached_count
@@ -6039,10 +6026,18 @@ class MaxCommentsBot:
             return False
         if self.store.get_post(post_message_id) is not None:
             return False
+        forwarded = self.extract_forwarded_channel_post(message)
+        if forwarded is not None:
+            logger.info(
+                "Skipping channel post auto-attach reason=forwarded_post_ignored target_channel_id=%s "
+                "source_channel_id=%s post_message_id=%s",
+                safe_text(chat_id) or "<unknown>",
+                int(forwarded.channel_id),
+                post_message_id,
+            )
+            return False
 
-        post_text, effective_attachments, source_channel_id, used_forwarded_payload = self.resolve_channel_post_content(
-            message
-        )
+        post_text, effective_attachments, _, _ = self.resolve_channel_post_content(message)
         if post_text.startswith("/"):
             return False
         if CHANNEL_POST_FOOTER in post_text:
@@ -6051,15 +6046,6 @@ class MaxCommentsBot:
             return False
 
         if not post_text and not effective_attachments:
-            if source_channel_id is not None:
-                logger.info(
-                    "Skipping channel post auto-attach reason=no_renderable_content target_channel_id=%s "
-                    "source_channel_id=%s post_message_id=%s used_forwarded_payload=%s",
-                    safe_text(chat_id) or "<unknown>",
-                    source_channel_id,
-                    post_message_id,
-                    used_forwarded_payload,
-                )
             return False
         if self.has_any_inline_keyboard(effective_attachments):
             return False
@@ -6182,7 +6168,6 @@ class MaxCommentsBot:
         post_text: str,
         post_title: str | None = None,
         source_attachments: list[dict[str, Any]] | None = None,
-        source_message_link: dict[str, Any] | None = None,
     ) -> sqlite3.Row:
         clean_post_text = strip_managed_channel_footer(post_text)
         clean_attachments = list(source_attachments or [])
@@ -6235,35 +6220,14 @@ class MaxCommentsBot:
             )
             return stored_post
 
-        try:
-            self.api.edit_message(
+        self.api.edit_message(
+            post_message_id,
+            text=self.render_channel_post_text(clean_post_text, post_message_id),
+            attachments=self.render_channel_post_attachments(
                 post_message_id,
-                text=self.render_channel_post_text(clean_post_text, post_message_id),
-                attachments=self.render_channel_post_attachments(
-                    post_message_id,
-                    post_attachments=clean_attachments,
-                ),
-            )
-        except MaxApiError:
-            if not self.link_is_forwarded_post(source_message_link):
-                raise
-            reply_message = self.api.send_message(
-                chat_id=channel_chat_id,
-                text=CHANNEL_POST_FOOTER,
-                attachments=self.build_comment_button(post_message_id),
-                link={"type": "reply", "mid": post_message_id},
-                fmt="markdown",
-            )
-            button_message_id = extract_message_id(reply_message)
-            if button_message_id:
-                self.store.set_button_message_id(post_message_id, button_message_id)
-            else:
-                raise MaxApiError("MAX API did not return message id for the forwarded post button")
-            logger.info(
-                "Created fallback button message %s for forwarded channel post %s",
-                button_message_id,
-                post_message_id,
-            )
+                post_attachments=clean_attachments,
+            ),
+        )
 
         stored_post = self.store.get_post(post_message_id)
         if stored_post is None:
@@ -6322,23 +6286,23 @@ class MaxCommentsBot:
 
     def attach_existing_post(self, post_message_id: str, *, admin_user_id: int | None) -> dict[str, Any]:
         message = self.api.get_message(post_message_id)
-        post_text, source_attachments, source_channel_id, used_forwarded_payload = self.resolve_channel_post_content(
-            message
-        )
+        forwarded = self.extract_forwarded_channel_post(message)
+        if forwarded is not None:
+            logger.info(
+                "Skipping manual attach reason=forwarded_post_ignored target_channel_id=%s source_channel_id=%s "
+                "post_message_id=%s",
+                safe_text((message.get("recipient") or {}).get("chat_id")) or "<unknown>",
+                int(forwarded.channel_id),
+                post_message_id,
+            )
+            raise MaxApiError("Пересланные посты не поддерживаются для подключения комментариев.")
+        post_text, source_attachments, _, _ = self.resolve_channel_post_content(message)
         recipient = message.get("recipient") or {}
         chat_id = recipient.get("chat_id")
         binding = self.get_channel_binding(chat_id)
         if binding is None:
             raise MaxApiError("Channel is not connected")
         post_url = message.get("url")
-        if used_forwarded_payload:
-            logger.info(
-                "Resolved forwarded channel post during manual attach target_channel_id=%s source_channel_id=%s "
-                "post_message_id=%s",
-                int(binding["channel_chat_id"]),
-                source_channel_id if source_channel_id is not None else "<unknown>",
-                post_message_id,
-            )
 
         self.register_channel_post_for_comments(
             post_message_id=post_message_id,
@@ -6347,7 +6311,6 @@ class MaxCommentsBot:
             post_url=post_url,
             post_text=post_text,
             source_attachments=source_attachments,
-            source_message_link=self.normalize_message_link_for_send(message.get("link")),
         )
 
         if admin_user_id is not None:
@@ -7688,28 +7651,13 @@ class MaxCommentsBot:
                         self.attach_existing_post(forwarded_post_id, admin_user_id=None)
                         attached_count += 1
                 except Exception:
-                    logger.exception("Failed to attach comments to forwarded post %s", forwarded_post_id)
-                    try:
-                        raw_payload = json.loads(safe_text(row["raw_payload"]) or "{}")
-                    except json.JSONDecodeError:
-                        raw_payload = {}
-                    forwarded = self.extract_forwarded_channel_post(raw_payload) if isinstance(raw_payload, dict) else None
-                    if forwarded is not None:
-                        try:
-                            self.register_channel_post_for_comments(
-                                post_message_id=forwarded_post_id,
-                                channel_chat_id=int(channel_id),
-                                comments_chat_id=WEBAPP_ONLY_COMMENTS_CHAT_ID,
-                                post_url=forwarded.post_url,
-                                post_text=forwarded.post_text,
-                                source_attachments=forwarded.post_attachments,
-                                source_message_link=self.normalize_message_link_for_send(
-                                    raw_payload.get("link") if isinstance(raw_payload, dict) else None
-                                ),
-                            )
-                            attached_count += 1
-                        except Exception:
-                            logger.exception("Failed to attach forwarded raw payload post %s", forwarded_post_id)
+                    logger.info(
+                        "Skipping forwarded post attach after approval reason=forwarded_post_ignored "
+                        "channel_id=%s post_message_id=%s request_id=%s",
+                        channel_id,
+                        forwarded_post_id,
+                        request_id,
+                    )
             binding = self.get_channel_binding(int(channel_id))
 
         updated = self.store.update_channel_connection_request_status(
