@@ -498,6 +498,7 @@ COMMENTS_PAGE_SIZE_MAX = 100
 
 
 def strip_managed_channel_footer(post_text: str) -> str:
+    # Legacy cleanup for posts created before we stopped appending the service footer.
     clean_text = safe_text(post_text)
     footer_marker = f"\n\n{CHANNEL_POST_FOOTER}"
     if footer_marker in clean_text:
@@ -1080,12 +1081,16 @@ class MaxApiClient:
         self,
         message_id: str,
         *,
-        text: str,
+        text: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
         link: dict[str, Any] | None = None,
-        fmt: str = "markdown",
+        fmt: str | None = "markdown",
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"text": text, "format": fmt}
+        payload: dict[str, Any] = {}
+        if text is not None:
+            payload["text"] = text
+            if fmt is not None:
+                payload["format"] = fmt
         if attachments is not None:
             payload["attachments"] = attachments
         if link is not None:
@@ -6215,14 +6220,13 @@ class MaxCommentsBot:
         if button_message_id:
             self.api.edit_message(
                 button_message_id,
-                text=CHANNEL_POST_FOOTER,
                 attachments=self.build_comment_button(post_message_id),
             )
             return stored_post
 
+        # Keep the channel post text untouched so admins can still edit the post in MAX.
         self.api.edit_message(
             post_message_id,
-            text=self.render_channel_post_text(clean_post_text, post_message_id),
             attachments=self.render_channel_post_attachments(
                 post_message_id,
                 post_attachments=clean_attachments,
@@ -6370,7 +6374,6 @@ class MaxCommentsBot:
             comment_count = int(post["comment_count"])
         button_message_id = safe_text(post["button_message_id"]) if "button_message_id" in post.keys() else ""
         target_message_id = button_message_id or post_message_id
-        text = CHANNEL_POST_FOOTER if button_message_id else self.render_channel_post_text(post["post_text"], post_message_id)
         attachments = (
             self.build_comment_button(post_message_id, comment_count=comment_count)
             if button_message_id
@@ -6383,7 +6386,6 @@ class MaxCommentsBot:
         try:
             self.api.edit_message(
                 target_message_id,
-                text=text,
                 attachments=attachments,
             )
         except Exception:
@@ -6411,14 +6413,6 @@ class MaxCommentsBot:
         if direct_url:
             lines.append(f"WebApp: {direct_url}")
         return "\n".join(lines)
-
-    def render_channel_post_text(self, post_text: str, post_message_id: str) -> str:
-        footer_lines = [
-            "",
-            "",
-            CHANNEL_POST_FOOTER,
-        ]
-        return f"{post_text}{chr(10).join(footer_lines)}"
 
     def direct_webapp_url(self, post_message_id: str) -> str | None:
         if not WEB_APP_PUBLIC_URL:

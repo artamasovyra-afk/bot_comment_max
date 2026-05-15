@@ -373,6 +373,109 @@ def test_register_channel_post_for_comments_propagates_edit_error_without_forwar
     assert sent_messages == []
 
 
+def test_register_channel_post_for_comments_updates_only_attachments(bot_module, tmp_path) -> None:
+    store = bot_module.CommentStore(str(tmp_path / "post-button-attachments-only.sqlite3"))
+
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.store = store
+    app.get_bot_username = lambda: "cit_bot"
+
+    captured: list[dict[str, object]] = []
+
+    class FakeApi:
+        def edit_message(self, message_id: str, **kwargs):
+            captured.append({"message_id": message_id, **kwargs})
+            return {"success": True}
+
+    app.api = FakeApi()
+
+    stored = app.register_channel_post_for_comments(
+        post_message_id="mid.original.10",
+        channel_chat_id=-74631532033454,
+        comments_chat_id=0,
+        post_url="https://max.ru/id/test/10",
+        post_text="Оригинальный текст поста",
+        source_attachments=[
+            {"type": "image", "payload": {"url": "https://example.test/photo.jpg"}}
+        ],
+    )
+
+    assert stored["post_text"] == "Оригинальный текст поста"
+    assert captured == [
+        {
+            "message_id": "mid.original.10",
+            "attachments": [
+                {"type": "image", "payload": {"url": "https://example.test/photo.jpg"}},
+                {
+                    "type": "inline_keyboard",
+                    "payload": {
+                        "buttons": [
+                            [
+                                {
+                                    "type": "link",
+                                    "text": "0 комментариев",
+                                    "url": "https://max.ru/cit_bot?startapp=post_bWlkLm9yaWdpbmFsLjEw",
+                                }
+                            ]
+                        ]
+                    },
+                },
+            ],
+        }
+    ]
+
+
+def test_refresh_post_comment_button_keeps_existing_post_text(bot_module, tmp_path) -> None:
+    store = bot_module.CommentStore(str(tmp_path / "refresh-attachments-only.sqlite3"))
+    store.upsert_post(
+        post_message_id="mid.original.11",
+        channel_chat_id=-74631532033454,
+        comments_chat_id=0,
+        post_url="https://max.ru/id/test/11",
+        post_text="Текст поста без служебной подписи",
+        post_attachments=[{"type": "image", "payload": {"url": "https://example.test/photo.jpg"}}],
+        button_message_id=None,
+        discussion_message_id=None,
+    )
+
+    captured: list[dict[str, object]] = []
+
+    class FakeApi:
+        def edit_message(self, message_id: str, **kwargs):
+            captured.append({"message_id": message_id, **kwargs})
+            return {"success": True}
+
+    app = object.__new__(bot_module.MaxCommentsBot)
+    app.store = store
+    app.api = FakeApi()
+    app.get_bot_username = lambda: "cit_bot"
+
+    app.refresh_post_comment_button("mid.original.11", comment_count=3)
+
+    assert captured == [
+        {
+            "message_id": "mid.original.11",
+            "attachments": [
+                {"type": "image", "payload": {"url": "https://example.test/photo.jpg"}},
+                {
+                    "type": "inline_keyboard",
+                    "payload": {
+                        "buttons": [
+                            [
+                                {
+                                    "type": "link",
+                                    "text": "3 комментария",
+                                    "url": "https://max.ru/cit_bot?startapp=post_bWlkLm9yaWdpbmFsLjEx",
+                                }
+                            ]
+                        ]
+                    },
+                },
+            ],
+        }
+    ]
+
+
 def test_attach_existing_post_rejects_forwarded_post(bot_module) -> None:
     app = object.__new__(bot_module.MaxCommentsBot)
     app.api = types.SimpleNamespace(
@@ -394,6 +497,32 @@ def test_attach_existing_post_rejects_forwarded_post(bot_module) -> None:
 
     with pytest.raises(bot_module.MaxApiError, match="Пересланные посты"):
         app.attach_existing_post("mid.forwarded.1", admin_user_id=None)
+
+
+def test_max_api_edit_message_omits_text_when_not_provided(bot_module) -> None:
+    api = bot_module.MaxApiClient("token", "https://platform-api.max.ru")
+    captured: dict[str, object] = {}
+
+    def fake_request(method: str, path: str, query=None, payload=None):
+        captured["method"] = method
+        captured["path"] = path
+        captured["query"] = query
+        captured["payload"] = payload
+        return {"success": True}
+
+    api._request = fake_request
+
+    api.edit_message(
+        "mid.original.12",
+        attachments=[{"type": "inline_keyboard", "payload": {"buttons": []}}],
+    )
+
+    assert captured == {
+        "method": "PUT",
+        "path": "/messages",
+        "query": {"message_id": "mid.original.12"},
+        "payload": {"attachments": [{"type": "inline_keyboard", "payload": {"buttons": []}}]},
+    }
 
 
 def test_admin_delete_user_soft_deletes_and_clears_channel_links(bot_module, tmp_path) -> None:
