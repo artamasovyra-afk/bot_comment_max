@@ -195,6 +195,35 @@ pytest
 pytest
 ```
 
+### Report-only проверка конфигурации
+
+Для пилотной проверки переменных окружения добавлен report-only preflight:
+
+```bash
+python3 scripts/config_preflight.py
+```
+
+Проверка читает только явно перечисленные переменные, печатает имена полей, issue codes и безопасные маркеры вроде `<missing>`, `<empty>`, `<set>` и `<redacted>`.
+Она не печатает реальные значения, не читает `.env` напрямую, не делает сетевых вызовов и не блокирует production startup.
+
+Пилотная проверка покрывает:
+
+- `MAX_BOT_TOKEN`;
+- `SUPER_ADMIN_LOGIN`;
+- `SUPER_ADMIN_PASSWORD`;
+- `ADMIN_SESSION_SECRET`;
+- `MAX_DATABASE_PATH`;
+- `MAX_DELIVERY_MODE`;
+- `MAX_WEB_APP_PUBLIC_URL`;
+- `MAX_WEBHOOK_PUBLIC_URL`;
+- `MAX_WEBHOOK_SECRET`.
+
+`APP_ENV` и `DATABASE_URL` не добавлены в pilot spec, потому что проект использует другие подтверждённые имена.
+
+Rollback: удалить вызов `python3 scripts/config_preflight.py` из локального preflight процесса
+или удалить `config_validation.py`, `scripts/config_preflight.py` и связанные тесты.
+Production startup path `python3 bot.py` этим пилотом не изменяется.
+
 Скрипт проверяет:
 
 - что `VERSION` имеет формат semver
